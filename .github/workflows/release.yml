@@ -1,0 +1,116 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+            bundles: deb rpm appimage
+            assets: |
+              src-tauri/target/release/bundle/**/*.deb
+              src-tauri/target/release/bundle/**/*.rpm
+              src-tauri/target/release/bundle/**/*.AppImage
+          - os: windows-latest
+            name: windows
+            bundles: msi nsis
+            assets: |
+              src-tauri/target/release/bundle/**/*.msi
+              src-tauri/target/release/bundle/**/*.exe
+          - os: macos-latest
+            name: macos
+            bundles: dmg
+            assets: src-tauri/target/universal-apple-darwin/release/bundle/**/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Require tag on main and matching version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD
+          node <<'NODE'
+          const fs = require('node:fs');
+          const expected = process.env.RELEASE_TAG.slice(1);
+          const packageVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const tauriVersion = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          const cargoVersion = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = "([^"]+)"/m)?.[1];
+          const versions = [packageVersion, tauriVersion, cargoVersion];
+          if (versions.some(version => version !== expected)) {
+            throw new Error(`Tag ${expected} must match package, Tauri, and Cargo versions: ${versions.join(', ')}`);
+          }
+          NODE
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl file libayatana-appindicator3-dev libfuse2 libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev rpm wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install macOS build targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build Linux or Windows installers
+        if: runner.os != 'macOS'
+        run: npm run tauri build -- --ci --bundles ${{ matrix.bundles }}
+
+      - name: Build universal macOS installer
+        if: runner.os == 'macOS'
+        run: npm run tauri build -- --ci --target universal-apple-darwin --bundles dmg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arc-${{ matrix.name }}
+          path: ${{ matrix.assets }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: arc-*
+          path: release-assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: Arc ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*
+          fail_on_unmatched_files: true
