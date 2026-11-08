@@ -29,7 +29,7 @@ import ThemeMaker from "./ThemeMaker";
 import "./pluginExtensions.css";
 import { forgetTerminalOutput } from "./terminalOutput";
 import { usePluginRuntime, type PluginAppSnapshot, type PluginCommandDefinition, type PluginContextMenuItem, type PluginPanelContribution, type PluginStatusItem, type PluginToolbarAction } from "./pluginRuntime";
-import { BUILTIN_THEMES, DEFAULT_THEME, isThemeDefinition, loadSettings, themeCss, type AppSettings, type ThemeDefinition } from "./settings";
+import { APP_SETTINGS_VERSION, BUILTIN_THEMES, DEFAULT_THEME, isThemeDefinition, loadSettings, themeCss, type AppSettings, type ThemeDefinition } from "./settings";
 
 const TerminalView = lazy(() => import("./TerminalView"));
 
@@ -754,7 +754,7 @@ function App() {
   const dynamicThemeCss = useMemo(() => themeCss(activeTheme, settings), [activeTheme, settings]);
 
   useEffect(() => {
-    localStorage.setItem("glasswing.settings", JSON.stringify(settings));
+    localStorage.setItem("glasswing.settings", JSON.stringify({ ...settings, version: APP_SETTINGS_VERSION }));
   }, [settings]);
 
   const runPluginAction = async (action: PluginToolbarAction) => {

@@ -39,6 +39,8 @@ export type AppSettings = {
   glassControlsTransparency: number;
 };
 
+export const APP_SETTINGS_VERSION = 1;
+
 export type ThemeColors = {
   background: string;
   sidebar: string;
@@ -105,7 +107,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   editorGlassTransparency: 28,
   editorGlassBlur: 18,
   editorGlassSaturation: 130,
-  glassAppTransparency: 100,
+  glassAppTransparency: 20,
   glassSidebarTransparency: 20,
   glassTabsTransparency: 14,
   glassTerminalTransparency: 28,
@@ -190,9 +192,14 @@ export const THEME_COLOR_GROUPS: { name: string; keys: (keyof ThemeColors)[] }[]
 
 export function loadSettings(): AppSettings {
   try {
-    const stored = JSON.parse(localStorage.getItem("glasswing.settings") ?? "null") as Partial<AppSettings> | null;
+    const stored = JSON.parse(localStorage.getItem("glasswing.settings") ?? "null") as (Partial<AppSettings> & { version?: number }) | null;
     if (!stored) return DEFAULT_SETTINGS;
-    return { ...DEFAULT_SETTINGS, ...stored };
+    const settings = { ...DEFAULT_SETTINGS, ...stored };
+    // Previous default made the entire app background fully transparent.
+    if (stored.version !== APP_SETTINGS_VERSION && stored.glassAppTransparency === 100) {
+      settings.glassAppTransparency = DEFAULT_SETTINGS.glassAppTransparency;
+    }
+    return settings;
   } catch {
     return DEFAULT_SETTINGS;
   }

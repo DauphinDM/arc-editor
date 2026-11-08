@@ -1,0 +1,16 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Glasswing",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 520,
+        "decorations": true,
+        "transparent": false,
+        "zoomHotkeysEnabled": false
+      }
+    ]
+  }
+}
