@@ -8,17 +8,27 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:webview:allow-set-webview-zoom",
+    "core:window:allow-center",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-size",
+    "core:window:allow-toggle-maximize",
     "dialog:allow-open",
+    "dialog:allow-save",
     "opener:allow-reveal-item-in-dir",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "http://127.0.0.1:*" }]
+      "allow": [{ "url": "http://127.0.0.1:*" }, { "url": "https://github.com/**" }, { "url": "https://cli.github.com/**" }, { "url": "https://git-scm.com/**" }]
     },
     {
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "$HOME/**" }, { "path": "$DOCUMENT/**" }, { "path": "$DOWNLOAD/**" }, { "path": "$APPDATA/**" }]
     },
     "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-html",
     "fs:allow-read-dir",
     "fs:allow-read-text-file",
     "fs:allow-write-text-file",

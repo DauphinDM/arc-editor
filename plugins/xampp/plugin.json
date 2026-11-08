@@ -1,0 +1,7 @@
+{
+  "id": "xampp",
+  "name": "XAMPP",
+  "version": "1.0.0",
+  "description": "Start or stop the XAMPP stack.",
+  "main": "main.js"
+}

@@ -6,25 +6,29 @@ import { bracketMatching, HighlightStyle, indentOnInput, indentUnit, syntaxHighl
 import { autocompletion, closeBrackets, closeBracketsKeymap, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { tags } from "@lezer/highlight";
-import { open } from "@tauri-apps/plugin-dialog";
+import { php } from "@codemirror/lang-php";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { copyFile, exists, mkdir, open as openFs, readDir, readTextFile, remove, rename, stat, writeTextFile } from "@tauri-apps/plugin-fs";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { Plugin } from "prettier";
 import {
-  ChevronDown, ChevronRight, Circle, File, FilePlus2, Folder, FolderOpen, Github,
-  FolderPlus, PanelLeftClose, PanelLeftOpen, Search, Settings as SettingsIcon, Square, Terminal as TerminalIcon, X,
+  ChevronDown, ChevronRight, Circle, File, FilePlus2, Folder, FolderOpen, Github, Globe,
+  FolderPlus, PanelLeftClose, PanelLeftOpen, Puzzle, Search, Server, Settings as SettingsIcon, Terminal as TerminalIcon, X,
 } from "lucide-react";
 import {
-  SiCss, SiHtml5, SiJavascript, SiJson, SiMarkdown, SiReact, SiSass, SiSvg, SiTypescript, SiYaml,
+  SiCss, SiHtml5, SiJavascript, SiJson, SiMarkdown, SiPhp, SiReact, SiSass, SiSvg, SiTypescript, SiYaml,
 } from "react-icons/si";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import SettingsPanel from "./SettingsPanel";
 import GithubPanel from "./GithubPanel";
+import PluginPanel from "./PluginPanel";
 import ThemeMaker from "./ThemeMaker";
+import "./pluginExtensions.css";
 import { forgetTerminalOutput } from "./terminalOutput";
+import { usePluginRuntime, type PluginAppSnapshot, type PluginCommandDefinition, type PluginContextMenuItem, type PluginPanelContribution, type PluginStatusItem, type PluginToolbarAction } from "./pluginRuntime";
 import { BUILTIN_THEMES, DEFAULT_THEME, isThemeDefinition, loadSettings, themeCss, type AppSettings, type ThemeDefinition } from "./settings";
 
 const TerminalView = lazy(() => import("./TerminalView"));
@@ -41,11 +45,51 @@ type SplitPlacement = { direction: SplitDirection; after: boolean };
 type LayoutNode = { type: "group"; groupId: GroupId } | { type: "split"; id: string; direction: SplitDirection; ratio: number; first: LayoutNode; second: LayoutNode };
 type NewItemKind = "file" | "folder";
 type ContextMenuState = { x: number; y: number; target?: DiskFile };
-type LiveServerInfo = { root: string; url: string };
 type FileClipboard = { entries: DiskFile[]; workspace: string };
 type DeletedEntry = { originalPath: string; trashedPath: string; entry: DiskFile };
 type UndoBatch = { workspace: string; entries: DeletedEntry[] };
 const GITHUB_TAB_KEY = "internal:github";
+const PLUGIN_TAB_KEY = "internal:plugins";
+const PLUGIN_VIEW_PREFIX = "internal:plugin-view:";
+
+function PluginViewHost({ panel }: { panel: PluginPanelContribution }) {
+  const container = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!container.current) return;
+    try {
+      const cleanup = panel.mount(container.current);
+      return () => cleanup?.();
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }, [panel]);
+  return <div className="plugin-view-host" ref={container}>{error && <div className="message error">Plugin panel failed: {error}</div>}</div>;
+}
+
+async function requestWorkspaceAccess(root: string): Promise<boolean> {
+  const alreadyAllowed = await invoke<boolean>("workspace_access_allowed", { root });
+  if (alreadyAllowed) return true;
+  const approved = window.confirm(
+    `Glasswing needs permission to read and edit files in this folder and its subfolders:\n\n${root}\n\nGrant access for this app session?`,
+  );
+  if (!approved) return false;
+  await invoke("workspace_grant_access", { root });
+  return true;
+}
+
+function matchesPluginShortcut(event: KeyboardEvent, shortcut: string): boolean {
+  const parts = shortcut.toLowerCase().split("+").map((part) => part.trim());
+  const key = parts.find((part) => !["ctrl", "cmd", "meta", "shift", "alt", "option"].includes(part));
+  if (!key) return false;
+  const expectsControl = parts.some((part) => ["ctrl", "cmd", "meta"].includes(part));
+  const expectsShift = parts.includes("shift");
+  const expectsAlt = parts.some((part) => ["alt", "option"].includes(part));
+  return (event.ctrlKey || event.metaKey) === expectsControl
+    && event.shiftKey === expectsShift
+    && event.altKey === expectsAlt
+    && event.key.toLowerCase() === key;
+}
 
 function insertSplit(layout: LayoutNode, targetId: GroupId, newGroupId: GroupId, placement: SplitPlacement, splitId: string): LayoutNode {
   if (layout.type === "group") {
@@ -163,6 +207,100 @@ function htmlTagCompletion(context: CompletionContext): CompletionResult | null 
   };
 }
 
+const phpCompletions = [
+  { label: "<?php", type: "keyword", detail: "Start PHP code" },
+  { label: "echo", type: "keyword", detail: "Output text" },
+  { label: "function", type: "keyword", detail: "Declare a function" },
+  { label: "class", type: "keyword", detail: "Declare a class" },
+  { label: "public", type: "keyword", detail: "Public visibility" },
+  { label: "private", type: "keyword", detail: "Private visibility" },
+  { label: "protected", type: "keyword", detail: "Protected visibility" },
+  { label: "static", type: "keyword", detail: "Static declaration" },
+  { label: "new", type: "keyword", detail: "Create an object" },
+  { label: "return", type: "keyword", detail: "Return from a function" },
+  { label: "if", type: "keyword", detail: "Conditional statement" },
+  { label: "elseif", type: "keyword", detail: "Additional conditional branch" },
+  { label: "else", type: "keyword", detail: "Fallback conditional branch" },
+  { label: "foreach", type: "keyword", detail: "Iterate over an array" },
+  { label: "for", type: "keyword", detail: "For loop" },
+  { label: "while", type: "keyword", detail: "While loop" },
+  { label: "try", type: "keyword", detail: "Start exception handling" },
+  { label: "catch", type: "keyword", detail: "Handle an exception" },
+  { label: "throw", type: "keyword", detail: "Throw an exception" },
+  { label: "use", type: "keyword", detail: "Import a namespace or trait" },
+  { label: "namespace", type: "keyword", detail: "Declare a namespace" },
+  { label: "interface", type: "keyword", detail: "Declare an interface" },
+  { label: "trait", type: "keyword", detail: "Declare a trait" },
+  { label: "extends", type: "keyword", detail: "Extend a class" },
+  { label: "implements", type: "keyword", detail: "Implement an interface" },
+  { label: "include", type: "keyword", detail: "Include a PHP file" },
+  { label: "require", type: "keyword", detail: "Require a PHP file" },
+  { label: "count", type: "function", detail: "Count items in an array or Countable" },
+  { label: "array_map", type: "function", detail: "Apply a callback to array values" },
+  { label: "array_filter", type: "function", detail: "Filter array values using a callback" },
+  { label: "array_merge", type: "function", detail: "Merge one or more arrays" },
+  { label: "in_array", type: "function", detail: "Check whether a value exists in an array" },
+  { label: "isset", type: "function", detail: "Check whether a variable is set" },
+  { label: "empty", type: "function", detail: "Check whether a value is empty" },
+  { label: "strlen", type: "function", detail: "Get string length" },
+  { label: "str_replace", type: "function", detail: "Replace text in a string" },
+  { label: "explode", type: "function", detail: "Split a string into an array" },
+  { label: "implode", type: "function", detail: "Join array values into a string" },
+  { label: "trim", type: "function", detail: "Remove whitespace from a string" },
+  { label: "htmlspecialchars", type: "function", detail: "Escape HTML special characters" },
+  { label: "json_encode", type: "function", detail: "Encode a value as JSON" },
+  { label: "json_decode", type: "function", detail: "Decode a JSON string" },
+  { label: "preg_match", type: "function", detail: "Perform a regular-expression match" },
+  { label: "filter_var", type: "function", detail: "Filter a value" },
+  { label: "header", type: "function", detail: "Send an HTTP response header" },
+  { label: "http_response_code", type: "function", detail: "Get or set HTTP response code" },
+  { label: "password_hash", type: "function", detail: "Create a password hash" },
+  { label: "password_verify", type: "function", detail: "Verify a password against a hash" },
+  { label: "file_get_contents", type: "function", detail: "Read a file into a string" },
+  { label: "file_put_contents", type: "function", detail: "Write data to a file" },
+  { label: "var_dump", type: "function", detail: "Inspect a value" },
+  { label: "print_r", type: "function", detail: "Display structured information" },
+  { label: "DateTime", type: "class", detail: "Date and time representation" },
+  { label: "Exception", type: "class", detail: "Base exception class" },
+  { label: "$this", type: "variable", detail: "Current object" },
+  { label: "$_GET", type: "variable", detail: "Query-string values" },
+  { label: "$_POST", type: "variable", detail: "Submitted form values" },
+  { label: "$_REQUEST", type: "variable", detail: "Request values" },
+  { label: "$_SERVER", type: "variable", detail: "Server and request information" },
+  { label: "$_SESSION", type: "variable", detail: "Session values" },
+  { label: "$_COOKIE", type: "variable", detail: "Cookie values" },
+  { label: "$_FILES", type: "variable", detail: "Uploaded files" },
+  { label: "$_ENV", type: "variable", detail: "Environment values" },
+];
+
+function phpCompletion(context: CompletionContext): CompletionResult | null {
+  const word = context.matchBefore(/[$A-Za-z_][\w$]*/);
+  if (!word && !context.explicit) return null;
+  return {
+    from: word?.from ?? context.pos,
+    options: phpCompletions,
+    validFor: /^[$A-Za-z_][\w$]*$/,
+  };
+}
+
+function expandDocumentTemplate(view: EditorView, extension: string): boolean {
+  if (!["html", "htm", "php"].includes(extension)) return false;
+  const document = view.state.doc.toString();
+  const selection = view.state.selection.main;
+  if (selection.from !== document.length || selection.to !== document.length || !/^\s*!\s*$/.test(document)) return false;
+
+  const phpFile = extension === "php";
+  const phpBlock = phpFile ? "<?php\n\n?>\n" : "";
+  const template = `${phpBlock}<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>Document</title>\n</head>\n<body>\n\n</body>\n</html>`;
+  const cursor = phpFile ? "<?php\n".length : template.indexOf("<body>\n") + "<body>\n".length;
+  view.dispatch({
+    changes: { from: 0, to: document.length, insert: template },
+    selection: { anchor: cursor },
+    scrollIntoView: true,
+  });
+  return true;
+}
+
 const extensionOf = (name: string) => name.split(".").pop()?.toLowerCase() ?? "";
 
 async function prettierFormat(name: string, content: string): Promise<string | null> {
@@ -225,6 +363,7 @@ function removeNestedEntries(entries: DiskFile[]): DiskFile[] {
 function FileIcon({ name }: { name: string }) {
   const ext = extensionOf(name);
   if (["html", "htm"].includes(ext)) return <SiHtml5 className="file-icon icon-html" />;
+  if (ext === "php") return <SiPhp className="file-icon icon-php" />;
   if (ext === "css") return <SiCss className="file-icon icon-css" />;
   if (ext === "scss") return <SiSass className="file-icon icon-scss" />;
   if (["jsx", "tsx"].includes(ext)) return <SiReact className="file-icon icon-react" />;
@@ -237,8 +376,15 @@ function FileIcon({ name }: { name: string }) {
   return <File size={14} className="file-icon" />;
 }
 
+function PluginToolbarIcon({ name }: { name?: string }) {
+  if (name === "server") return <Server size={15} />;
+  if (name === "globe") return <Globe size={15} />;
+  return <Puzzle size={15} />;
+}
+
 async function loadCodeLanguage(extension: string): Promise<Extension> {
   if (["html", "htm", "svg"].includes(extension)) return (await import("@codemirror/lang-html")).html();
+  if (extension === "php") return php();
   if (["css", "scss"].includes(extension)) return (await import("@codemirror/lang-css")).css();
   if (["js", "mjs", "cjs", "jsx", "ts", "tsx"].includes(extension)) {
     return (await import("@codemirror/lang-javascript")).javascript({ jsx: true, typescript: ["ts", "tsx"].includes(extension) });
@@ -262,7 +408,9 @@ function EditorPane({
   onSelect,
   onTerminalTitleChange,
   workspace,
-  onGithubLogin,
+  pluginPanel,
+  pluginViews,
+  editorViews,
   settings,
   theme,
 }: {
@@ -279,7 +427,9 @@ function EditorPane({
   onSelect: (id: GroupId, path: string) => void;
   onTerminalTitleChange: (id: string, title: string) => void;
   workspace: string;
-  onGithubLogin: () => void;
+  pluginPanel: ReactNode;
+  pluginViews: PluginPanelContribution[];
+  editorViews: { current: Map<string, EditorView> };
   settings: AppSettings;
   theme: ThemeDefinition;
 }) {
@@ -320,6 +470,7 @@ function EditorPane({
       }),
     });
     view.current = editor;
+    editorViews.current.set(file.path, editor);
     if (snapshot.current?.path === file.path) {
       const previous = snapshot.current;
       requestAnimationFrame(() => {
@@ -332,9 +483,10 @@ function EditorPane({
     return () => {
       snapshot.current = { path: file.path, selection: editor.state.selection, scrollTop: editor.scrollDOM.scrollTop, scrollLeft: editor.scrollDOM.scrollLeft };
       editor.destroy();
+      if (editorViews.current.get(file.path) === editor) editorViews.current.delete(file.path);
       if (view.current === editor) view.current = null;
     };
-  }, [file?.path, group.id, onActivate, onChange]);
+  }, [editorViews, file?.path, group.id, onActivate, onChange]);
 
   useEffect(() => {
     const editor = view.current;
@@ -351,19 +503,20 @@ function EditorPane({
     if (!file || !editor) return;
     const extension = extensionOf(file.name);
     const isHtml = ["html", "htm"].includes(extension);
+    const isPhp = extension === "php";
     const isCss = ["css", "scss"].includes(extension);
     editor.dispatch({ effects: compartments.settings.reconfigure([
       EditorState.tabSize.of(settings.tabSize),
       indentUnit.of(" ".repeat(settings.tabSize)),
       ...(settings.lineNumbers ? [lineNumbers()] : []),
-      keymap.of([...(settings.autoCloseBrackets ? closeBracketsKeymap : []), ...defaultKeymap, ...searchKeymap, ...historyKeymap, indentWithTab]),
+      keymap.of([...(settings.autoCloseBrackets ? closeBracketsKeymap : []), { key: "Tab", run: (view) => expandDocumentTemplate(view, extension) }, ...defaultKeymap, ...searchKeymap, ...historyKeymap, indentWithTab]),
       ...(settings.bracketMatching ? [bracketMatching()] : []),
       ...(settings.autoCloseBrackets ? [closeBrackets()] : []),
       ...(settings.autoIndent ? [indentOnInput()] : []),
       ...(settings.activeLine ? [highlightActiveLine(), highlightActiveLineGutter()] : []),
       ...(settings.indentGuides && !isCss ? [indentationGuides(settings.tabSize)] : []),
       ...(settings.wordWrap ? [EditorView.lineWrapping] : []),
-      ...(settings.autocomplete ? [autocompletion(isHtml ? { override: [htmlTagCompletion] } : {})] : []),
+      ...(settings.autocomplete ? [autocompletion(isHtml ? { override: [htmlTagCompletion] } : isPhp ? { override: [phpCompletion] } : {})] : []),
       EditorView.theme({
         "&": { height: "100%" },
         ".cm-scroller": { overflow: "auto", fontFamily: settings.fontFamily, fontSize: `${settings.fontSize}px`, lineHeight: String(settings.lineHeight) },
@@ -372,7 +525,7 @@ function EditorPane({
         ".cm-focused": { outline: "none" },
       }),
     ]) });
-  }, [compartments.settings, file?.path, settings.tabSize, settings.lineNumbers, settings.autoCloseBrackets, settings.bracketMatching, settings.autoIndent, settings.activeLine, settings.indentGuides, settings.wordWrap, settings.autocomplete, settings.fontFamily, settings.fontSize, settings.lineHeight]);
+  }, [compartments.settings, file?.path, file?.name, settings.tabSize, settings.lineNumbers, settings.autoCloseBrackets, settings.bracketMatching, settings.autoIndent, settings.activeLine, settings.indentGuides, settings.wordWrap, settings.autocomplete, settings.fontFamily, settings.fontSize, settings.lineHeight]);
 
   useEffect(() => {
     const editor = view.current;
@@ -428,12 +581,15 @@ function EditorPane({
 
   const filesByPath = useMemo(() => new Map(files.map((entry) => [entry.path, entry])), [files]);
   const terminalsByKey = useMemo(() => new Map(terminals.map((entry) => [entry.key, entry])), [terminals]);
+  const pluginViewsByKey = useMemo(() => new Map(pluginViews.map((panel) => [`${PLUGIN_VIEW_PREFIX}${panel.id}`, panel])), [pluginViews]);
   const tabItems = useMemo(() => group.tabs.map((key) => ({
     key,
     file: filesByPath.get(key),
     terminal: terminalsByKey.get(key),
     github: key === GITHUB_TAB_KEY,
-  })).filter((entry) => entry.file || entry.terminal || entry.github), [filesByPath, group.tabs, terminalsByKey]);
+    plugins: key === PLUGIN_TAB_KEY,
+    pluginView: pluginViewsByKey.get(key),
+  })).filter((entry) => entry.file || entry.terminal || entry.github || entry.plugins || entry.pluginView), [filesByPath, group.tabs, pluginViewsByKey, terminalsByKey]);
   const groupTerminals = tabItems.flatMap((entry) => entry.terminal ? [entry.terminal] : []);
 
   return (
@@ -468,16 +624,18 @@ function EditorPane({
         const path = event.dataTransfer.getData("application/x-glasswing-editor-tab") || event.dataTransfer.getData("application/x-glasswing-file");
         if (path) onDropFile(group.id, path);
       }}>
-        {tabItems.map(({ key, file: tab, terminal, github }) => <button key={key} className={`editor-tab ${key === group.activePath ? "active" : ""}`} draggable={!github} onDragStart={(event) => { event.dataTransfer.setData("application/x-glasswing-editor-tab", key); event.dataTransfer.effectAllowed = "move"; }} onClick={() => onSelect(group.id, key)}>
-          {terminal ? <TerminalIcon size={14} className="file-icon" /> : github ? <Github size={14} className="file-icon" /> : <FileIcon name={tab!.name} />}<span className="tab-name">{terminal ? settings.terminalShowTitle ? terminal.title : "Terminal" : github ? "GitHub" : tab!.name}</span>
+        {tabItems.map(({ key, file: tab, terminal, github, plugins, pluginView }) => <button key={key} className={`editor-tab ${key === group.activePath ? "active" : ""}`} draggable={!github && !plugins && !pluginView} onDragStart={(event) => { event.dataTransfer.setData("application/x-glasswing-editor-tab", key); event.dataTransfer.effectAllowed = "move"; }} onClick={() => onSelect(group.id, key)}>
+          {terminal ? <TerminalIcon size={14} className="file-icon" /> : github ? <Github size={14} className="file-icon" /> : plugins || pluginView ? <Puzzle size={14} className="file-icon" /> : <FileIcon name={tab!.name} />}<span className="tab-name">{terminal ? settings.terminalShowTitle ? terminal.title : "Terminal" : github ? "GitHub" : plugins ? "Plugins" : pluginView ? pluginView.title : tab!.name}</span>
           {tab?.dirty ? <Circle size={8} className="dirty-dot" fill="currentColor" /> : null}
           <span className="tab-close" title="Close editor (Ctrl+W)" onClick={(event) => { event.stopPropagation(); onClose(group.id, key); }}><X size={13} /></span>
         </button>)}
         <div className="tab-spacer" />
       </div>
       {file && <div className="editor-host" ref={host} />}
-      {group.activePath === GITHUB_TAB_KEY && <GithubPanel workspace={workspace} onLogin={onGithubLogin} />}
-      {!file && !activeTerminal && group.activePath !== GITHUB_TAB_KEY && <div className="editor-empty"><span>Choose a file to begin.</span><span>Drop a file on an edge to split the editor.</span></div>}
+      {group.activePath === GITHUB_TAB_KEY && <GithubPanel workspace={workspace} />}
+      {group.activePath === PLUGIN_TAB_KEY && pluginPanel}
+      {pluginViewsByKey.has(group.activePath) && <PluginViewHost panel={pluginViewsByKey.get(group.activePath)!} />}
+      {!file && !activeTerminal && group.activePath !== GITHUB_TAB_KEY && group.activePath !== PLUGIN_TAB_KEY && !pluginViewsByKey.has(group.activePath) && <div className="editor-empty"><span>Choose a file to begin.</span><span>Drop a file on an edge to split the editor.</span></div>}
       {groupTerminals.length > 0 && <div className={`terminal-stack ${activeTerminal ? "active" : ""}`}>{groupTerminals.map((session) => <div key={session.id} className={`terminal-host ${activeTerminal?.id === session.id ? "active" : ""}`}>{activeTerminal?.id === session.id && <Suspense fallback={<div className="terminal-view" />}><TerminalView session={session} active theme={theme} settings={settings} onTitleChange={onTerminalTitleChange} /></Suspense>}</div>)}</div>}
     </section>
   );
@@ -544,6 +702,7 @@ function App() {
   const fileContents = useRef(new Map<string, string>());
   const [groups, setGroups] = useState<EditorGroup[]>([{ id: "group-1", activePath: "", tabs: [] }]);
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
+  const editorViews = useRef(new Map<string, EditorView>());
   const [layout, setLayout] = useState<LayoutNode>({ type: "group", groupId: "group-1" });
   const [activeGroupId, setActiveGroupId] = useState<GroupId>("group-1");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -555,13 +714,14 @@ function App() {
   const [renamingPath, setRenamingPath] = useState("");
   const [renameName, setRenameName] = useState("");
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [liveServer, setLiveServer] = useState<LiveServerInfo | null>(null);
   const [fileClipboard, setFileClipboard] = useState<FileClipboard | null>(null);
   const [undoStack, setUndoStack] = useState<UndoBatch[]>([]);
   const [viewerOpen, setViewerOpen] = useState(true);
   const [searchOpen, setSearchOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const [message, setMessage] = useState("");
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
   const [treeScrollTop, setTreeScrollTop] = useState(0);
   const [treeViewportHeight, setTreeViewportHeight] = useState(480);
@@ -596,6 +756,22 @@ function App() {
   useEffect(() => {
     localStorage.setItem("glasswing.settings", JSON.stringify(settings));
   }, [settings]);
+
+  const runPluginAction = async (action: PluginToolbarAction) => {
+    try {
+      await action.onClick();
+    } catch (error) {
+      setMessage(`Plugin ${action.pluginName} failed: ${String(error)}`);
+    }
+  };
+
+  const runPluginStatusItem = async (item: PluginStatusItem) => {
+    try {
+      await item.onClick?.();
+    } catch (error) {
+      setMessage(`Plugin ${item.pluginName} failed: ${String(error)}`);
+    }
+  };
 
   useEffect(() => {
     if (!isTauri()) {
@@ -789,10 +965,10 @@ function App() {
     setTerminals((current) => current.map((terminal) => terminal.id === id ? { ...terminal, title } : terminal));
   }, []);
 
-  const openTerminal = (command?: string) => {
+  const openTerminal = (command?: string): string | null => {
     if (!isTauri()) {
       setMessage("Terminal sessions are available in Glasswing desktop.");
-      return;
+      return null;
     }
     const id = `terminal-${Date.now()}-${++terminalCounter.current}`;
     const session = { id, key: `terminal:${id}`, cwd: workspace, title: "Terminal", command };
@@ -804,6 +980,8 @@ function App() {
     setSettingsOpen(false);
     setThemeMakerOpen(false);
     setMessage("");
+    pluginRuntime.emitEvent("terminal:opened", { id });
+    return id;
   };
 
   const openGithubPanel = () => {
@@ -813,6 +991,15 @@ function App() {
     }
     setGroups((current) => current.map((group) => group.id === activeGroupId
       ? { ...group, activePath: GITHUB_TAB_KEY, tabs: group.tabs.includes(GITHUB_TAB_KEY) ? group.tabs : [...group.tabs, GITHUB_TAB_KEY] }
+      : group));
+    setSettingsOpen(false);
+    setThemeMakerOpen(false);
+    setMessage("");
+  };
+
+  const openPluginPanel = () => {
+    setGroups((current) => current.map((group) => group.id === activeGroupId
+      ? { ...group, activePath: PLUGIN_TAB_KEY, tabs: group.tabs.includes(PLUGIN_TAB_KEY) ? group.tabs : [...group.tabs, PLUGIN_TAB_KEY] }
       : group));
     setSettingsOpen(false);
     setThemeMakerOpen(false);
@@ -839,6 +1026,13 @@ function App() {
         for (const entry of contents[folderIndex]) {
           if (generation !== scanGeneration.current || collected.length >= 5000) break;
           if (ignored.has(entry.name) || (!settings.showHiddenFiles && entry.name.startsWith("."))) continue;
+          if (entry.name.startsWith(".")) {
+            await invoke("workspace_allow_hidden_path", {
+              root: rootPath,
+              path: `${folder.folder}/${entry.name}`,
+              directory: entry.isDirectory,
+            });
+          }
           const relative = folder.prefix ? `${folder.prefix}/${entry.name}` : entry.name;
           if (entry.isDirectory) {
             collected.push({ name: entry.name, path: relative, kind: "directory" });
@@ -1001,23 +1195,31 @@ function App() {
     historyRestoreStarted.current = true;
     const previousWorkspace = localStorage.getItem("glasswing.lastWorkspace");
     if (!previousWorkspace) return;
-    void refreshWorkspace(previousWorkspace).then(() => {
-      setWorkspace(previousWorkspace);
-      setMessage("");
-    }).catch(() => {
-      localStorage.removeItem("glasswing.lastWorkspace");
-    });
+    void (async () => {
+      try {
+        if (!await requestWorkspaceAccess(previousWorkspace)) {
+          localStorage.removeItem("glasswing.lastWorkspace");
+          setMessage("Folder access declined.");
+          return;
+        }
+        await refreshWorkspace(previousWorkspace);
+        setWorkspace(previousWorkspace);
+        setMessage("");
+      } catch {
+        localStorage.removeItem("glasswing.lastWorkspace");
+      }
+    })();
   }, [refreshWorkspace]);
 
   const openWorkspace = async () => {
     if (folderDialogOpen.current) return;
     folderDialogOpen.current = true;
     try {
-      const selected = await open({ directory: true, multiple: false, title: "Open workspace" });
-      if (typeof selected !== "string") return;
-      if (workspace && selected !== workspace && isTauri()) {
-        await invoke("live_server_stop");
-        setLiveServer(null);
+      const selected = await invoke<string | null>("workspace_pick");
+      if (!selected) return;
+      if (!await requestWorkspaceAccess(selected)) {
+        setMessage("Folder access declined.");
+        return;
       }
       await refreshWorkspace(selected);
       localStorage.setItem("glasswing.lastWorkspace", selected);
@@ -1108,6 +1310,7 @@ function App() {
         dirty: false,
       } : entry));
       setMessage("Saved");
+      pluginRuntime.emitEvent("file:saved", { path, content });
       window.setTimeout(() => setMessage((current) => current === "Saved" ? "" : current), 1400);
       return true;
     } catch (error) {
@@ -1119,6 +1322,7 @@ function App() {
   const updateFile = useCallback((path: string, content: string, replace = false) => {
     if (fileContents.current.get(path) === content) return;
     fileContents.current.set(path, content);
+    pluginRuntime.emitEvent("editor:changed", { path, content });
     setOpenFiles((current) => {
       const file = current.find((entry) => entry.path === path);
       if (!file || file.dirty && !replace) return current;
@@ -1166,6 +1370,7 @@ function App() {
       setTerminals((current) => current.filter((entry) => entry.id !== terminal.id));
       forgetTerminalOutput(terminal.id);
       void invoke("terminal_close", { id: terminal.id }).catch((error) => setMessage(`Could not close terminal: ${String(error)}`));
+      pluginRuntime.emitEvent("terminal:closed", { id: terminal.id });
     }
     if (!otherGroupsStillUseFile && !terminal) {
       fileContents.current.delete(path);
@@ -1278,33 +1483,12 @@ function App() {
     }
   };
 
-  const startLiveServer = async (target?: DiskFile) => {
-    setContextMenu(null);
-    if (!workspace) return;
-    if (!isTauri()) {
-      setMessage("Live Server is available in Glasswing desktop.");
-      return;
-    }
-    const root = target?.kind === "directory" ? `${workspace}/${target.path}` : workspace;
-    const entry = target?.kind === "file" ? target.path : "";
-    try {
-      const server = await invoke<LiveServerInfo>("live_server_start", { root, entry });
-      setLiveServer(server);
-      await openUrl(server.url);
-      setMessage(`Live Server running at ${server.url}`);
-    } catch (error) {
-      setMessage(`Could not start Live Server: ${String(error)}`);
-    }
-  };
-
-  const stopLiveServer = async () => {
+  const runPluginContextMenuItem = async (item: PluginContextMenuItem, target?: DiskFile) => {
     setContextMenu(null);
     try {
-      await invoke("live_server_stop");
-      setLiveServer(null);
-      setMessage("Live Server stopped.");
+      await item.onClick({ workspace, target: target && { name: target.name, path: target.path, kind: target.kind } });
     } catch (error) {
-      setMessage(`Could not stop Live Server: ${String(error)}`);
+      setMessage(`Plugin ${item.pluginName} failed: ${String(error)}`);
     }
   };
 
@@ -1493,6 +1677,10 @@ function App() {
       const target = event.target as HTMLElement;
       if ((event.key === "F2" || event.key === "Delete") && target.matches("input, textarea, [contenteditable='true']")) return;
       if (event.key === "Escape") {
+        if (commandPaletteOpen) {
+          setCommandPaletteOpen(false);
+          return;
+        }
         setContextMenu(null);
         return;
       }
@@ -1515,6 +1703,18 @@ function App() {
         return;
       }
       const modifier = event.ctrlKey || event.metaKey;
+      if (modifier && event.shiftKey && key === "p") {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+        setCommandQuery("");
+        return;
+      }
+      const pluginCommand = pluginRuntime.commands.find((command) => command.shortcut && matchesPluginShortcut(event, command.shortcut));
+      if (pluginCommand) {
+        event.preventDefault();
+        void runPaletteCommand(pluginCommand);
+        return;
+      }
       if (!modifier) return;
       if (key === "t") {
         event.preventDefault();
@@ -1766,6 +1966,145 @@ function App() {
     <div aria-hidden="true" style={{ height: Math.max(0, visibleTreeNodes.length - treeWindowEnd) * 24 }} />
   </>;
 
+  const openPluginView = (id: string) => {
+    const path = `${PLUGIN_VIEW_PREFIX}${id}`;
+    setGroups((current) => current.map((group) => group.id === activeGroupId
+      ? { ...group, activePath: path, tabs: group.tabs.includes(path) ? group.tabs : [...group.tabs, path] }
+      : group));
+    setSettingsOpen(false);
+    setThemeMakerOpen(false);
+    setMessage("");
+  };
+
+  const activeEditorPath = () => {
+    const activePath = groups.find((group) => group.id === activeGroupId)?.activePath;
+    return openFiles.some((file) => file.path === activePath) ? activePath : undefined;
+  };
+
+  const getPluginEditor = (path?: string) => editorViews.current.get(path ?? activeEditorPath() ?? "") ?? null;
+
+  const getPluginEditorSnapshot = (path?: string) => {
+    const activePath = path ?? activeEditorPath();
+    if (!activePath) return null;
+    const file = openFiles.find((entry) => entry.path === activePath);
+    if (!file) return null;
+    const editor = editorViews.current.get(activePath);
+    const selection = editor?.state.selection.main;
+    return {
+      path: activePath,
+      name: file.name,
+      text: fileContents.current.get(activePath) ?? "",
+      dirty: file.dirty,
+      selection: { from: selection?.from ?? 0, to: selection?.to ?? 0 },
+    };
+  };
+
+  const normalizePluginPath = (path: string) => path.startsWith(workspace)
+    ? path.slice(workspace.length).replace(/^[\\/]+/, "")
+    : path.replace(/\\/g, "/").replace(/^\.\//, "");
+
+  const pluginRuntime = usePluginRuntime(workspace, setMessage, {
+    getAppState: (): PluginAppSnapshot => ({
+      workspace,
+      activeFile: activeEditorPath() ?? "",
+      openFiles: openFiles.map(({ path, name, dirty }) => ({ path, name, dirty })),
+      terminals: terminals.map(({ id, title, cwd }) => ({ id, title, cwd })),
+      settings: { ...settings },
+      theme: { ...activeTheme, colors: { ...activeTheme.colors } },
+    }),
+    getThemes: () => themes.map(({ id, name }) => ({ id, name })),
+    openWorkspace: async () => openWorkspace(),
+    openSettings: () => { setSettingsOpen(true); setThemeMakerOpen(false); },
+    openGithub: openGithubPanel,
+    openPlugins: openPluginPanel,
+    openPluginPanel: openPluginView,
+    setTitle: (title) => {
+      document.title = title;
+      if (isTauri()) void getCurrentWindow().setTitle(title);
+    },
+    updateSettings,
+    setTheme: (id) => {
+      if (!themes.some((theme) => theme.id === id)) return false;
+      updateSettings({ selectedTheme: id });
+      return true;
+    },
+    refreshWorkspace: async () => { if (workspace) await refreshWorkspace(workspace); },
+    openFile: async (path) => {
+      const relativePath = normalizePluginPath(path);
+      await openFile({ path: relativePath, name: relativePath.split("/").at(-1) ?? relativePath, kind: "file" });
+    },
+    deleteFile: async (path) => {
+      const relativePath = normalizePluginPath(path);
+      const entry = files.find((file) => file.path === relativePath);
+      if (!entry) throw new Error(`Workspace entry not found: ${relativePath}`);
+      await deleteEntries([entry]);
+    },
+    renameFile: async (path, name) => {
+      const relativePath = normalizePluginPath(path);
+      const entry = files.find((file) => file.path === relativePath);
+      if (!entry) throw new Error(`Workspace entry not found: ${relativePath}`);
+      await renameEntry(entry, name);
+    },
+    saveFile,
+    formatFile,
+    getEditor: (path) => getPluginEditor(path ? normalizePluginPath(path) : undefined),
+    getEditorSnapshot: (path) => getPluginEditorSnapshot(path ? normalizePluginPath(path) : undefined),
+    setEditorText: (path, text) => {
+      const relativePath = normalizePluginPath(path);
+      const editor = editorViews.current.get(relativePath);
+      if (editor) editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: text } });
+      else if (openFiles.some((file) => file.path === relativePath)) updateFile(relativePath, text, true);
+      else throw new Error(`No open editor matches ${relativePath}.`);
+    },
+    getTerminals: () => terminals.map(({ id, title, cwd }) => ({ id, title, cwd })),
+    openTerminal,
+    writeTerminal: async (id, data) => invoke("terminal_write", { id, data }),
+    resizeTerminal: async (id, cols, rows) => invoke("terminal_resize", { id, cols, rows }),
+    closeTerminal: async (id) => {
+      const terminal = terminals.find((entry) => entry.id === id);
+      if (!terminal) return;
+      const group = groups.find((entry) => entry.tabs.includes(terminal.key));
+      if (group) await closeTab(group.id, terminal.key);
+    },
+  });
+
+  useEffect(() => { pluginRuntime.emitEvent("workspace:changed", { path: workspace }); }, [pluginRuntime.emitEvent, workspace]);
+  useEffect(() => { pluginRuntime.emitEvent("editor:active", getPluginEditorSnapshot()); }, [pluginRuntime.emitEvent, activeGroupId, groups, openFiles]);
+  useEffect(() => { pluginRuntime.emitEvent("settings:changed", { settings, theme: activeTheme }); }, [pluginRuntime.emitEvent, settings, activeTheme]);
+
+  const appCommands: PluginCommandDefinition[] = [
+    { id: "open-folder", title: "Open Folder", run: () => openWorkspace() },
+    { id: "new-file", title: "New File", run: () => startCreating("file") },
+    { id: "new-folder", title: "New Folder", run: () => startCreating("folder") },
+    { id: "new-terminal", title: "New Terminal", run: () => { openTerminal(); } },
+    { id: "open-settings", title: "Open Settings", run: () => setSettingsOpen(true) },
+    { id: "open-plugins", title: "Open Plugins", run: openPluginPanel },
+    { id: "open-github", title: "Open GitHub", run: openGithubPanel },
+    { id: "save-file", title: "Save Active File", run: async () => { const path = activeEditorPath(); if (path) await saveFile(path); } },
+    { id: "format-file", title: "Format Active File", run: async () => { const path = activeEditorPath(); if (path) await formatFile(path); } },
+    { id: "toggle-file-viewer", title: "Toggle File Viewer", run: () => setViewerOpen((visible) => !visible) },
+  ];
+  const commandItems: (PluginCommandDefinition & { pluginId: string; pluginName: string })[] = [
+    ...appCommands.map((command) => ({ ...command, pluginId: "glasswing", pluginName: "Glasswing" })),
+    ...pluginRuntime.commands,
+    ...pluginRuntime.panels.map((panel) => ({
+      id: `open-panel:${panel.id}`,
+      title: `Open ${panel.title}`,
+      description: `Plugin panel from ${panel.pluginName}`,
+      pluginId: panel.pluginId,
+      pluginName: panel.pluginName,
+      run: () => openPluginView(panel.id),
+    })),
+  ].filter((command) => `${command.title} ${command.description ?? ""} ${command.pluginName}`.toLowerCase().includes(commandQuery.toLowerCase()));
+  const runPaletteCommand = async (command: PluginCommandDefinition & { pluginId: string; pluginName: string }) => {
+    setCommandPaletteOpen(false);
+    try {
+      await command.run();
+    } catch (error) {
+      setMessage(`Command ${command.title} failed: ${String(error)}`);
+    }
+  };
+
   const renderLayout = (node: LayoutNode): ReactNode => {
     if (node.type === "split") {
       return <SplitContainer key={node.id} node={node} onResize={resizeSplit} first={renderLayout(node.first)} second={renderLayout(node.second)} />;
@@ -1790,7 +2129,19 @@ function App() {
       onSelect={setActiveTab}
       onTerminalTitleChange={updateTerminalTitle}
       workspace={workspace}
-      onGithubLogin={() => openTerminal("gh auth login --hostname github.com --git-protocol https --web")}
+      pluginViews={pluginRuntime.panels}
+      editorViews={editorViews}
+      pluginPanel={<PluginPanel
+        plugins={pluginRuntime.plugins}
+        pluginDirectory={pluginRuntime.pluginDirectory}
+        availableBuiltins={pluginRuntime.availableBuiltins}
+        panels={pluginRuntime.panels}
+        onInstallPlugin={pluginRuntime.installFromFolder}
+        onInstallBuiltin={pluginRuntime.installBuiltin}
+        onTogglePlugin={pluginRuntime.setEnabled}
+        onUninstallPlugin={pluginRuntime.uninstall}
+        onOpenPanel={openPluginView}
+      />}
       settings={settings}
       theme={activeTheme}
     />;
@@ -1809,8 +2160,8 @@ function App() {
 
   return <main className={`app-shell ${settings.appTheme === "macos" ? "app-theme-macos" : ""} ${settings.editorGlassEnabled ? "editor-glass-enabled" : ""}`} onClick={() => { if (contextMenu) setContextMenu(null); }}>
     <style>{dynamicThemeCss}</style>
-    {!workspace && terminals.length === 0 ? <section className="welcome-screen">
-      <div className="welcome-tools"><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>
+    {!workspace && terminals.length === 0 && !groups.some((group) => group.tabs.includes(PLUGIN_TAB_KEY)) ? <section className="welcome-screen">
+      <div className="welcome-tools"><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button><button className="settings-launch" aria-label="Open plugins" title="Open plugins" onClick={openPluginPanel}><Puzzle size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>
       <div className="welcome-content">
         <div className="welcome-name">GLASSWING</div>
         <button className="welcome-open" onClick={() => void openWorkspace()}>Open Folder</button>
@@ -1866,7 +2217,13 @@ function App() {
           </div>}
           {filter.trim() ? filteredFiles.length ? renderSearchResults() : <div className="empty-hint">No files found.</div> : tree.length ? renderTree() : <div className="empty-hint">No visible files.</div>}
         </div>
-        <div className="file-viewer-footer"><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button>{liveServer && <button className="settings-launch" aria-label="Stop Live Server" title="Stop Live Server" onClick={() => void stopLiveServer()}><Square size={13} /></button>}<button className="settings-launch" aria-label="Open GitHub" title="Open GitHub" onClick={openGithubPanel}><Github size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>
+        <div className="file-viewer-footer">
+          <button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button>
+          {pluginRuntime.actions.map((action) => <button key={action.id} className="settings-launch" aria-label={action.label} title={action.title ?? action.label} onClick={() => void runPluginAction(action)}><PluginToolbarIcon name={action.icon} /></button>)}
+          <button className="settings-launch" aria-label="Open GitHub" title="Open GitHub" onClick={openGithubPanel}><Github size={15} /></button>
+          <button className="settings-launch" aria-label="Open plugins" title="Open plugins" onClick={openPluginPanel}><Puzzle size={15} /></button>
+          <button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button>
+        </div>
       </aside>}
       {workspace && viewerOpen && <div
         className="file-viewer-resizer"
@@ -1887,16 +2244,17 @@ function App() {
         }}
       ><span /></div>}
       {workspace && !viewerOpen && <button className="show-viewer" title="Show file viewer (Ctrl+B)" onClick={() => setViewerOpen(true)}><PanelLeftOpen size={15} /></button>}
-      {!workspace && <div className="terminal-global-tools"><button className="settings-launch" aria-label="Open folder" title="Open folder" onClick={() => void openWorkspace()}><FolderOpen size={15} /></button><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>}
+      {!workspace && <div className="terminal-global-tools"><button className="settings-launch" aria-label="Open folder" title="Open folder" onClick={() => void openWorkspace()}><FolderOpen size={15} /></button><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button><button className="settings-launch" aria-label="Open plugins" title="Open plugins" onClick={openPluginPanel}><Puzzle size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>}
       <section className="editor-root">
         {renderLayout(layout)}
+        {pluginRuntime.statusItems.length > 0 && <div className="plugin-status-bar">{pluginRuntime.statusItems.filter((item) => item.position !== "right").map((item) => <button key={item.id} title={item.tooltip ?? item.pluginName} onClick={() => void runPluginStatusItem(item)}>{item.text}</button>)}<span />{pluginRuntime.statusItems.filter((item) => item.position === "right").map((item) => <button key={item.id} title={item.tooltip ?? item.pluginName} onClick={() => void runPluginStatusItem(item)}>{item.text}</button>)}</div>}
         {message && <div className={`message ${message.startsWith("Could not") ? "error" : ""}`} onClick={() => setMessage("")}>{message}</div>}
       </section>
       {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onMouseLeave={() => setContextMenu(null)} onClick={(event) => event.stopPropagation()}>
         {contextMenu.target ? <>
-          <button onClick={() => void startLiveServer(contextMenu.target)}>{liveServer ? "Open with Live Server" : "Start Live Server"}</button>
-          {liveServer && <button onClick={() => void stopLiveServer()}>Stop Live Server</button>}
-          <div className="menu-divider" />
+          {pluginRuntime.contextMenuItems.map((item) => <button key={item.id} onClick={() => void runPluginContextMenuItem(item, contextMenu.target)}>{item.label}</button>)}
+          {pluginRuntime.contextMenuItems.length > 0 && <div className="menu-divider" />}
+          {pluginRuntime.contextMenuItems.length === 0 && <div className="menu-divider" />}
           <button onClick={() => startRename(contextMenu.target!)}>Rename <kbd>F2</kbd></button>
           <button onClick={() => void duplicateEntry(contextMenu.target!)}>Duplicate</button>
           <button onClick={() => copyEntry(contextMenu.target!)}>Copy <kbd>Ctrl+C</kbd></button>
@@ -1908,9 +2266,9 @@ function App() {
           <button onClick={() => void copyPath(contextMenu.target!, false)}>Copy Path</button>
           <button onClick={() => void copyPath(contextMenu.target!, true)}>Copy Relative Path</button>
         </> : <>
-          <button onClick={() => void startLiveServer()}>{liveServer ? "Open with Live Server" : "Start Live Server"}</button>
-          {liveServer && <button onClick={() => void stopLiveServer()}>Stop Live Server</button>}
-          <div className="menu-divider" />
+          {pluginRuntime.contextMenuItems.map((item) => <button key={item.id} onClick={() => void runPluginContextMenuItem(item)}>{item.label}</button>)}
+          {pluginRuntime.contextMenuItems.length > 0 && <div className="menu-divider" />}
+          {pluginRuntime.contextMenuItems.length === 0 && <div className="menu-divider" />}
           <button disabled={!fileClipboard} onClick={() => void pasteEntry("")}>Paste here <kbd>Ctrl+V</kbd></button>
           <div className="menu-divider" />
           <button onClick={() => void openContainingFolder()}>Open Containing Folder</button>
@@ -1929,6 +2287,15 @@ function App() {
       onOpenThemeMaker={() => { setSettingsOpen(false); setThemeMakerOpen(true); }}
       onDeleteTheme={(id) => void deleteTheme(id)}
     />}
+    {commandPaletteOpen && <div className="plugin-command-backdrop" onClick={() => setCommandPaletteOpen(false)}>
+      <section className="plugin-command-dialog" role="dialog" aria-modal="true" aria-label="Command palette" onClick={(event) => event.stopPropagation()}>
+        <input autoFocus value={commandQuery} placeholder="Search commands and plugin actions…" onChange={(event) => setCommandQuery(event.target.value)} onKeyDown={(event) => {
+          if (event.key === "Escape") setCommandPaletteOpen(false);
+          else if (event.key === "Enter" && commandItems[0]) void runPaletteCommand(commandItems[0]);
+        }} />
+        <div>{commandItems.map((command) => <button key={command.id} onClick={() => void runPaletteCommand(command)}><span>{command.title}<small>{command.description}</small></span><small>{command.shortcut ? <kbd>{command.shortcut}</kbd> : command.pluginName}</small></button>)}{commandItems.length === 0 && <p>No matching commands.</p>}</div>
+      </section>
+    </div>}
   </main>;
 }
 

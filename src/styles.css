@@ -194,3 +194,4 @@
 .app-shell.editor-glass-enabled .editor-root,.app-shell.editor-glass-enabled .editor-layout,.app-shell.editor-glass-enabled .editor-empty{background:transparent}
 .app-shell.app-theme-macos.editor-glass-enabled{background:color-mix(in srgb,var(--macos-background) calc(100% - var(--glass-app-transparency,0%)),transparent)}
 .app-shell.app-theme-macos.editor-glass-enabled .editor-root,.app-shell.app-theme-macos.editor-glass-enabled .editor-layout,.app-shell.app-theme-macos.editor-glass-enabled .editor-empty{background:transparent}
+.icon-php{color:#777bb4}

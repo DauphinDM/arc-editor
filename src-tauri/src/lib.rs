@@ -1,6 +1,7 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
@@ -13,14 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::FsExt;
 
 #[derive(Default)]
 struct TerminalState(Mutex<TerminalSessions>);
 
 #[derive(Default)]
-struct LiveServerState(Mutex<Option<LiveServer>>);
+struct LocalHttpServerState(Mutex<HashMap<String, LocalHttpServer>>);
 
-struct LiveServer {
+struct LocalHttpServer {
     root: PathBuf,
     port: u16,
     stop: Arc<AtomicBool>,
@@ -46,7 +49,7 @@ struct TerminalOutput {
 }
 
 #[derive(Serialize, Clone)]
-struct LiveServerInfo {
+struct LocalServerInfo {
     root: String,
     url: String,
 }
@@ -63,6 +66,7 @@ struct GithubChange {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GithubStatus {
+    platform: String,
     git_installed: bool,
     gh_installed: bool,
     authenticated: bool,
@@ -79,7 +83,7 @@ struct GithubStatus {
     user_email: String,
 }
 
-impl Drop for LiveServer {
+impl Drop for LocalHttpServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for thread in self.threads.drain(..) {
@@ -88,10 +92,10 @@ impl Drop for LiveServer {
     }
 }
 
-impl Drop for LiveServerState {
+impl Drop for LocalHttpServerState {
     fn drop(&mut self) {
-        if let Ok(server) = self.0.get_mut() {
-            drop(server.take());
+        if let Ok(servers) = self.0.get_mut() {
+            servers.clear();
         }
     }
 }
@@ -137,8 +141,14 @@ fn terminal_spawn(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    #[cfg(target_os = "windows")]
+    let shell = env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    #[cfg(not(target_os = "windows"))]
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let mut command_builder = CommandBuilder::new(&shell);
+    #[cfg(target_os = "windows")]
+    command_builder.arg("/Q");
+    #[cfg(not(target_os = "windows"))]
     command_builder.arg("-i");
     command_builder.env("TERM", "xterm-256color");
     command_builder.env("COLORTERM", "truecolor");
@@ -312,6 +322,122 @@ fn terminal_close(state: State<'_, TerminalState>, id: String) -> Result<(), Str
     Ok(())
 }
 
+#[tauri::command]
+async fn workspace_pick(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let dialog = app.dialog().file().set_title("Open workspace");
+    let folder = if let Some(window) = app.get_webview_window("main") {
+        dialog.set_parent(&window).blocking_pick_folder()
+    } else {
+        dialog.blocking_pick_folder()
+    };
+    folder
+        .map(|folder| {
+            folder
+                .into_path()
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
+fn workspace_access_allowed(app: tauri::AppHandle, root: String) -> Result<bool, String> {
+    let root = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|error| format!("Could not access folder: {error}"))?;
+    Ok(app.fs_scope().is_allowed(root))
+}
+
+#[tauri::command]
+fn workspace_grant_access(app: tauri::AppHandle, root: String) -> Result<(), String> {
+    let root = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|error| format!("Could not access folder: {error}"))?;
+    if !root.is_dir() {
+        return Err("Workspace path is not a folder.".to_string());
+    }
+    app.fs_scope()
+        .allow_directory(root, true)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn workspace_allow_hidden_path(
+    app: tauri::AppHandle,
+    root: String,
+    path: String,
+    directory: bool,
+) -> Result<(), String> {
+    let root = PathBuf::from(root)
+        .canonicalize()
+        .map_err(|error| format!("Could not access workspace: {error}"))?;
+    let path = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("Could not access hidden path: {error}"))?;
+    if !path.starts_with(&root) {
+        return Err("Hidden path is outside the workspace.".to_string());
+    }
+    let scope = app.fs_scope();
+    if directory {
+        scope
+            .allow_directory(path, true)
+            .map_err(|error| error.to_string())
+    } else {
+        scope.allow_file(path).map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+fn plugin_process_is_running(names: Vec<String>) -> Result<bool, String> {
+    if names.is_empty()
+        || names.iter().any(|name| {
+            name.is_empty()
+                || name.contains('/')
+                || name.contains('\\')
+                || name.chars().any(char::is_whitespace)
+        })
+    {
+        return Err("Process names must be non-empty executable names.".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let processes = fs::read_dir("/proc")
+            .map_err(|error| format!("Could not inspect running processes: {error}"))?;
+        for process in processes.flatten() {
+            if !process
+                .file_name()
+                .to_string_lossy()
+                .chars()
+                .all(|character| character.is_ascii_digit())
+            {
+                continue;
+            }
+            let command_line = fs::read(process.path().join("cmdline")).unwrap_or_default();
+            let matches = command_line
+                .split(|byte| *byte == 0)
+                .filter_map(|argument| std::str::from_utf8(argument).ok())
+                .filter_map(|argument| Path::new(argument).file_name())
+                .any(|name| {
+                    names
+                        .iter()
+                        .any(|candidate| name.to_string_lossy() == candidate.as_str())
+                });
+            if matches {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
+
+fn gh_command() -> Command {
+    Command::new("gh")
+}
+
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
         .args(args)
@@ -476,19 +602,23 @@ fn github_status(root: String) -> Result<GithubStatus, String> {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
-    let gh_installed = Command::new("gh")
+    let gh_installed = gh_command()
         .arg("--version")
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
-    let authenticated = gh_installed
-        && Command::new("gh")
+    let authenticated = if gh_installed {
+        gh_command()
             .args(["auth", "status"])
             .current_dir(&root)
             .output()
             .map(|output| output.status.success())
-            .unwrap_or(false);
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let mut status = GithubStatus {
+        platform: env::consts::OS.to_string(),
         git_installed,
         gh_installed,
         authenticated,
@@ -637,6 +767,20 @@ fn github_commit(root: String, message: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn github_fetch(root: String) -> Result<(), String> {
+    let root = resolve_git_root(Path::new(&root))?;
+    let remote = github_remote_name(&root)
+        .ok_or_else(|| "Add a GitHub remote before checking for updates.".to_string())?;
+    let output = Command::new("git")
+        .args(["fetch", &remote])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("Could not run Git: {error}"))?;
+    require_success(output)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn github_pull(root: String) -> Result<(), String> {
     let root = resolve_git_root(Path::new(&root))?;
     let remote = github_remote_name(&root)
@@ -721,7 +865,7 @@ fn github_create_repo(root: String, name: String, visibility: String) -> Result<
     let root = PathBuf::from(root)
         .canonicalize()
         .map_err(|error| format!("Could not access workspace: {error}"))?;
-    let auth = Command::new("gh")
+    let auth = gh_command()
         .args(["auth", "status"])
         .current_dir(&root)
         .output()
@@ -767,7 +911,7 @@ fn github_create_repo(root: String, name: String, visibility: String) -> Result<
         "origin".to_string()
     };
     let visibility_flag = format!("--{visibility}");
-    let create = Command::new("gh")
+    let create = gh_command()
         .args(["repo", "create", name, "--source"])
         .arg(&repo_root)
         .args(["--remote", &remote, &visibility_flag])
@@ -799,72 +943,84 @@ fn github_create_repo(root: String, name: String, visibility: String) -> Result<
 }
 
 #[tauri::command]
-fn live_server_start(
-    state: State<'_, LiveServerState>,
+fn plugin_local_server_start(
+    app: tauri::AppHandle,
+    state: State<'_, LocalHttpServerState>,
+    plugin_id: String,
     root: String,
     entry: String,
-) -> Result<LiveServerInfo, String> {
+) -> Result<LocalServerInfo, String> {
     let root = PathBuf::from(root)
         .canonicalize()
-        .map_err(|error| format!("Could not access server folder: {error}"))?;
+        .map_err(|error| format!("Could not access local server folder: {error}"))?;
     if !root.is_dir() {
-        return Err("Live Server needs a folder.".to_string());
+        return Err("Local server needs a folder.".to_string());
+    }
+    if !app.fs_scope().is_allowed(&root) {
+        return Err("Plugin local server folder is outside approved workspace access.".to_string());
     }
     if entry.contains('\\')
         || Path::new(&entry)
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err("Invalid Live Server entry path.".to_string());
+        return Err("Invalid local server entry path.".to_string());
     }
 
     let mut active = state.0.lock().map_err(|error| error.to_string())?;
-    if let Some(server) = active.as_ref().filter(|server| server.root == root) {
-        return Ok(live_server_info(&server.root, server.port, &entry));
+    if let Some(server) = active.get(&plugin_id).filter(|server| server.root == root) {
+        return Ok(local_server_info(&server.root, server.port, &entry));
     }
-    drop(active.take());
+    drop(active.remove(&plugin_id));
 
-    let server = create_live_server(root)?;
-    let info = live_server_info(&server.root, server.port, &entry);
-    *active = Some(server);
+    let server = create_local_http_server(root)?;
+    let info = local_server_info(&server.root, server.port, &entry);
+    active.insert(plugin_id, server);
     Ok(info)
 }
 
 #[tauri::command]
-fn live_server_stop(state: State<'_, LiveServerState>) -> Result<bool, String> {
-    let server = state.0.lock().map_err(|error| error.to_string())?.take();
+fn plugin_local_server_stop(
+    state: State<'_, LocalHttpServerState>,
+    plugin_id: String,
+) -> Result<bool, String> {
+    let server = state
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&plugin_id);
     let was_running = server.is_some();
     drop(server);
     Ok(was_running)
 }
 
-fn live_server_info(root: &Path, port: u16, entry: &str) -> LiveServerInfo {
+fn local_server_info(root: &Path, port: u16, entry: &str) -> LocalServerInfo {
     let encoded_entry = encode_url_path(entry);
     let path = if encoded_entry.is_empty() {
         "/".to_string()
     } else {
         format!("/{encoded_entry}")
     };
-    LiveServerInfo {
+    LocalServerInfo {
         root: root.to_string_lossy().into_owned(),
         url: format!("http://127.0.0.1:{port}{path}"),
     }
 }
 
-fn create_live_server(root: PathBuf) -> Result<LiveServer, String> {
+fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
     let listener = TcpListener::bind(("127.0.0.1", 5500))
         .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
-        .map_err(|error| format!("Could not start Live Server: {error}"))?;
+        .map_err(|error| format!("Could not start local server: {error}"))?;
     let port = listener
         .local_addr()
-        .map_err(|error| format!("Could not read Live Server address: {error}"))?
+        .map_err(|error| format!("Could not read local server address: {error}"))?
         .port();
     listener
         .set_nonblocking(true)
-        .map_err(|error| format!("Could not configure Live Server: {error}"))?;
+        .map_err(|error| format!("Could not configure local server: {error}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let generation = Arc::new(AtomicU64::new(live_file_signature(&root)));
+    let generation = Arc::new(AtomicU64::new(local_file_signature(&root)));
     let server_stop = Arc::clone(&stop);
     let server_generation = Arc::clone(&generation);
     let server_root = root.clone();
@@ -875,7 +1031,7 @@ fn create_live_server(root: PathBuf) -> Result<LiveServer, String> {
                     let request_root = server_root.clone();
                     let request_generation = Arc::clone(&server_generation);
                     thread::spawn(move || {
-                        handle_live_request(stream, &request_root, &request_generation);
+                        handle_local_request(stream, &request_root, &request_generation);
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -896,7 +1052,7 @@ fn create_live_server(root: PathBuf) -> Result<LiveServer, String> {
             if watch_stop.load(Ordering::Relaxed) {
                 break;
             }
-            let current = live_file_signature(&watch_root);
+            let current = local_file_signature(&watch_root);
             if current != previous {
                 watch_generation.store(current, Ordering::Relaxed);
                 previous = current;
@@ -904,7 +1060,7 @@ fn create_live_server(root: PathBuf) -> Result<LiveServer, String> {
         }
     });
 
-    Ok(LiveServer {
+    Ok(LocalHttpServer {
         root,
         port,
         stop,
@@ -912,7 +1068,7 @@ fn create_live_server(root: PathBuf) -> Result<LiveServer, String> {
     })
 }
 
-fn handle_live_request(mut stream: TcpStream, root: &Path, generation: &AtomicU64) {
+fn handle_local_request(mut stream: TcpStream, root: &Path, generation: &AtomicU64) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request = Vec::with_capacity(1024);
     let mut buffer = [0_u8; 1024];
@@ -1219,7 +1375,7 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn live_file_signature(root: &Path) -> u64 {
+fn local_file_signature(root: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut pending = vec![root.to_path_buf()];
     let mut count = 0;
@@ -1272,12 +1428,17 @@ fn live_file_signature(root: &Path) -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalState::default())
-        .manage(LiveServerState::default())
+        .manage(LocalHttpServerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
+            workspace_pick,
+            workspace_access_allowed,
+            workspace_grant_access,
+            workspace_allow_hidden_path,
+            plugin_process_is_running,
             terminal_spawn,
             terminal_write,
             terminal_resize,
@@ -1286,13 +1447,14 @@ pub fn run() {
             github_configure_identity,
             github_stage,
             github_commit,
+            github_fetch,
             github_pull,
             github_push,
             github_switch_branch,
             github_create_branch,
             github_create_repo,
-            live_server_start,
-            live_server_stop
+            plugin_local_server_start,
+            plugin_local_server_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running Glasswing");
@@ -1337,15 +1499,15 @@ mod tests {
     }
 
     #[test]
-    fn live_server_serves_files_blocks_traversal_and_reloads() {
+    fn local_server_serves_files_blocks_traversal_and_reloads() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("glasswing-live-server-{suffix}"));
+        let root = std::env::temp_dir().join(format!("glasswing-local-server-{suffix}"));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("index.html"), "<!doctype html><body>hello</body>").unwrap();
-        let server = create_live_server(root.clone()).unwrap();
+        let server = create_local_http_server(root.clone()).unwrap();
 
         let page = request(server.port, "/");
         assert!(page.starts_with("HTTP/1.1 200 OK"));
@@ -1372,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn live_server_encodes_file_urls() {
+    fn local_server_encodes_file_urls() {
         assert_eq!(
             encode_url_path("folder/a file.html"),
             "folder/a%20file.html"
