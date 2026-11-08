@@ -1,6 +1,6 @@
-# Glasswing Plugin API
+# Arc Plugin API
 
-This guide describes the JavaScript API available to installed Glasswing plugins. Keep this file beside your coding agent while building a plugin.
+This guide describes the JavaScript API available to installed Arc plugins. Keep this file beside your coding agent while building a plugin.
 
 ## Quick start
 
@@ -11,7 +11,7 @@ Create a folder containing `plugin.json` and `main.js`:
   "id": "hello-world",
   "name": "Hello World",
   "version": "1.0.0",
-  "description": "A sample Glasswing plugin",
+  "description": "A sample Arc plugin",
   "main": "main.js"
 }
 ```
@@ -67,7 +67,7 @@ api.app.openSettings();
 api.app.openGithub();
 api.app.openPlugins();
 api.app.openPanel("my-panel");
-api.app.setTitle("Glasswing — My Plugin");
+api.app.setTitle("Arc — My Plugin");
 ```
 
 `getState()` returns workspace path, active file, open files and dirty flags, terminal sessions, settings, and active theme.
@@ -161,10 +161,10 @@ await api.window.toggleMaximize();
 await api.window.setFullscreen(true);
 await api.window.setAlwaysOnTop(true);
 await api.window.minimize();
-await api.window.close(); // Closes Glasswing.
+await api.window.close(); // Closes Arc.
 ```
 
-Window controls require Glasswing desktop. Closing app ends all plugin sessions.
+Window controls require Arc desktop. Closing app ends all plugin sessions.
 
 ## UI contributions
 
@@ -240,7 +240,7 @@ if (api.ui.confirm("Continue?")) {
 // Call removeStyles() when style should stop applying.
 ```
 
-Styles apply across Glasswing. Glasswing removes registered plugin styles when plugin disables.
+Styles apply across Arc. Arc removes registered plugin styles when plugin disables.
 
 ## Commands and command palette
 
@@ -302,6 +302,6 @@ The local HTTP server is scoped to your plugin ID and stops when plugin deactiva
 - Plugin source is a self-contained JavaScript ES module. Do not use bare package imports.
 - `activate(api)` may be asynchronous and may return a cleanup function.
 - Contributions, event subscriptions, and styles disappear when plugin disables.
-- Plugin JavaScript runs with broad access to Glasswing and Tauri APIs. Install plugins only from trusted sources.
+- Plugin JavaScript runs with broad access to Arc and Tauri APIs. Install plugins only from trusted sources.
 - Prefer public `api.*` methods over direct `api.invoke` calls. Native command names may change.
 - Plugin IDs and contribution IDs use lowercase letters, numbers, dots, underscores, and hyphens.

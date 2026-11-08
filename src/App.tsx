@@ -71,7 +71,7 @@ async function requestWorkspaceAccess(root: string): Promise<boolean> {
   const alreadyAllowed = await invoke<boolean>("workspace_access_allowed", { root });
   if (alreadyAllowed) return true;
   const approved = window.confirm(
-    `Glasswing needs permission to read and edit files in this folder and its subfolders:\n\n${root}\n\nGrant access for this app session?`,
+    `Arc needs permission to read and edit files in this folder and its subfolders:\n\n${root}\n\nGrant access for this app session?`,
   );
   if (!approved) return false;
   await invoke("workspace_grant_access", { root });
@@ -601,8 +601,8 @@ function EditorPane({
       onDrop={(event) => {
         event.preventDefault();
         setDragActive(false);
-        const editorTabPath = event.dataTransfer.getData("application/x-glasswing-editor-tab");
-        const path = editorTabPath || event.dataTransfer.getData("application/x-glasswing-file");
+        const editorTabPath = event.dataTransfer.getData("application/x-arc-editor-tab");
+        const path = editorTabPath || event.dataTransfer.getData("application/x-arc-file");
         if (path) {
           const bounds = event.currentTarget.getBoundingClientRect();
           const x = (event.clientX - bounds.left) / bounds.width;
@@ -621,10 +621,10 @@ function EditorPane({
         event.preventDefault();
         event.stopPropagation();
         setDragActive(false);
-        const path = event.dataTransfer.getData("application/x-glasswing-editor-tab") || event.dataTransfer.getData("application/x-glasswing-file");
+        const path = event.dataTransfer.getData("application/x-arc-editor-tab") || event.dataTransfer.getData("application/x-arc-file");
         if (path) onDropFile(group.id, path);
       }}>
-        {tabItems.map(({ key, file: tab, terminal, github, plugins, pluginView }) => <button key={key} className={`editor-tab ${key === group.activePath ? "active" : ""}`} draggable={!github && !plugins && !pluginView} onDragStart={(event) => { event.dataTransfer.setData("application/x-glasswing-editor-tab", key); event.dataTransfer.effectAllowed = "move"; }} onClick={() => onSelect(group.id, key)}>
+        {tabItems.map(({ key, file: tab, terminal, github, plugins, pluginView }) => <button key={key} className={`editor-tab ${key === group.activePath ? "active" : ""}`} draggable={!github && !plugins && !pluginView} onDragStart={(event) => { event.dataTransfer.setData("application/x-arc-editor-tab", key); event.dataTransfer.effectAllowed = "move"; }} onClick={() => onSelect(group.id, key)}>
           {terminal ? <TerminalIcon size={14} className="file-icon" /> : github ? <Github size={14} className="file-icon" /> : plugins || pluginView ? <Puzzle size={14} className="file-icon" /> : <FileIcon name={tab!.name} />}<span className="tab-name">{terminal ? settings.terminalShowTitle ? terminal.title : "Terminal" : github ? "GitHub" : plugins ? "Plugins" : pluginView ? pluginView.title : tab!.name}</span>
           {tab?.dirty ? <Circle size={8} className="dirty-dot" fill="currentColor" /> : null}
           <span className="tab-close" title="Close editor (Ctrl+W)" onClick={(event) => { event.stopPropagation(); onClose(group.id, key); }}><X size={13} /></span>
@@ -754,7 +754,7 @@ function App() {
   const dynamicThemeCss = useMemo(() => themeCss(activeTheme, settings), [activeTheme, settings]);
 
   useEffect(() => {
-    localStorage.setItem("glasswing.settings", JSON.stringify({ ...settings, version: APP_SETTINGS_VERSION }));
+    localStorage.setItem("arc.settings", JSON.stringify({ ...settings, version: APP_SETTINGS_VERSION }));
   }, [settings]);
 
   const runPluginAction = async (action: PluginToolbarAction) => {
@@ -775,7 +775,7 @@ function App() {
 
   useEffect(() => {
     if (!isTauri()) {
-      const saved = Object.keys(localStorage).filter((key) => key.startsWith("glasswing.theme.")).flatMap((key) => {
+      const saved = Object.keys(localStorage).filter((key) => key.startsWith("arc.theme.")).flatMap((key) => {
         try {
           const value: unknown = JSON.parse(localStorage.getItem(key) ?? "null");
           return isThemeDefinition(value) ? [value] : [];
@@ -861,7 +861,7 @@ function App() {
         await mkdir(themePath, { recursive: true });
         await writeTextFile(await join(themePath, "theme.json"), JSON.stringify(saved, null, 2));
       } else {
-        localStorage.setItem(`glasswing.theme.${saved.id}`, JSON.stringify(saved));
+        localStorage.setItem(`arc.theme.${saved.id}`, JSON.stringify(saved));
       }
       setThemes((current) => current.some((entry) => entry.id === saved.id)
         ? current.map((entry) => entry.id === saved.id ? saved : entry)
@@ -893,7 +893,7 @@ function App() {
     if (!theme || !customThemeIds.has(id) || !window.confirm(`Remove theme “${theme.name}”? This cannot be undone.`)) return;
     try {
       if (isTauri()) await remove(await join(await appDataDir(), "themes", id), { recursive: true });
-      else localStorage.removeItem(`glasswing.theme.${id}`);
+      else localStorage.removeItem(`arc.theme.${id}`);
       setThemes((current) => current.filter((entry) => entry.id !== id));
       setCustomThemeIds((current) => new Set([...current].filter((entry) => entry !== id)));
       if (settings.selectedTheme === id) updateSettings({ selectedTheme: DEFAULT_THEME.id });
@@ -904,7 +904,7 @@ function App() {
 
   const openThemeFolder = async (theme: ThemeDefinition) => {
     if (!isTauri()) {
-      setMessage("Theme folders are available in Glasswing desktop.");
+      setMessage("Theme folders are available in Arc desktop.");
       return;
     }
     try {
@@ -967,7 +967,7 @@ function App() {
 
   const openTerminal = (command?: string): string | null => {
     if (!isTauri()) {
-      setMessage("Terminal sessions are available in Glasswing desktop.");
+      setMessage("Terminal sessions are available in Arc desktop.");
       return null;
     }
     const id = `terminal-${Date.now()}-${++terminalCounter.current}`;
@@ -1193,12 +1193,12 @@ function App() {
   useEffect(() => {
     if (historyRestoreStarted.current) return;
     historyRestoreStarted.current = true;
-    const previousWorkspace = localStorage.getItem("glasswing.lastWorkspace");
+    const previousWorkspace = localStorage.getItem("arc.lastWorkspace");
     if (!previousWorkspace) return;
     void (async () => {
       try {
         if (!await requestWorkspaceAccess(previousWorkspace)) {
-          localStorage.removeItem("glasswing.lastWorkspace");
+          localStorage.removeItem("arc.lastWorkspace");
           setMessage("Folder access declined.");
           return;
         }
@@ -1206,7 +1206,7 @@ function App() {
         setWorkspace(previousWorkspace);
         setMessage("");
       } catch {
-        localStorage.removeItem("glasswing.lastWorkspace");
+        localStorage.removeItem("arc.lastWorkspace");
       }
     })();
   }, [refreshWorkspace]);
@@ -1222,7 +1222,7 @@ function App() {
         return;
       }
       await refreshWorkspace(selected);
-      localStorage.setItem("glasswing.lastWorkspace", selected);
+      localStorage.setItem("arc.lastWorkspace", selected);
       terminals.forEach((terminal) => {
         forgetTerminalOutput(terminal.id);
         void invoke("terminal_close", { id: terminal.id });
@@ -1826,22 +1826,22 @@ function App() {
       setSelectedPath(entry.path);
       selectionAnchor.current = entry.path;
     }
-    event.dataTransfer.setData("application/x-glasswing-tree-entries", JSON.stringify(entries.map((item) => item.path)));
-    event.dataTransfer.setData("application/x-glasswing-tree-entry", entry.path);
-    event.dataTransfer.setData("application/x-glasswing-file", entry.path);
+    event.dataTransfer.setData("application/x-arc-tree-entries", JSON.stringify(entries.map((item) => item.path)));
+    event.dataTransfer.setData("application/x-arc-tree-entry", entry.path);
+    event.dataTransfer.setData("application/x-arc-file", entry.path);
     event.dataTransfer.effectAllowed = "copyMove";
   };
 
   const handleTreeDragOver = (event: ReactDragEvent<HTMLElement>, destination: string) => {
-    if (!Array.from(event.dataTransfer.types).includes("application/x-glasswing-tree-entries") && !Array.from(event.dataTransfer.types).includes("application/x-glasswing-tree-entry")) return;
+    if (!Array.from(event.dataTransfer.types).includes("application/x-arc-tree-entries") && !Array.from(event.dataTransfer.types).includes("application/x-arc-tree-entry")) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
     setDropTargetPath(destination);
   };
 
   const handleTreeDrop = (event: ReactDragEvent<HTMLElement>, destination: string) => {
-    const encoded = event.dataTransfer.getData("application/x-glasswing-tree-entries");
-    const single = event.dataTransfer.getData("application/x-glasswing-tree-entry");
+    const encoded = event.dataTransfer.getData("application/x-arc-tree-entries");
+    const single = event.dataTransfer.getData("application/x-arc-tree-entry");
     let paths: string[] = single ? [single] : [];
     try {
       if (encoded) paths = JSON.parse(encoded) as string[];
@@ -2085,7 +2085,7 @@ function App() {
     { id: "toggle-file-viewer", title: "Toggle File Viewer", run: () => setViewerOpen((visible) => !visible) },
   ];
   const commandItems: (PluginCommandDefinition & { pluginId: string; pluginName: string })[] = [
-    ...appCommands.map((command) => ({ ...command, pluginId: "glasswing", pluginName: "Glasswing" })),
+    ...appCommands.map((command) => ({ ...command, pluginId: "arc", pluginName: "Arc" })),
     ...pluginRuntime.commands,
     ...pluginRuntime.panels.map((panel) => ({
       id: `open-panel:${panel.id}`,
@@ -2163,7 +2163,7 @@ function App() {
     {!workspace && terminals.length === 0 && !groups.some((group) => group.tabs.includes(PLUGIN_TAB_KEY)) ? <section className="welcome-screen">
       <div className="welcome-tools"><button className="settings-launch" aria-label="New terminal (Ctrl+T)" title="New terminal (Ctrl+T)" onClick={() => openTerminal()}><TerminalIcon size={15} /></button><button className="settings-launch" aria-label="Open plugins" title="Open plugins" onClick={openPluginPanel}><Puzzle size={15} /></button><button className="settings-launch" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)" onClick={() => setSettingsOpen(true)}><SettingsIcon size={15} /></button></div>
       <div className="welcome-content">
-        <div className="welcome-name">GLASSWING</div>
+        <div className="welcome-name">ARC</div>
         <button className="welcome-open" onClick={() => void openWorkspace()}>Open Folder</button>
         <div className="welcome-shortcuts">
           <div><span><kbd>Ctrl</kbd> <kbd>K</kbd> <kbd>Ctrl</kbd> <kbd>O</kbd></span><span>Open folder</span></div>

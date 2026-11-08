@@ -1,6 +1,6 @@
-# VDB-ide
+# Arc
 
-Glasswing is a desktop IDE prototype for modern web development, built with Tauri 2, React, TypeScript, and CodeMirror 6.
+Arc is a desktop IDE prototype for modern web development, built with Tauri 2, React, TypeScript, and CodeMirror 6.
 
 ## Development
 
@@ -39,4 +39,4 @@ Open a workspace with `Ctrl+K`, then `Ctrl+O`. Press `Ctrl+T` to open a terminal
 - Built-in Live Server starts from file-viewer context menus, serves on localhost, and reloads pages after file changes.
 - Integrated shell terminal tabs with split-pane support and persistent settings.
 
-LSP remains a future milestone. Glasswing has no accounts or Git integration.
+LSP remains a future milestone. Arc has no accounts or Git integration.

@@ -1,12 +1,12 @@
 [package]
-name = "glasswing"
+name = "arc"
 version = "0.1.0"
 description = "A focused workspace for building the web"
-authors = ["Glasswing"]
+authors = ["Arc"]
 edition = "2021"
 
 [lib]
-name = "glasswing_lib"
+name = "arc_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

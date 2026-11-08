@@ -1,0 +1,37 @@
+.settings-backdrop .settings-panel{width:min(760px,100vw)}
+.settings-panel .settings-header{height:64px;flex-basis:64px;padding:0 22px}
+.settings-layout{min-height:0;flex:1;display:flex}
+.settings-nav{width:176px;flex:0 0 176px;display:flex;flex-direction:column;padding:14px 10px;border-right:1px solid var(--settings-border,#2b3036)}
+.settings-nav-list{display:grid;gap:4px}
+.settings-nav-button{width:100%;min-height:40px;display:flex;align-items:center;gap:10px;padding:0 11px;border:1px solid transparent;border-radius:5px;background:transparent;color:var(--settings-muted,#8c939d);font:inherit;font-size:11px;text-align:left;cursor:pointer}
+.settings-nav-button:hover{background:color-mix(in srgb,var(--settings-raised,#24282e) 70%,transparent);color:var(--settings-text,#d5d9e0)}
+.settings-nav-button:focus-visible{outline:1px solid var(--settings-accent,#8ba5c2);outline-offset:1px}
+.settings-nav-button[aria-current=page]{border-color:color-mix(in srgb,var(--settings-border,#343a40) 80%,transparent);background:color-mix(in srgb,var(--settings-raised,#24282e) 82%,transparent);color:var(--settings-text,#d5d9e0)}
+.settings-nav-button[aria-current=page] svg{color:var(--settings-accent,#9ab0ca)}
+.settings-nav-button svg{flex:0 0 auto}
+.settings-nav .settings-reset{min-height:34px;height:auto;justify-content:flex-start;margin-top:auto;padding:0 9px;border-radius:5px;background:transparent;color:var(--settings-muted,#8c939d);font:inherit;font-size:10px}
+.settings-nav .settings-reset:hover{background:color-mix(in srgb,var(--settings-raised,#24282e) 70%,transparent);color:var(--settings-text,#d5d9e0)}
+.settings-main{min-width:0;min-height:0;flex:1;display:flex;flex-direction:column}
+.settings-page-heading{flex:0 0 auto;padding:22px 28px 15px;border-bottom:1px solid var(--settings-border,#2b3036)}
+.settings-page-heading h3{margin:0;color:var(--settings-text,#d5d9e0);font-size:16px;font-weight:600;letter-spacing:-.01em}
+.settings-page-heading p{margin:5px 0 0;color:var(--settings-muted,#8c939d);font-size:10px;line-height:1.5}
+.settings-main .settings-scroll{min-height:0;flex:1;padding:4px 28px 22px;overflow:auto}
+.settings-main .settings-section{padding:17px 0 15px}
+.settings-main .settings-section h3{margin-bottom:9px;color:var(--settings-text,#d5d9e0);font-size:10px;letter-spacing:.04em}
+.settings-main .setting-toggle{min-height:46px}
+.settings-main .setting-toggle+.setting-toggle{border-top:1px solid color-mix(in srgb,var(--settings-border,#2b3036) 60%,transparent)}
+.settings-main .setting-field{margin:13px 0}
+.settings-main .theme-search{margin:10px 0}
+.settings-main .theme-list{max-height:240px}
+@media(max-width:620px){
+  .settings-backdrop .settings-panel{width:100vw}
+  .settings-panel .settings-header{padding:0 16px}
+  .settings-layout{flex-direction:column}
+  .settings-nav{width:auto;flex:0 0 auto;flex-direction:row;align-items:center;gap:6px;padding:7px 8px;border-right:0;border-bottom:1px solid var(--settings-border,#2b3036)}
+  .settings-nav-list{min-width:0;flex:1;display:flex;gap:3px;overflow-x:auto}
+  .settings-nav-button{width:auto;min-width:max-content;min-height:35px;gap:6px;padding:0 8px;font-size:10px}
+  .settings-nav .settings-reset{width:34px;min-height:34px;flex:0 0 34px;justify-content:center;margin:0;padding:0;overflow:hidden;font-size:0}
+  .settings-nav .settings-reset svg{flex:0 0 auto}
+  .settings-page-heading{padding:15px 16px 11px}
+  .settings-main .settings-scroll{padding:0 16px 18px}
+}

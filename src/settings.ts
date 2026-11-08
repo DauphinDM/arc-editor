@@ -190,9 +190,27 @@ export const THEME_COLOR_GROUPS: { name: string; keys: (keyof ThemeColors)[] }[]
   { name: "Syntax", keys: ["keyword", "control", "string", "number", "function", "type", "property", "tag", "attribute", "comment", "operator", "meta", "invalid", "invalidBackground"] },
 ];
 
+export function migrateStorageNamespace(): void {
+  const marker = "arc.migratedGlasswingStorage";
+  try {
+    if (localStorage.getItem(marker) === "true") return;
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith("glasswing.")) continue;
+      const arcKey = `arc.${key.slice("glasswing.".length)}`;
+      if (localStorage.getItem(arcKey) === null) {
+        const value = localStorage.getItem(key);
+        if (value !== null) localStorage.setItem(arcKey, value);
+      }
+    }
+    localStorage.setItem(marker, "true");
+  } catch {
+    // Keep legacy data intact if browser storage is unavailable or full.
+  }
+}
+
 export function loadSettings(): AppSettings {
   try {
-    const stored = JSON.parse(localStorage.getItem("glasswing.settings") ?? "null") as (Partial<AppSettings> & { version?: number }) | null;
+    const stored = JSON.parse(localStorage.getItem("arc.settings") ?? "null") as (Partial<AppSettings> & { version?: number }) | null;
     if (!stored) return DEFAULT_SETTINGS;
     const settings = { ...DEFAULT_SETTINGS, ...stored };
     // Previous default made the entire app background fully transparent.

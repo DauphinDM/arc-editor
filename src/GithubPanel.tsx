@@ -86,7 +86,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
 
   const refresh = useCallback(async (fetchRemote = false): Promise<GithubStatus | null> => {
     if (!isTauri()) {
-      setError("GitHub tools are available in Glasswing desktop.");
+      setError("GitHub tools are available in Arc desktop.");
       setLoading(false);
       return null;
     }
@@ -167,7 +167,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
             void invoke("terminal_write", { id, data: "\r" });
           }
         }
-        if (plain.includes("__GLASSWING_GH_AUTH_FAILED__")) {
+        if (plain.includes("__ARC_GH_AUTH_FAILED__")) {
           setAuthError("GitHub sign-in did not complete. Try again.");
         }
       });
@@ -176,7 +176,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
       await invoke("terminal_spawn", {
         id,
         cwd: workspace || null,
-        command: "gh auth login --hostname github.com --git-protocol https --web && echo __GLASSWING_GH_AUTH_DONE__ || echo __GLASSWING_GH_AUTH_FAILED__",
+        command: "gh auth login --hostname github.com --git-protocol https --web && echo __ARC_GH_AUTH_DONE__ || echo __ARC_GH_AUTH_FAILED__",
       });
     } catch (cause) {
       authSession.current?.unsubscribe();
@@ -284,7 +284,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
     {!status?.gitInstalled || !status.ghInstalled ? <section className="github-setup-card github-setup-guide">
       <div className="github-setup-icon"><Github size={22} /></div>
       <h2>Set up GitHub tools</h2>
-      <p>Install Git and GitHub CLI, then restart Glasswing. Choose your operating system for matching instructions.</p>
+      <p>Install Git and GitHub CLI, then restart Arc. Choose your operating system for matching instructions.</p>
       <label className="github-field"><span>Operating system</span><select value={setupPlatform} onChange={(event) => setPlatformOverride(event.target.value as SetupPlatform)}>
         <option value="windows">Windows</option><option value="linux">Linux</option><option value="macos">macOS</option>
       </select></label>
@@ -296,16 +296,16 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
       {setupPlatform === "linux" && <span className="github-help">Package names and commands can vary by distribution version. Official instructions cover additional distros.</span>}
     </section> : !status.authenticated ? <section className="github-setup-card">
       <div className="github-setup-icon"><Github size={24} /></div>
-      <h2>Set up GitHub with Glasswing</h2>
+      <h2>Set up GitHub with Arc</h2>
       {authSessionId ? <div className="github-auth-flow">
         <p>{authDeviceCode ? "Enter this one-time code on GitHub:" : "Starting secure GitHub sign-in…"}</p>
         {authDeviceCode && <div className="github-device-code"><code>{authDeviceCode}</code><button className="github-secondary" onClick={() => void writeText(authDeviceCode).then(() => setNotice("Device code copied." )).catch((cause) => setAuthError(String(cause)))}>Copy code</button></div>}
-        <span className="github-help">Browser opens automatically. Glasswing waits here until you approve sign-in.</span>
+        <span className="github-help">Browser opens automatically. Arc waits here until you approve sign-in.</span>
         {authDeviceCode && <button className="github-secondary" onClick={() => void openLink("https://github.com/login/device")}><ExternalLink size={13} /> Open GitHub device page</button>}
         {authError && <span className="github-auth-error">{authError}</span>}
         <button className="github-text-button" onClick={() => void cancelAuth()}>Cancel sign-in</button>
       </div> : <>
-        <p>Sign in once. Glasswing completes GitHub’s device authorization inside this panel.</p>
+        <p>Sign in once. Arc completes GitHub’s device authorization inside this panel.</p>
         <button className="github-primary" disabled={busy} onClick={() => void beginAuth()}>{busy ? <LoaderCircle size={14} className="github-spin" /> : <Github size={15} />} Sign in to GitHub</button>
         {authError && <span className="github-auth-error">{authError}</span>}
       </>}
@@ -323,7 +323,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
         <h2>{status.isRepo ? "Publish this repository" : "Create a GitHub repository"}</h2>
         <p>{status.isRepo
           ? "This folder has Git history but no GitHub remote. Create a repository and connect it."
-          : "Create a GitHub repository from this folder. Glasswing initializes Git when needed."}</p>
+          : "Create a GitHub repository from this folder. Arc initializes Git when needed."}</p>
         <label className="github-field"><span>Repository name</span><input value={repoName} onChange={(event) => setRepoName(event.target.value)} placeholder="my-project" /></label>
         <label className="github-field"><span>Visibility</span><select value={visibility} onChange={(event) => setVisibility(event.target.value)}><option value="private">Private</option><option value="public">Public</option></select></label>
         <button className="github-primary" disabled={busy || !repoName.trim()} onClick={() => void perform(
@@ -406,7 +406,7 @@ function IdentitySetup({ name, email, disabled, onName, onEmail, onSave }: {
 }) {
   return <section className="github-identity-card">
     <strong>Set up commit identity</strong>
-    <span>Git uses this name and email on your commits. Glasswing saves them to your global Git config.</span>
+    <span>Git uses this name and email on your commits. Arc saves them to your global Git config.</span>
     <input value={name} onChange={(event) => onName(event.target.value)} placeholder="Your name" aria-label="Git name" />
     <input value={email} onChange={(event) => onEmail(event.target.value)} placeholder="you@example.com" aria-label="Git email" />
     <button className="github-secondary" disabled={disabled || !name.trim() || !email.trim()} onClick={onSave}>Save identity</button>

@@ -1127,7 +1127,7 @@ fn handle_local_request(mut stream: TcpStream, root: &Path, generation: &AtomicU
         );
         return;
     };
-    if relative == "__glasswing_live_reload" {
+    if relative == "__arc_live_reload" {
         let body = generation.load(Ordering::Relaxed).to_string();
         respond_live_request(
             &mut stream,
@@ -1309,7 +1309,7 @@ fn mime_type(path: &Path) -> &'static str {
 
 fn inject_live_reload(body: Vec<u8>) -> Vec<u8> {
     let mut html = String::from_utf8_lossy(&body).into_owned();
-    let script = "<script>(()=>{let last='';const poll=async()=>{try{const response=await fetch('/__glasswing_live_reload',{cache:'no-store'});const next=await response.text();if(last&&next!==last)location.reload();last=next}catch{}setTimeout(poll,1000)};poll()})()</script>";
+    let script = "<script>(()=>{let last='';const poll=async()=>{try{const response=await fetch('/__arc_live_reload',{cache:'no-store'});const next=await response.text();if(last&&next!==last)location.reload();last=next}catch{}setTimeout(poll,1000)};poll()})()</script>";
     if let Some(position) = html.rfind("</body>") {
         html.insert_str(position, script);
     } else {
@@ -1457,7 +1457,7 @@ pub fn run() {
             plugin_local_server_stop
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Glasswing");
+        .expect("error while running Arc");
 }
 
 #[cfg(test)]
@@ -1504,7 +1504,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("glasswing-local-server-{suffix}"));
+        let root = std::env::temp_dir().join(format!("arc-local-server-{suffix}"));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("index.html"), "<!doctype html><body>hello</body>").unwrap();
         let server = create_local_http_server(root.clone()).unwrap();
@@ -1512,17 +1512,17 @@ mod tests {
         let page = request(server.port, "/");
         assert!(page.starts_with("HTTP/1.1 200 OK"));
         assert!(page.contains("hello"));
-        assert!(page.contains("__glasswing_live_reload"));
+        assert!(page.contains("__arc_live_reload"));
         assert!(request(server.port, "/..%2Fsecret").starts_with("HTTP/1.1 403 Forbidden"));
 
-        let before = request(server.port, "/__glasswing_live_reload")
+        let before = request(server.port, "/__arc_live_reload")
             .split("\r\n\r\n")
             .nth(1)
             .unwrap()
             .to_string();
         fs::write(root.join("style.css"), "body { color: red; }").unwrap();
         thread::sleep(Duration::from_millis(900));
-        let after = request(server.port, "/__glasswing_live_reload")
+        let after = request(server.port, "/__arc_live_reload")
             .split("\r\n\r\n")
             .nth(1)
             .unwrap()

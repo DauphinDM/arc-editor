@@ -1,7 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { migrateStorageNamespace } from "./settings";
 import "./styles.css";
+
+migrateStorageNamespace();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

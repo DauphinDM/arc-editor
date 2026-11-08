@@ -13,8 +13,8 @@ import type { AppSettings, ThemeDefinition } from "./settings";
 const builtinManifestSources = import.meta.glob<string>("../plugins/*/plugin.json", { eager: true, query: "?raw", import: "default" });
 const builtinPluginSources = import.meta.glob<string>("../plugins/*/main.js", { eager: true, query: "?raw", import: "default" });
 
-const disabledStorageKey = "glasswing.plugins.disabled";
-const builtinsSeededKey = "glasswing.plugins.builtinsSeeded";
+const disabledStorageKey = "arc.plugins.disabled";
+const builtinsSeededKey = "arc.plugins.builtinsSeeded";
 
 export type PluginManifest = {
   id: string;
@@ -294,7 +294,7 @@ export function usePluginRuntime(
     listeners.current.get(event)?.forEach((listener) => {
       try { listener(payload); } catch (error) { notify(`Plugin event listener failed: ${String(error)}`); }
     });
-    window.dispatchEvent(new CustomEvent(`glasswing:${event}`, { detail: payload }));
+    window.dispatchEvent(new CustomEvent(`arc:${event}`, { detail: payload }));
   }, [notify]);
 
   useEffect(() => {
@@ -408,7 +408,7 @@ export function usePluginRuntime(
             setPanels((current) => [...current.filter((entry) => entry.id !== panel.id), panel]);
           };
           const resolveFilePath = (path: string, allowRoot = false) => pluginWorkspacePath(workspaceRef.current, path, allowRoot);
-          const scopedStorageKey = (key: string) => `glasswing.plugin.${plugin.id}.${key}`;
+          const scopedStorageKey = (key: string) => `arc.plugin.${plugin.id}.${key}`;
           const getEditor = (path?: string) => hostActionsRef.current.getEditor(path);
           const runCommand = async (id: string) => {
             const command = commandRef.current.get(id.includes(":") ? id : `${plugin.id}:${id}`);
@@ -590,7 +590,7 @@ export function usePluginRuntime(
               addStyles: (css) => {
                 if (css.length > 100_000) throw new Error("Plugin stylesheet exceeds 100 KB.");
                 const style = document.createElement("style");
-                style.dataset.glasswingPlugin = plugin.id;
+                style.dataset.arcPlugin = plugin.id;
                 style.textContent = css;
                 document.head.append(style);
                 const dispose = () => style.remove();
@@ -666,7 +666,7 @@ export function usePluginRuntime(
     if (typeof selected !== "string") return;
     const manifest = parseManifest(JSON.parse(await readTextFile(await join(selected, "plugin.json"))));
     const source = await readTextFile(await join(selected, manifest.main));
-    if (!window.confirm(`Install “${manifest.name}”? Plugin JavaScript runs inside Glasswing and can call its plugin API.`)) return;
+    if (!window.confirm(`Install “${manifest.name}”? Plugin JavaScript runs inside Arc and can call its plugin API.`)) return;
 
     const root = await join(await appDataDir(), "plugins");
     await mkdir(root, { recursive: true });

@@ -59,8 +59,8 @@
 .app-shell.app-theme-macos .workspace-header,.app-shell.app-theme-macos .workspace-row{color:var(--macos-secondary)}
 .app-shell.app-theme-macos .workspace-header:hover{color:var(--macos-text)}
 .app-shell.app-theme-macos .workspace-open,.app-shell.app-theme-macos .workspace-header svg{color:var(--macos-tertiary)}
-.app-shell.app-theme-macos .tree-scroll{padding:5px 0}
-.app-shell.app-theme-macos .tree-row{width:calc(100% - 12px);margin:1px 6px;border-radius:6px;color:var(--macos-secondary);transition:background-color 100ms ease,color 100ms ease}
+.app-shell.app-theme-macos .tree-scroll{padding:2px 0}
+.app-shell.app-theme-macos .tree-row{width:calc(100% - 6px);margin:1px 3px;border-radius:6px;color:var(--macos-secondary);transition:background-color 100ms ease,color 100ms ease}
 .app-shell.app-theme-macos .tree-row:hover,.app-shell.app-theme-macos .workspace-row:hover{background:color-mix(in srgb,var(--macos-hover) calc(100% - var(--glass-sidebar-transparency,0%)),transparent);color:var(--macos-text)}
 .app-shell.app-theme-macos .tree-row.selected{background:color-mix(in srgb,var(--macos-selected) calc(100% - var(--glass-sidebar-transparency,0%)),transparent);color:var(--macos-accent)}
 .app-shell.app-theme-macos .tree-row>svg:first-child,.app-shell.app-theme-macos .file-icon{color:var(--macos-tertiary)!important}
@@ -163,16 +163,16 @@
 @keyframes macos-popover-in{from{opacity:0;transform:translateY(3px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes macos-panel-in{from{opacity:.75;transform:translateX(10px)}to{opacity:1;transform:translateX(0)}}
 @media(prefers-reduced-motion:reduce){.app-shell.app-theme-macos button,.app-shell.app-theme-macos .tree-row{transition:none}.app-shell.app-theme-macos .settings-panel,.app-shell.app-theme-macos .context-menu{animation:none}}
-.app-shell.app-theme-macos .file-viewer{margin:8px 0 8px 8px;border:1px solid var(--macos-border);border-radius:9px;overflow:hidden;box-shadow:0 3px 14px rgba(25,30,45,.06)}
-.app-shell.app-theme-macos .file-viewer-resizer{width:12px;flex-basis:12px;background:transparent}
+.app-shell.app-theme-macos .file-viewer{margin:2px 0 2px 2px;border:1px solid var(--macos-border);border-radius:9px;overflow:hidden;box-shadow:0 3px 14px rgba(25,30,45,.06)}
+.app-shell.app-theme-macos .file-viewer-resizer{width:6px;flex-basis:6px;background:transparent}
 .app-shell.app-theme-macos .file-viewer-resizer span{background:transparent}
 .app-shell.app-theme-macos .file-viewer-resizer:hover{border-radius:6px;background:color-mix(in srgb,var(--macos-accent) 10%,transparent)}
 .app-shell.app-theme-macos .file-viewer-resizer:hover span{background:var(--macos-accent)}
-.app-shell.app-theme-macos .editor-root{min-width:0;padding:8px 8px 8px 0;background:color-mix(in srgb,var(--macos-background) calc(100% - var(--glass-app-transparency,0%)),transparent);overflow:hidden}
+.app-shell.app-theme-macos .editor-root{min-width:0;padding:2px 2px 2px 0;background:color-mix(in srgb,var(--macos-background) calc(100% - var(--glass-app-transparency,0%)),transparent);overflow:hidden}
 .app-shell.app-theme-macos .editor-root>.split-container{min-width:0;min-height:0}
 .app-shell.app-theme-macos .split-container{background:transparent}
-.app-shell.app-theme-macos .split-container.vertical{column-gap:3px}
-.app-shell.app-theme-macos .split-container.horizontal{row-gap:3px}
+.app-shell.app-theme-macos .split-container.vertical{column-gap:1px}
+.app-shell.app-theme-macos .split-container.horizontal{row-gap:1px}
 .app-shell.app-theme-macos .split-child{background:transparent}
 .app-shell.app-theme-macos .editor-pane{border:1px solid color-mix(in srgb,var(--macos-border) 76%,transparent);border-radius:8px;overflow:hidden;box-shadow:0 3px 14px rgba(25,30,45,.07)}
 .app-shell.app-theme-macos .split-divider{display:grid;place-items:center;background:transparent}
@@ -195,3 +195,4 @@
 .app-shell.app-theme-macos.editor-glass-enabled{background:color-mix(in srgb,var(--macos-background) calc(100% - var(--glass-app-transparency,0%)),transparent)}
 .app-shell.app-theme-macos.editor-glass-enabled .editor-root,.app-shell.app-theme-macos.editor-glass-enabled .editor-layout,.app-shell.app-theme-macos.editor-glass-enabled .editor-empty{background:transparent}
 .icon-php{color:#777bb4}
+.editor-host{padding-top:0;padding-bottom:0}

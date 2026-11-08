@@ -3,7 +3,7 @@ import { ArrowLeft, FolderOpen, Plus, Save } from "lucide-react";
 import { themeColorWithOpacity, THEME_COLOR_GROUPS, type AppSettings, type ThemeColors, type ThemeDefinition } from "./settings";
 
 const sample = [
-  { number: "1", parts: [{ text: "const", color: "keyword" }, { text: " greeting", color: "text" }, { text: " = ", color: "operator" }, { text: "'Hello, Glasswing!'", color: "string" }, { text: ";", color: "operator" }] },
+  { number: "1", parts: [{ text: "const", color: "keyword" }, { text: " greeting", color: "text" }, { text: " = ", color: "operator" }, { text: "'Hello, Arc!'", color: "string" }, { text: ";", color: "operator" }] },
   { number: "2", parts: [{ text: "", color: "text" }] },
   { number: "3", parts: [{ text: "function", color: "keyword" }, { text: " render", color: "function" }, { text: "(", color: "operator" }, { text: "theme", color: "property" }, { text: ") {", color: "operator" }] },
   { number: "4", parts: [{ text: "  return", color: "keyword" }, { text: " <", color: "operator" }, { text: "Panel", color: "tag" }, { text: " tone", color: "attribute" }, { text: "=", color: "operator" }, { text: "\"calm\"", color: "string" }, { text: " />", color: "operator" }] },

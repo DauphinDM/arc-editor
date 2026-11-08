@@ -89,7 +89,7 @@ export default function PluginPanel({
     const url = URL.createObjectURL(new Blob([pluginApiMarkdown], { type: "text/markdown;charset=utf-8" }));
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "glasswing-plugin-api.md";
+    anchor.download = "arc-plugin-api.md";
     anchor.click();
     URL.revokeObjectURL(url);
   };
@@ -104,7 +104,7 @@ export default function PluginPanel({
 
     <section className="plugin-content">
       <div className="plugin-folder-row"><div><span>Plugin folder</span><code>{pluginDirectory || "Preparing plugin folder…"}</code></div><button className="github-secondary" disabled={!pluginDirectory} onClick={() => void openPluginFolder()}><FolderOpen size={13} /> Open</button></div>
-      <p className="plugin-intro">Each installed plugin is a package in Glasswing’s plugins folder. Plugins add their own actions and context menu items.</p>
+      <p className="plugin-intro">Each installed plugin is a package in Arc’s plugins folder. Plugins add their own actions and context menu items.</p>
       <div className="plugin-section-heading"><h2>Installed plugins</h2><span>{plugins.length}</span></div>
       {plugins.length ? plugins.map((plugin) => <article className="plugin-card" key={plugin.id}>
         <div className="plugin-card-icon"><Puzzle size={16} /></div>
@@ -134,8 +134,8 @@ export default function PluginPanel({
 
       <section className="plugin-help">
         <h2>Install a local plugin</h2>
-        <p>Select folder containing <code>plugin.json</code> and a self-contained <code>main.js</code>. Glasswing copies both into app data.</p>
-        <p>Plugin code runs inside Glasswing. Install code only from sources you trust.</p>
+        <p>Select folder containing <code>plugin.json</code> and a self-contained <code>main.js</code>. Arc copies both into app data.</p>
+        <p>Plugin code runs inside Arc. Install code only from sources you trust.</p>
         <pre><code>{`plugin.json
 {
   "id": "hello-world",

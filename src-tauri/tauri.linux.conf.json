@@ -2,13 +2,13 @@
   "app": {
     "windows": [
       {
-        "title": "Glasswing",
+        "title": "Arc",
         "width": 1280,
         "height": 820,
         "minWidth": 760,
         "minHeight": 520,
         "decorations": true,
-        "transparent": false,
+        "transparent": true,
         "zoomHotkeysEnabled": false
       }
     ]

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Glasswing",
+  "productName": "Arc",
   "version": "0.1.0",
-  "identifier": "dev.glasswing.ide",
+  "identifier": "dev.arc.ide",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Glasswing",
+        "title": "Arc",
         "width": 1280,
         "height": 820,
         "minWidth": 760,
