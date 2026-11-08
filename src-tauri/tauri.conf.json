@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Glasswing",
+  "version": "0.1.0",
+  "identifier": "dev.glasswing.ide",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Glasswing",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 760,
+        "minHeight": 520,
+        "decorations": true,
+        "transparent": true,
+        "zoomHotkeysEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

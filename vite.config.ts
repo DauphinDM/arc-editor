@@ -1,0 +1,24 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    strictPort: true,
+    watch: { ignored: ["**/src-tauri/**"] },
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const modulePath = id.replaceAll("\\", "/");
+          if (modulePath.includes("/node_modules/@codemirror/view/") || modulePath.includes("/node_modules/@codemirror/state/")) return "editor-core";
+          if (modulePath.includes("/node_modules/@codemirror/language/") || modulePath.includes("/node_modules/@lezer/")) return "editor-language";
+          if (["autocomplete", "commands", "search"].some((name) => modulePath.includes(`/node_modules/@codemirror/${name}/`))) return "editor-tools";
+          if (modulePath.includes("/node_modules/react/") || modulePath.includes("/node_modules/react-dom/") || modulePath.includes("/node_modules/scheduler/")) return "react-vendor";
+        },
+      },
+    },
+  },
+});
