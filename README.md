@@ -1,90 +1,44 @@
 # Arc
 
-Arc is a desktop workspace for editing and running web projects. It brings a code editor, file browser, split views, terminal, local preview, and GitHub tools into one window.
+Arc is a desktop workspace for web development. It puts your project files, code editor, terminal, browser preview, and GitHub tools in one window.
 
-## Download
+## What you can do
 
-Get the latest Windows, Linux, or macOS build from [GitHub Releases](https://github.com/TibeDev/vdb-ide/releases/latest).
+- Open a project folder and browse, search, create, rename, move, copy, or delete its files.
+- Edit JavaScript, TypeScript, JSX, TSX, HTML, CSS, SCSS, PHP, JSON, and Markdown with syntax highlighting.
+- Work across multiple tabs and nested editor splits. Drag tabs between panes or drag a tab to a pane edge to create a split.
+- Open terminal tabs in your project folder.
+- Preview a project with Live Server. Arc serves the workspace locally and reloads the page when files change.
+- Use the GitHub panel to create or connect a repository, change branches, stage and commit files, and pull or push changes.
+- Adjust editor and terminal settings, choose a built-in color theme, or create a custom theme.
+- Install local JavaScript plugins. Arc includes Live Server and a Linux-only XAMPP plugin.
 
-Builds are currently unsigned. Windows and macOS may show a security prompt the first time you open Arc.
+## Working in a project
 
-## Features
+Open a folder with `Ctrl+K`, then `Ctrl+O`. Use the file browser to open or manage files. Save with `Ctrl+S`; supported files can be formatted with Prettier on save or with `Alt+Shift+F`.
 
-- Edit JavaScript, TypeScript, JSX, TSX, HTML, CSS, SCSS, PHP, JSON, and Markdown with syntax highlighting. Arc also provides HTML-tag and PHP completion.
-- Browse, search, create, rename, move, copy, and delete workspace files. Undo file deletions with `Ctrl+Z`.
-- Keep multiple editor tabs open. Drag tabs to create nested splits or move them between panes.
-- Open shell terminals in the current workspace, with multiple tabs and splits.
-- Preview a workspace through the included Live Server plugin. File changes reload in the browser.
-- Stage and commit changes, switch or create branches, pull and push, or publish a GitHub repository from the GitHub panel.
-- Change editor and terminal settings, choose built-in color themes, or create your own.
-- Install local JavaScript plugins. Arc includes Live Server and Linux-only XAMPP plugins.
+Open a terminal with `Ctrl+T`. Start Live Server from the plugin toolbar or file context menu to preview the current project in a browser.
 
-Arc does not include language-server support yet. The GitHub panel requires Git and GitHub CLI (`gh`).
+The GitHub panel needs Git and GitHub CLI (`gh`). Open the panel, sign in, then stage and commit changes or sync with a remote.
 
 ## Shortcuts
 
-| Shortcut                    | Action                                      |
-| --------------------------- | ------------------------------------------- |
-| `Ctrl+K`, then `Ctrl+O`     | Open a workspace folder                     |
-| `Ctrl+N` / `Ctrl+Shift+N`   | Create a file / folder                      |
-| `Ctrl+T`                    | Open a terminal                             |
-| `Ctrl+Shift+P`              | Open the command palette                    |
-| `Ctrl+\\` / `Ctrl+Shift+\\` | Split editor vertically / horizontally      |
-| `Ctrl+B`                    | Show or hide the file browser               |
-| `Ctrl+S` / `Ctrl+W`         | Save / save and close the active editor     |
-| `F2` / `Delete`             | Rename / delete the selected file or folder |
-| `Alt+Shift+F`               | Format the active file                      |
+| Shortcut                    | Action                                  |
+| --------------------------- | --------------------------------------- |
+| `Ctrl+K`, then `Ctrl+O`     | Open a project folder                   |
+| `Ctrl+N` / `Ctrl+Shift+N`   | Create a file / folder                  |
+| `Ctrl+T`                    | Open a terminal                         |
+| `Ctrl+Shift+P`              | Open the command palette                |
+| `Ctrl+\\` / `Ctrl+Shift+\\` | Split editor vertically / horizontally  |
+| `Ctrl+B`                    | Show or hide the file browser           |
+| `Ctrl+S` / `Ctrl+W`         | Save / save and close the active editor |
+| `F2` / `Delete`             | Rename / delete the selected item       |
+| `Alt+Shift+F`               | Format the active file                  |
 
 On macOS, replace `Ctrl` with `Command`. `Alt+Shift+F` uses `Option+Shift+F`.
 
-## Run from source
+## Editor and plugins
 
-Install Node.js and Rust. Desktop builds also need the platform dependencies listed in the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Arc provides HTML-tag and PHP completion. It does not include language-server support yet. Prettier formatting supports HTML, SVG, Vue, CSS, SCSS, JavaScript, TypeScript, JSON, Markdown, and YAML.
 
-```sh
-git clone https://github.com/TibeDev/vdb-ide.git
-cd vdb-ide
-npm ci
-npm run tauri dev
-```
-
-On Linux, install Tauri's [WebKitGTK and system package prerequisites](https://v2.tauri.app/start/prerequisites/#linux) first. Git and GitHub CLI are optional; install both to use the GitHub panel.
-
-Run `npm run dev` to work on the frontend in a browser. Native desktop features require `npm run tauri dev`.
-
-## Build
-
-Build the frontend alone:
-
-```sh
-npm run build
-```
-
-Build desktop installers for the current platform:
-
-```sh
-npm run tauri build
-```
-
-Tauri writes installers under `src-tauri/target/release/bundle/`.
-
-## Publish a release
-
-GitHub Actions builds Linux (`.deb`, `.rpm`, `.AppImage`), Windows (`.msi`, `.exe`), and universal macOS (`.dmg`) installers when you push a version tag from `main`.
-
-1. Update the version in `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`.
-2. Commit and push the version change to `main`.
-3. Tag that commit and push the tag:
-
-```sh
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-The workflow checks that the tag matches app versions and points to a commit on `main`. It publishes the GitHub release after all platform builds pass.
-
-## Plugins
-
-Install a plugin from **Plugins → Install from folder**. Each plugin folder needs `plugin.json` and a self-contained `main.js`. Plugin code runs inside Arc and can access app and workspace APIs, so install plugins only from sources you trust.
-
-See [`PLUGIN_API.md`](PLUGIN_API.md) for the plugin API.
+Install a plugin from **Plugins → Install from folder**. A plugin folder needs `plugin.json` and a self-contained `main.js`. Plugins can access Arc and workspace APIs, so install them only from sources you trust. See [`PLUGIN_API.md`](PLUGIN_API.md) for the API.
