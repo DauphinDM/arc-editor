@@ -13,6 +13,16 @@ Arc is a desktop workspace for web development. It puts your project files, code
 - Adjust editor and terminal settings, choose a built-in color theme, or create a custom theme.
 - Install local JavaScript plugins. Arc includes Live Server and a Linux-only XAMPP plugin.
 
+## Install on Omarchy
+
+From the project folder, pass the downloaded or locally built AppImage to the installer:
+
+```sh
+./install-appimage.sh /path/to/Arc.AppImage
+```
+
+The script copies Arc to `~/Applications/Arc.AppImage`, installs its icon and launcher entry under `$XDG_DATA_HOME` (or `~/.local/share`), and needs no `sudo`. Search for Arc in the app launcher.
+
 ## Working in a project
 
 Open a folder with `Ctrl+K`, then `Ctrl+O`. Use the file browser to open or manage files. Save with `Ctrl+S`; supported files can be formatted with Prettier on save or with `Alt+Shift+F`.
