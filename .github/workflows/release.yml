@@ -112,5 +112,5 @@ jobs:
         with:
           name: Arc ${{ github.ref_name }}
           generate_release_notes: true
-          files: release-assets/*
+          files: release-assets/**/*
           fail_on_unmatched_files: true
