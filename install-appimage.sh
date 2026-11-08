@@ -24,18 +24,10 @@ if [[ $data_home != /* ]]; then
   exit 1
 fi
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-icon_source="$script_dir/src-tauri/icons/icon.png"
-if [[ ! -f $icon_source ]]; then
-  printf 'Error: Arc icon not found: %s\n' "$icon_source" >&2
-  exit 1
-fi
-
 app_dir="$home/Applications"
 app_path="$app_dir/Arc.AppImage"
 applications_dir="$data_home/applications"
 desktop_file="$applications_dir/arc.desktop"
-icon_path="$data_home/icons/hicolor/512x512/apps/arc.png"
 
 mkdir -p "$app_dir" "$applications_dir"
 if [[ -e $app_path && $source_appimage -ef $app_path ]]; then
@@ -43,7 +35,6 @@ if [[ -e $app_path && $source_appimage -ef $app_path ]]; then
 else
   install -Dm755 -- "$source_appimage" "$app_path"
 fi
-install -Dm644 -- "$icon_source" "$icon_path"
 
 escaped_exec=$app_path
 escaped_exec=${escaped_exec//\\/\\\\}
@@ -52,7 +43,7 @@ escaped_exec=${escaped_exec//%/%%}
 
 desktop_tmp=$(mktemp "$applications_dir/.arc.desktop.XXXXXX")
 trap 'rm -f -- "$desktop_tmp"' EXIT
-printf '[Desktop Entry]\nVersion=1.0\nType=Application\nName=Arc\nComment=Web development workspace\nExec="%s"\nIcon=arc\nTerminal=false\nCategories=Development;IDE;\n' \
+printf '[Desktop Entry]\nVersion=1.0\nType=Application\nName=Arc\nComment=Web development workspace\nExec="%s"\nIcon=applications-development\nTerminal=false\nCategories=Development;IDE;\n' \
   "$escaped_exec" > "$desktop_tmp"
 chmod 644 "$desktop_tmp"
 mv -- "$desktop_tmp" "$desktop_file"

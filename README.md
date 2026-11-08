@@ -21,7 +21,7 @@ From the project folder, pass the downloaded or locally built AppImage to the in
 ./install-appimage.sh /path/to/Arc.AppImage
 ```
 
-The script copies Arc to `~/Applications/Arc.AppImage`, installs its icon and launcher entry under `$XDG_DATA_HOME` (or `~/.local/share`), and needs no `sudo`. Search for Arc in the app launcher.
+The script works with only the AppImage and this script. It copies Arc to `~/Applications/Arc.AppImage`, creates a launcher entry under `$XDG_DATA_HOME` (or `~/.local/share`), and needs no `sudo`. Search for Arc in the app launcher.
 
 ## Working in a project
 
