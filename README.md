@@ -1,4 +1,4 @@
-# Glasswing
+# VDB-ide
 
 Glasswing is a desktop IDE prototype for modern web development, built with Tauri 2, React, TypeScript, and CodeMirror 6.
 
