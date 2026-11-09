@@ -2173,6 +2173,7 @@ function App() {
     const interval = window.setInterval(flush, 60000);
     const appWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
+    let disposed = false;
     let closeHandled = false;
     void appWindow
       .onCloseRequested(async (event) => {
@@ -2183,13 +2184,16 @@ function App() {
         await appWindow.destroy();
       })
       .then((unlistenFn) => {
-        unlisten = unlistenFn;
+        if (disposed) unlistenFn();
+        else unlisten = unlistenFn;
       })
       .catch(() => undefined);
     return () => {
+      disposed = true;
       window.removeEventListener('blur', flush);
       window.clearInterval(interval);
       unlisten?.();
+      unlisten = undefined;
     };
   }, []);
 

@@ -193,6 +193,44 @@ function isPlainStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
 }
 
+function validateStoredLayout(value: unknown): StoredLayoutNode | null {
+  if (!value || typeof value !== 'object') return null;
+  const node = value as {
+    type?: unknown;
+    group?: unknown;
+    direction?: unknown;
+    ratio?: unknown;
+    first?: unknown;
+    second?: unknown;
+  };
+  if (node.type === 'group') {
+    if (typeof node.group !== 'number' || !Number.isInteger(node.group))
+      return null;
+    if (node.group < 0) return null;
+    return { type: 'group', group: node.group };
+  }
+  if (
+    node.type === 'split' &&
+    (node.direction === 'vertical' || node.direction === 'horizontal') &&
+    typeof node.ratio === 'number' &&
+    Number.isFinite(node.ratio) &&
+    node.ratio > 0.02 &&
+    node.ratio < 0.98
+  ) {
+    const first = validateStoredLayout(node.first);
+    const second = validateStoredLayout(node.second);
+    if (!first || !second) return null;
+    return {
+      type: 'split',
+      direction: node.direction,
+      ratio: node.ratio,
+      first,
+      second,
+    };
+  }
+  return null;
+}
+
 export function validateStoredSnapshot(value: unknown): StoredSnapshot | null {
   if (!value || typeof value !== 'object') return null;
   const raw = value as Partial<StoredSnapshot> & { terminals?: unknown };
@@ -200,14 +238,9 @@ export function validateStoredSnapshot(value: unknown): StoredSnapshot | null {
   if (typeof raw.workspace !== 'string' || !raw.workspace) return null;
   if (typeof raw.savedAt !== 'string') return null;
   if (!Array.isArray(raw.groups) || !raw.groups.every(isStoredGroup)) return null;
-  const layout = deserializeLayoutNode(
-    raw.layout,
-    () => '_valid_',
-    () => '',
-  );
+  const layout = validateStoredLayout(raw.layout);
   if (!layout) return null;
   const groups = raw.groups;
-  const storedLayout = layout as unknown as StoredLayoutNode;
   const activeGroup =
     typeof raw.activeGroup === 'number' && Number.isInteger(raw.activeGroup)
       ? Math.min(groups.length - 1, Math.max(0, raw.activeGroup))
@@ -250,7 +283,7 @@ export function validateStoredSnapshot(value: unknown): StoredSnapshot | null {
     version: WORKSPACE_SNAPSHOT_VERSION,
     workspace: raw.workspace,
     savedAt: raw.savedAt,
-    layout: storedLayout,
+    layout,
     groups,
     activeGroup,
     viewer,
