@@ -1943,6 +1943,39 @@ function App() {
       }
     }
 
+    // Tree selection: renamed folders re-point; deleted folders fall back to
+    // the workspace root so new files/folders land somewhere that exists.
+    if (removals.length > 0 || renames.size > 0) {
+      const remapSelection = (path: string) => {
+        let next = path;
+        for (const [from, to] of renames) {
+          if (next === from) next = to;
+          else if (from && next.startsWith(`${from}/`))
+            next = `${to}${next.slice(from.length)}`;
+        }
+        for (const removedRel of removals) {
+          if (
+            removedRel &&
+            (next === removedRel || next.startsWith(`${removedRel}/`))
+          )
+            return '';
+        }
+        return next;
+      };
+      if (selectedPath) setSelectedPath(remapSelection(selectedPath));
+      if (selectedDirectory) setSelectedDirectory(remapSelection(selectedDirectory));
+      if (selectedPaths.size)
+        setSelectedPaths((current) => {
+          const next = new Set<string>();
+          for (const path of current) {
+            const remapped = remapSelection(path);
+            if (remapped) next.add(remapped);
+          }
+          return next;
+        });
+      selectionAnchor.current = remapSelection(selectionAnchor.current);
+    }
+
     for (const relativePath of modified) {
       const open = openFilesRef.current.find(
         (file) => file.path === relativePath,
@@ -3241,7 +3274,23 @@ function App() {
         setCommandPaletteOpen(false);
         return;
       }
+      const hadMenu = Boolean(contextMenu);
       setContextMenu(null);
+      if (hadMenu) return;
+      const inViewer =
+        !settingsOpen &&
+        !themeMakerOpen &&
+        Boolean(target.closest('.file-viewer')) &&
+        !target.matches("input, textarea, [contenteditable='true']");
+      if (inViewer && !renamingPath && !newItemKind) {
+        // Escape deselects (VS Code behavior): selection falls back to root.
+        if (selectedPath || selectedPaths.size) {
+          setSelectedPath('');
+          setSelectedPaths(new Set());
+          setSelectedDirectory('');
+          selectionAnchor.current = '';
+        }
+      }
       return;
     }
     if (event.key === 'F2' && selectedPath) {
