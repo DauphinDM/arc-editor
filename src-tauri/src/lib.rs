@@ -1,6 +1,11 @@
+use notify_debouncer_full::{
+    new_debouncer,
+    notify::{event::EventKind, event::ModifyKind, event::RenameMode, Event, RecommendedWatcher},
+    Debouncer, RecommendedCache,
+};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -9,10 +14,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::FsExt;
@@ -1494,11 +1499,478 @@ fn local_file_signature(root: &Path) -> u64 {
     hasher.finish()
 }
 
+// ---------- Workspace file watcher ----------
+
+const WATCH_IGNORED_NAMES: &[&str] = &[
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    ".next",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+];
+/// Upper bound on directories we register with inotify so a large
+/// dependency tree can not exhaust `fs.inotify.max_user_watches`.
+const WATCH_MAX_DIRS: usize = 3000;
+/// Upper bound on entries reported by the catch-up listing for a freshly
+/// created directory (bytes for a wholly new subtree).
+const WATCH_MAX_ENTRIES: usize = 5000;
+/// Once this many `watch()` calls failed (watch-limit reached), stop trying
+/// to register more directories and report the error once.
+const WATCH_MAX_FAILURES: usize = 32;
+/// Debounce window before events are forwarded to the frontend.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsEvent {
+    root: String,
+    kind: String,
+    paths: Vec<String>,
+    is_dir: Option<bool>,
+}
+
+#[derive(Default)]
+struct WatcherInner {
+    watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    root: Option<PathBuf>,
+    watched: HashSet<PathBuf>,
+    failures: usize,
+    reported_limit: bool,
+    filter: Option<ignore::gitignore::Gitignore>,
+}
+
+#[derive(Default)]
+struct WatcherState {
+    inner: Arc<Mutex<WatcherInner>>,
+}
+
+fn build_watch_filter(root: &Path) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    for name in WATCH_IGNORED_NAMES {
+        let _ = builder.add_line(None, name);
+    }
+    if let Ok(body) = fs::read_to_string(root.join(".arcwatchignore")) {
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let _ = builder.add_line(None, line);
+        }
+    }
+    builder.build().unwrap_or_else(|_| {
+        ignore::gitignore::GitignoreBuilder::new(Path::new(""))
+            .build()
+            .expect("empty gitignore builder cannot fail")
+    })
+}
+
+/// True when a path should produce no tree-sync events because it sits in a
+/// tooling directory or matches a user's `.arcwatchignore` pattern.
+fn is_watch_ignored(
+    filter: &ignore::gitignore::Gitignore,
+    root: &Path,
+    path: &Path,
+    is_dir: bool,
+) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    let mut stack = PathBuf::new();
+    let depth = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return true;
+        };
+        if WATCH_IGNORED_NAMES.contains(&name.to_string_lossy().as_ref()) {
+            return true;
+        }
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        stack.push(name);
+        let component_is_dir = index + 1 < depth || is_dir && index + 1 == depth;
+        if filter.matched(&stack, component_is_dir).is_ignore() {
+            return true;
+        }
+    }
+    false
+}
+
+fn map_fs_event(
+    filter: &ignore::gitignore::Gitignore,
+    root: &Path,
+    event: &Event,
+) -> Option<FsEvent> {
+    if event.paths.is_empty() {
+        return None;
+    }
+    let accepted = |path: &Path, is_dir: Option<bool>| -> bool {
+        if !path.starts_with(root) {
+            return false;
+        }
+        !is_watch_ignored(filter, root, path, is_dir.unwrap_or(false))
+    };
+    let root_string = root.to_string_lossy().replace('\\', "/");
+    let absolute_paths = |paths: &[PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect()
+    };
+    let (kind, is_dir) = match &event.kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            let path = event.paths.last().unwrap();
+            let is_dir = fs::metadata(path).map(|data| data.is_dir()).ok();
+            if !accepted(path, is_dir) {
+                return None;
+            }
+            ("created", is_dir)
+        }
+        EventKind::Remove(_) => {
+            let path = event.paths.last().unwrap();
+            if !path.starts_with(root) || is_watch_ignored(filter, root, path, true) {
+                return None;
+            }
+            ("removed", None)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
+            let to = &event.paths[1];
+            let is_dir = fs::metadata(to).map(|data| data.is_dir()).ok();
+            if accepted(to, is_dir) {
+                ("renamed", is_dir)
+            } else if accepted(&event.paths[0], None) {
+                // filename renamed out of the workspace from the tree's view
+                ("removed", None)
+            } else {
+                return None;
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            let path = &event.paths[0];
+            if !accepted(path, None) {
+                return None;
+            }
+            ("removed", None)
+        }
+        EventKind::Modify(_) => {
+            let path = event.paths.last().unwrap();
+            if !accepted(path, None) {
+                return None;
+            }
+            ("modified", None)
+        }
+        _ => return None,
+    };
+    let paths_out = if kind == "removed" {
+        let last = event.paths.last().unwrap();
+        absolute_paths(std::slice::from_ref(last))
+    } else {
+        absolute_paths(&event.paths)
+    };
+    Some(FsEvent {
+        root: root_string,
+        kind: kind.to_string(),
+        paths: paths_out,
+        is_dir,
+    })
+}
+
+/// Point the watcher at `dir` and every non-ignored subdirectory below it.
+/// Per-directory registration instead of one recursive watch keeps
+/// `node_modules`-style churn from exhausting inotify watches.
+fn watch_directory_tree(
+    debouncer: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
+    watched: &mut HashSet<PathBuf>,
+    filter: &ignore::gitignore::Gitignore,
+    root: &Path,
+    dir: &Path,
+    failures: &mut usize,
+) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut stalled = false;
+    while let Some(current) = stack.pop() {
+        if watched.len() >= WATCH_MAX_DIRS || *failures >= WATCH_MAX_FAILURES {
+            stalled = true;
+            break;
+        }
+        if !watched.insert(current.clone()) {
+            continue; // already registered
+        }
+        if let Err(_error) = debouncer.watch(
+            &current,
+            notify_debouncer_full::notify::RecursiveMode::NonRecursive,
+        ) {
+            *failures += 1;
+            watched.remove(&current);
+            stalled = true;
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue; // vanished before the watch could apply
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let child = entry.path();
+            if is_watch_ignored(filter, root, &child, true) {
+                continue;
+            }
+            stack.push(child);
+        }
+    }
+    stalled
+}
+
+/// List `dir` and everything below it (skipping tooling directories and
+/// `.arcwatchignore` matches) as one synthetic `created` event per entry.
+/// This closes the races between a fresh folder tree and the watcher tree
+/// registration.
+fn list_catch_up_events(
+    filter: &ignore::gitignore::Gitignore,
+    root: &Path,
+    dir: &Path,
+) -> Vec<FsEvent> {
+    let root_string = root.to_string_lossy().replace('\\', "/");
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        if out.len() >= WATCH_MAX_ENTRIES {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue; // vanished between the event and the registration
+        };
+        for entry in entries.flatten() {
+            if out.len() >= WATCH_MAX_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            if is_watch_ignored(filter, root, &path, is_dir) {
+                continue;
+            }
+            if relative_watch_path(root, &path).is_empty() {
+                continue;
+            }
+            out.push(FsEvent {
+                root: root_string.clone(),
+                kind: "created".to_string(),
+                paths: vec![path.to_string_lossy().replace('\\', "/")],
+                is_dir: Some(is_dir),
+            });
+            if is_dir {
+                pending.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn relative_watch_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|rest| rest.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn watch_project(
+    app: tauri::AppHandle,
+    state: State<'_, WatcherState>,
+    root: String,
+) -> Result<String, String> {
+    let root_path =
+        fs::canonicalize(&root).map_err(|error| format!("Could not watch {root}: {error}"))?;
+    let filter = build_watch_filter(&root_path);
+    let (send, receive) = channel::<notify_debouncer_full::DebounceEventResult>();
+    let mut debouncer = new_debouncer(WATCH_DEBOUNCE, None, send)
+        .map_err(|error| format!("Could not start file watcher: {error}"))?;
+
+    let mut watched = HashSet::new();
+    let mut failures = 0_usize;
+
+    {
+        let mut inner = state.inner.lock().map_err(|_error| "watcher poisoned")?;
+        inner.watcher = None;
+        inner.root = None;
+        inner.watched.clear();
+        inner.failures = 0;
+        watch_directory_tree(
+            &mut debouncer,
+            &mut watched,
+            &filter,
+            &root_path,
+            &root_path,
+            &mut failures,
+        );
+        if !watched.contains(&root_path) {
+            return Err(format!(
+                "Could not watch {root}: watcher registration failed"
+            ));
+        }
+        inner.watcher = Some(debouncer);
+        inner.root = Some(root_path.clone());
+        inner.watched = watched;
+        inner.failures = failures;
+        inner.filter = Some(filter);
+        inner.reported_limit = false;
+    }
+    if failures >= WATCH_MAX_FAILURES {
+        let _ = app.emit(
+            "fs-watcher-error",
+            "Live file updates stopped: too many files (watch limit reached). Changes will appear after refresh.",
+        );
+    }
+
+    let app_handle = app.clone();
+    let inner_state = state.inner.clone();
+    let thread_root = root_path.clone();
+    thread::spawn(move || {
+        let mut last_reported = Instant::now() - Duration::from_secs(30);
+        for result in receive {
+            match result {
+                Ok(events) => {
+                    let filter = {
+                        let inner = match inner_state.lock() {
+                            Ok(inner) => inner,
+                            Err(_) => return,
+                        };
+                        if inner.root.as_deref() != Some(thread_root.as_path()) {
+                            return;
+                        }
+                        match inner.filter.as_ref() {
+                            Some(filter) => filter.clone(),
+                            None => return,
+                        }
+                    };
+                    let mut removed: Vec<PathBuf> = Vec::new();
+                    let mut created_dirs: Vec<PathBuf> = Vec::new();
+                    let mut mapped: Vec<FsEvent> = Vec::new();
+                    for debounced in events {
+                        if let Some(event) = map_fs_event(&filter, &thread_root, &debounced.event) {
+                            match event.kind.as_str() {
+                                "created" | "renamed" => {
+                                    created_dirs.push(PathBuf::from(
+                                        event.paths.last().cloned().unwrap_or_default(),
+                                    ));
+                                }
+                                "removed" => removed.push(PathBuf::from(
+                                    event.paths.last().cloned().unwrap_or_default(),
+                                )),
+                                _ => {}
+                            }
+                            if event.kind == "renamed" && event.paths.len() > 1 {
+                                removed.push(PathBuf::from(event.paths[0].clone()));
+                            }
+                            mapped.push(event);
+                        }
+                    }
+                    for event in mapped {
+                        app_handle.emit("fs-changed", event).ok();
+                    }
+                    if !removed.is_empty() || !created_dirs.is_empty() {
+                        let mut guard = match inner_state.lock() {
+                            Ok(inner) => inner,
+                            Err(_) => return,
+                        };
+                        let inner: &mut WatcherInner = &mut guard;
+                        for path in removed {
+                            inner.watched.retain(|watched| {
+                                !(watched == &path || watched.starts_with(&path))
+                            });
+                        }
+                        for path in created_dirs {
+                            let Ok(is_dir) = fs::metadata(&path).map(|data| data.is_dir()) else {
+                                continue;
+                            };
+                            if !is_dir {
+                                continue;
+                            }
+                            let mut debouncer = match inner.watcher.take() {
+                                Some(debouncer) => debouncer,
+                                None => continue,
+                            };
+                            let stalled = watch_directory_tree(
+                                &mut debouncer,
+                                &mut inner.watched,
+                                &filter,
+                                &thread_root,
+                                &path,
+                                &mut inner.failures,
+                            );
+                            if inner.root.as_deref() != Some(thread_root.as_path()) {
+                                // A workspace switch replaced the watcher while we
+                                // were walking; keep the new one intact.
+                                continue;
+                            }
+                            inner.watcher = Some(debouncer);
+                            if inner.failures == WATCH_MAX_FAILURES && !inner.reported_limit {
+                                inner.reported_limit = true;
+                                let _ = app_handle.emit(
+                                    "fs-watcher-error",
+                                    "Live file updates stopped: too many files (watch limit reached). Changes will appear after refresh.",
+                                );
+                            }
+                            if !stalled {
+                                for catch_up in list_catch_up_events(&filter, &thread_root, &path) {
+                                    app_handle.emit("fs-changed", catch_up).ok();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(errors) => {
+                    if last_reported.elapsed() > Duration::from_secs(5) {
+                        last_reported = Instant::now();
+                        let message = errors
+                            .iter()
+                            .map(|error| error.to_string())
+                            .next()
+                            .unwrap_or_else(|| "watcher error".to_string());
+                        app_handle
+                            .emit(
+                                "fs-watcher-error",
+                                format!("Live file updates limited: {message}"),
+                            )
+                            .ok();
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(root_path.to_string_lossy().replace('\\', "/"))
+}
+
+#[tauri::command]
+fn unwatch_project(state: State<'_, WatcherState>, root: String) -> Result<(), String> {
+    let Ok(root_path) = fs::canonicalize(&root) else {
+        return Ok(()); // root gone; dropping the watcher below is enough
+    };
+    let mut inner = state.inner.lock().map_err(|_error| "watcher poisoned")?;
+    if inner.root.as_deref() == Some(root_path.as_path()) {
+        inner.watcher = None;
+        inner.root = None;
+        inner.watched.clear();
+        inner.failures = 0;
+        inner.reported_limit = false;
+        inner.filter = None;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalState::default())
         .manage(LocalHttpServerState::default())
+        .manage(WatcherState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
@@ -1508,6 +1980,8 @@ pub fn run() {
             workspace_access_allowed,
             workspace_grant_access,
             workspace_allow_hidden_path,
+            watch_project,
+            unwatch_project,
             plugin_process_is_running,
             set_native_background_blur,
             terminal_spawn,
@@ -1614,5 +2088,109 @@ mod tests {
             decode_url_path("/folder/a%20file.html").as_deref(),
             Some("folder/a file.html")
         );
+    }
+
+    #[test]
+    fn watcher_maps_events_and_filters_ignore_paths() {
+        use notify_debouncer_full::notify as notify_crate;
+        use notify_debouncer_full::notify::event::{CreateKind, DataChange, RemoveKind};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("arc-watch-root-{unique}"));
+        fs::create_dir_all(root.join("node_modules/pkgs")).unwrap();
+        fs::write(root.join("nested.txt"), "x").unwrap();
+        fs::write(root.join(".arcwatchignore"), "private/").unwrap();
+        let filter = build_watch_filter(&root);
+
+        let event = |kind: notify_crate::EventKind, paths: Vec<PathBuf>| {
+            let mut event = notify_crate::Event::new(kind);
+            event.paths = paths;
+            event
+        };
+
+        let created = map_fs_event(
+            &filter,
+            &root,
+            &event(
+                notify_crate::EventKind::Create(CreateKind::File),
+                vec![root.join("nested.txt")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            (created.kind.as_str(), created.is_dir),
+            ("created", Some(false))
+        );
+        assert_eq!(created.root, root.to_string_lossy().replace('\\', "/"));
+
+        assert!(map_fs_event(
+            &filter,
+            &root,
+            &event(
+                notify_crate::EventKind::Create(CreateKind::File),
+                vec![root.join("node_modules").join("pkg.js")],
+            ),
+        )
+        .is_none());
+
+        assert!(map_fs_event(
+            &filter,
+            &root,
+            &event(
+                notify_crate::EventKind::Create(CreateKind::Folder),
+                vec![root.join("private").join("x")],
+            ),
+        )
+        .is_none());
+
+        assert!(
+            map_fs_event(
+                &filter,
+                &root,
+                &event(
+                    notify_crate::EventKind::Remove(RemoveKind::File),
+                    vec![root.join("nested.txt")],
+                ),
+            )
+            .is_none()
+                == false // removed events must pass; metadata is gone anyway
+        );
+
+        assert!(map_fs_event(
+            &filter,
+            &root,
+            &event(
+                notify_crate::EventKind::Create(CreateKind::File),
+                vec!["/etc/passwd".into()],
+            ),
+        )
+        .is_none());
+
+        let renamed = map_fs_event(
+            &filter,
+            &root,
+            &event(
+                notify_debouncer_full::notify::event::EventKind::Modify(
+                    notify_debouncer_full::notify::event::ModifyKind::Name(
+                        notify_debouncer_full::notify::event::RenameMode::Both,
+                    ),
+                ),
+                vec![root.join("a.txt"), root.join("b.txt")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(renamed.kind, "renamed");
+        assert_eq!(renamed.paths.len(), 2);
+
+        assert_eq!(
+            relative_watch_path(&root, &root.join("kid").join("deep",)),
+            "kid/deep"
+        );
+        assert_eq!(relative_watch_path(&root, &Path::new("/etc")), "");
+
+        drop(fs::remove_dir_all(root));
     }
 }

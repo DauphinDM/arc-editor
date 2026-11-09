@@ -196,3 +196,7 @@
 .app-shell.app-theme-macos.editor-glass-enabled .editor-root,.app-shell.app-theme-macos.editor-glass-enabled .editor-layout,.app-shell.app-theme-macos.editor-glass-enabled .editor-empty{background:transparent}
 .icon-php{color:#777bb4}
 .editor-host{padding-top:0;padding-bottom:0}
+.disk-conflict{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:5px 12px;border-bottom:1px solid var(--line);background:#1c1f22;color:#e2c27d;font-size:10px}
+.disk-conflict span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.disk-conflict button{flex:0 0 auto;background:#303439;border:0;color:#dfe3e8;padding:3px 9px;font-size:10px;cursor:pointer}
+.disk-conflict button:hover{background:#3a4048}

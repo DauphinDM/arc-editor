@@ -53,6 +53,7 @@ import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
 import { php } from '@codemirror/lang-php';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
@@ -134,6 +135,12 @@ import {
 const TerminalView = lazy(() => import('./TerminalView'));
 
 type DiskFile = { name: string; path: string; kind: 'file' | 'directory' };
+type FsEvent = {
+  root: string;
+  kind: 'created' | 'removed' | 'renamed' | 'modified';
+  paths: string[];
+  isDir?: boolean;
+};
 type OpenFile = {
   path: string;
   name: string;
@@ -779,6 +786,9 @@ function EditorPane({
   onTerminalTitleChange,
   workspace,
   githubReloadToken,
+  diskConflict,
+  onConflictReload,
+  onConflictKeep,
   pluginPanel,
   pluginViews,
   editorViews,
@@ -799,6 +809,9 @@ function EditorPane({
   onTerminalTitleChange: (id: string, title: string) => void;
   workspace: string;
   githubReloadToken: number;
+  diskConflict?: boolean;
+  onConflictReload?: (path: string) => void;
+  onConflictKeep?: (path: string) => void;
   pluginPanel: ReactNode;
   pluginViews: PluginPanelContribution[];
   editorViews: { current: Map<string, EditorView> };
@@ -1223,6 +1236,13 @@ function EditorPane({
         )}
         <div className="tab-spacer" />
       </div>
+      {file && diskConflict && (
+        <div className="disk-conflict">
+          <span>{file.name} changed on disk.</span>
+          <button onClick={() => onConflictReload?.(file.path)}>Reload</button>
+          <button onClick={() => onConflictKeep?.(file.path)}>Keep mine</button>
+        </div>
+      )}
       {file && <div className="editor-host" ref={host} />}
       {group.activePath === GITHUB_TAB_KEY && (
         <GithubPanel workspace={workspace} reloadToken={githubReloadToken} />
@@ -1355,6 +1375,19 @@ function App() {
     { id: 'group-1', activePath: '', tabs: [] },
   ]);
   const [githubReloadToken, setGithubReloadToken] = useState(0);
+  const [diskConflicts, setDiskConflicts] = useState<Set<string>>(new Set());
+  const watcherRoot = useRef('');
+  const activeWatchRoot = useRef('');
+  const watchGeneration = useRef(0);
+  const fsEventQueue = useRef<FsEvent[]>([]);
+  const fsApplyScheduled = useRef(false);
+  const lastDiskWrite = useRef(new Map<string, string>());
+  const settingsRef = useRef<AppSettings>(settings);
+  const openFilesRef = useRef<OpenFile[]>([]);
+  const groupsRef = useRef<EditorGroup[]>([]);
+  const processFsEventsRef = useRef<(events: FsEvent[]) => Promise<void>>(
+    async () => undefined,
+  );
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const editorViews = useRef(new Map<string, EditorView>());
   const [layout, setLayout] = useState<LayoutNode>({
@@ -1740,6 +1773,291 @@ function App() {
     return newGroupId;
   };
 
+  // ---- Live file tree updates (backend watcher) ----
+
+  const processFsEvents = async (events: FsEvent[]) => {
+    if (!watcherRoot.current) return;
+    const root = watcherRoot.current;
+    const showHidden = settingsRef.current.showHiddenFiles;
+    const hidden = (relativePath: string) =>
+      !showHidden && relativePath.split('/').some((part) => part.startsWith('.'));
+    const relative = (absolutePath: string) =>
+      absolutePath.startsWith(`${root}/`)
+        ? absolutePath.slice(root.length + 1)
+        : absolutePath === root
+          ? ''
+          : '';
+    const removals: string[] = [];
+    const created: DiskFile[] = [];
+    const renames = new Map<string, string>();
+    const modified: string[] = [];
+    let rootGone = false;
+
+    for (const event of events) {
+      if (event.root !== root) continue;
+      if (event.kind === 'modified') {
+        const relativePath = relative(event.paths[0]);
+        if (relativePath) modified.push(relativePath);
+        continue;
+      }
+      if (event.kind === 'removed') {
+        const relativePath = relative(event.paths[0]);
+        removals.push(relativePath);
+        if (!relativePath) rootGone = true;
+        continue;
+      }
+      if (event.kind === 'created') {
+        const relativePath = relative(event.paths[0]);
+        if (relativePath && !hidden(relativePath)) {
+          created.push({
+            name: relativePath.split('/').at(-1) ?? relativePath,
+            path: relativePath,
+            kind: event.isDir ? 'directory' : 'file',
+          });
+        }
+        continue;
+      }
+      if (event.kind === 'renamed') {
+        const from = relative(event.paths[0]);
+        const to = relative(event.paths[1] ?? '');
+        if (!to) continue;
+        renames.set(from, to);
+        removals.push(from);
+        if (!hidden(to)) {
+          created.push({
+            name: to.split('/').at(-1) ?? to,
+            path: to,
+            kind: event.isDir ? 'directory' : 'file',
+          });
+        }
+      }
+    }
+
+    if (rootGone) {
+      setFiles([]);
+    } else if (removals.length > 0 || created.length > 0) {
+      setFiles((current) => {
+        const next = current.filter(
+          (file) =>
+            !removals.some(
+              (relativePath) =>
+                relativePath &&
+                (file.path === relativePath ||
+                  file.path.startsWith(`${relativePath}/`)),
+            ),
+        );
+        const added: DiskFile[] = [];
+        const seen = new Set(next.map((file) => file.path));
+        for (const entry of created) {
+          if (seen.has(entry.path)) continue;
+          added.push(entry);
+          seen.add(entry.path);
+        }
+        return added.length ? [...next, ...added] : next;
+      });
+    }
+
+    const doomed = new Set<string>();
+    for (const relativePath of removals) {
+      if (!relativePath) continue;
+      for (const file of openFilesRef.current) {
+        if (
+          (file.path === relativePath ||
+            file.path.startsWith(`${relativePath}/`)) &&
+          !file.dirty &&
+          ![...renames.keys()].some(
+            (from) =>
+              file.path === from || file.path.startsWith(`${from}/`),
+          )
+        ) {
+          doomed.add(file.path);
+        }
+      }
+    }
+    if (doomed.size) {
+      for (const path of doomed) fileContents.current.delete(path);
+      setOpenFiles((current) =>
+        current.filter((file) => !doomed.has(file.path)),
+      );
+      normalizeGroups(
+        groupsRef.current.map((group) => {
+          const tabs = group.tabs.filter((tab) => !doomed.has(tab));
+          return {
+            ...group,
+            tabs,
+            activePath: doomed.has(group.activePath)
+              ? (tabs.at(-1) ?? '')
+              : group.activePath,
+          };
+        }),
+      );
+    }
+    if (renames.size > 0) {
+      const remap = (path: string) => {
+        let next = path;
+        for (const [from, to] of renames) {
+          if (next === from) next = to;
+          else if (from && next.startsWith(`${from}/`))
+            next = `${to}${next.slice(from.length)}`;
+        }
+        return next;
+      };
+      const touches = (path: string) =>
+        [...renames.keys()].some(
+          (from) => path === from || path.startsWith(`${from}/`),
+        );
+      if (openFilesRef.current.some((file) => touches(file.path))) {
+        fileContents.current = new Map(
+          [...fileContents.current].map(([path, content]) => [
+            remap(path),
+            content,
+          ]),
+        );
+        lastDiskWrite.current = new Map(
+          [...lastDiskWrite.current].map(([path, content]) => [
+            remap(path),
+            content,
+          ]),
+        );
+        setOpenFiles((current) =>
+          current.map((file) => {
+            const next = remap(file.path);
+            return next === file.path
+              ? file
+              : {
+                  ...file,
+                  path: next,
+                  name: next.split('/').pop() ?? file.name,
+                };
+          }),
+        );
+        setGroups((current) =>
+          current.map((group) => ({
+            ...group,
+            tabs: group.tabs.map(remap),
+            activePath: group.activePath ? remap(group.activePath) : '',
+          })),
+        );
+        setDiskConflicts((current) => new Set([...current].map(remap)));
+        setExpanded((current) => new Set([...current].map(remap)));
+      }
+    }
+
+    for (const relativePath of modified) {
+      const open = openFilesRef.current.find(
+        (file) => file.path === relativePath,
+      );
+      if (!open) continue;
+      try {
+        const content = await readTextFile(`${root}/${relativePath}`);
+        const lastWritten = lastDiskWrite.current.get(relativePath);
+        if (lastWritten !== undefined && lastWritten === content) continue;
+        if (open.dirty) {
+          setDiskConflicts((current) =>
+            current.has(relativePath)
+              ? current
+              : new Set(current).add(relativePath),
+          );
+          continue;
+        }
+        fileContents.current.set(relativePath, content);
+        setOpenFiles((current) =>
+          current.map((file) =>
+            file.path === relativePath
+              ? { ...file, revision: file.revision + 1, dirty: false }
+              : file,
+          ),
+        );
+      } catch {
+        // The file vanished; the follow-up remove event closes the tab.
+      }
+    }
+  };
+  useEffect(() => {
+    processFsEventsRef.current = processFsEvents;
+  });
+
+  useEffect(() => {
+    settingsRef.current = settings;
+    openFilesRef.current = openFiles;
+    groupsRef.current = groups;
+  });
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const unlistenAll = Promise.all([
+      listen<FsEvent>('fs-changed', (event) => {
+        fsEventQueue.current.push(event.payload);
+        if (fsApplyScheduled.current) return;
+        fsApplyScheduled.current = true;
+        const flush = () => {
+          fsApplyScheduled.current = false;
+          const events = fsEventQueue.current;
+          fsEventQueue.current = [];
+          if (!events.length) return;
+          if (!watcherRoot.current) {
+            // Watcher handle not wired yet (watch_project pending): retry.
+            if (fsEventQueue.current.length > 500) fsEventQueue.current = [];
+            fsEventQueue.current.push(...events);
+            fsApplyScheduled.current = true;
+            window.setTimeout(flush, 120);
+            return;
+          }
+          void processFsEventsRef.current(events);
+        };
+        window.requestAnimationFrame(flush);
+      }),
+      listen<string>('fs-watcher-error', (event) => {
+        setMessage(event.payload);
+      }),
+    ]);
+    return () => {
+      void unlistenAll.then((unlisten) => unlisten.forEach((fn) => fn()));
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const generation = ++watchGeneration.current;
+    let cancelled = false;
+    const unwatchPath = async (path: string) => {
+      try {
+        await invoke('unwatch_project', { root: path });
+      } catch {
+        // best effort
+      }
+    };
+    void (async () => {
+      const previous = activeWatchRoot.current;
+      if (previous) await unwatchPath(previous);
+      if (!workspace) {
+        watcherRoot.current = '';
+        activeWatchRoot.current = '';
+        return;
+      }
+      try {
+        const watched = await invoke<string>('watch_project', {
+          root: workspace,
+        });
+        if (cancelled || generation !== watchGeneration.current) {
+          // A newer run owns the watcher (watch_project replaces the backend
+          // watcher outright); never unwatch from a stale run.
+          return;
+        }
+        watcherRoot.current = watched;
+        activeWatchRoot.current = watched;
+      } catch (error) {
+        if (cancelled) return;
+        watcherRoot.current = '';
+        activeWatchRoot.current = '';
+        setMessage(`Live file updates unavailable: ${String(error)}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace]);
+
   const updateTerminalTitle = useCallback((id: string, title: string) => {
     setTerminals((current) =>
       current.map((terminal) =>
@@ -1841,6 +2159,10 @@ function App() {
         'build',
         '.next',
         'target',
+        '__pycache__',
+        '.venv',
+        'venv',
+        '.cache',
       ]);
       const pending = [{ folder: rootPath, prefix: '' }];
       let pendingIndex = 0;
@@ -1918,6 +2240,26 @@ function App() {
     observer.observe(element);
     return () => observer.disconnect();
   }, [viewerOpen, workspace]);
+
+  useEffect(() => {
+    // Fallback when the backend watcher is unavailable (watch reached its
+    // limit, unsupported mount): refresh the tree when the window regains
+    // focus so external edits are still picked up eventually.
+    if (!isTauri() || !workspace) return;
+    const rescan = () => {
+      if (document.visibilityState !== 'visible') return;
+      // With the backend watcher healthy the tree stays live; rescan only
+      // serves as the fallback for watch failure / unsupported mounts.
+      if (watcherRoot.current) return;
+      void refreshWorkspace(workspace);
+    };
+    window.addEventListener('focus', rescan);
+    document.addEventListener('visibilitychange', rescan);
+    return () => {
+      window.removeEventListener('focus', rescan);
+      document.removeEventListener('visibilitychange', rescan);
+    };
+  }, [refreshWorkspace, workspace]);
 
   useEffect(() => {
     if (workspace) void refreshWorkspace(workspace);
@@ -2287,6 +2629,13 @@ function App() {
       try {
         await writeTextFile(`${workspace}/${file.path}`, content);
         fileContents.current.set(path, content);
+        lastDiskWrite.current.set(path, content);
+        setDiskConflicts((current) => {
+          if (!current.has(path)) return current;
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
         setOpenFiles((current) =>
           current.map((entry) =>
             entry.path === path
@@ -2362,6 +2711,43 @@ function App() {
     },
     [openFiles, updateFile],
   );
+
+  const reloadFromDisk = useCallback(
+    async (path: string) => {
+      if (!workspace) return;
+      setDiskConflicts((current) => {
+        if (!current.has(path)) return current;
+        const next = new Set(current);
+        next.delete(path);
+        return next;
+      });
+      const file = openFilesRef.current.find((entry) => entry.path === path);
+      if (!file) return;
+      try {
+        const content = await readTextFile(`${workspace}/${path}`);
+        fileContents.current.set(path, content);
+        setOpenFiles((current) =>
+          current.map((entry) =>
+            entry.path === path
+              ? { ...entry, revision: entry.revision + 1, dirty: false }
+              : entry,
+          ),
+        );
+      } catch (error) {
+        setMessage(`Could not reload ${file.name}: ${String(error)}`);
+      }
+    },
+    [workspace],
+  );
+
+  const keepBuffer = useCallback((path: string) => {
+    setDiskConflicts((current) => {
+      if (!current.has(path)) return current;
+      const next = new Set(current);
+      next.delete(path);
+      return next;
+    });
+  }, []);
 
   const closeTab = useCallback(
     async (groupId: GroupId, path: string) => {
@@ -3611,6 +3997,9 @@ function App() {
         onTerminalTitleChange={updateTerminalTitle}
         workspace={workspace}
         githubReloadToken={githubReloadToken}
+        diskConflict={diskConflicts.has(group.activePath)}
+        onConflictReload={reloadFromDisk}
+        onConflictKeep={keepBuffer}
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
         pluginPanel={
