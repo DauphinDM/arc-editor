@@ -1431,6 +1431,17 @@ function App() {
     );
   }, [settings]);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    const enabled = settings.editorGlassEnabled && settings.nativeBackgroundBlurEnabled;
+    void invoke('set_native_background_blur', { enabled }).catch((error) => {
+      if (enabled) {
+        setSettings((current) => ({ ...current, nativeBackgroundBlurEnabled: false }));
+      }
+      setMessage(`Could not ${enabled ? 'enable' : 'disable'} desktop blur: ${String(error)}`);
+    });
+  }, [settings.editorGlassEnabled, settings.nativeBackgroundBlurEnabled]);
+
   const runPluginAction = async (action: PluginToolbarAction) => {
     try {
       await action.onClick();

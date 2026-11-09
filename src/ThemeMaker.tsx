@@ -132,7 +132,6 @@ export default function ThemeMaker({
     background: glassFill(theme.colors.background, settings.glassAppTransparency),
     color: theme.colors.text,
     "--editor-glass-blur": `${settings.editorGlassBlur}px`,
-    "--editor-glass-saturation": `${settings.editorGlassSaturation}%`,
     "--glass-app-transparency": `${settings.editorGlassEnabled ? settings.glassAppTransparency : 0}%`,
     "--glass-sidebar-transparency": `${settings.editorGlassEnabled ? settings.glassSidebarTransparency : 0}%`,
     "--glass-controls-transparency": `${settings.editorGlassEnabled ? settings.glassControlsTransparency : 0}%`,

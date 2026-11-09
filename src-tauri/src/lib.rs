@@ -434,6 +434,53 @@ fn plugin_process_is_running(names: Vec<String>) -> Result<bool, String> {
     }
 }
 
+#[tauri::command]
+fn set_native_background_blur(window: tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            window_vibrancy::apply_acrylic(&window, None)
+        } else {
+            window_vibrancy::clear_acrylic(&window)
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if enabled {
+            window_vibrancy_wayland::apply_blur(&window, None)
+        } else {
+            match window_vibrancy_wayland::clear_blur(&window) {
+                Err(
+                    window_vibrancy_wayland::Error::UnsupportedPlatform(_)
+                    | window_vibrancy_wayland::Error::UnsupportedPlatformVersion(_),
+                ) => Ok(()),
+                result => result,
+            }
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if enabled {
+            window_vibrancy::apply_vibrancy(
+                &window,
+                window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground,
+                None,
+                None,
+            )
+        } else {
+            window_vibrancy::clear_vibrancy(&window).map(|_| ())
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (window, enabled);
+        Err("Native desktop blur is unsupported on this platform.".to_string())
+    }
+}
+
 fn external_command(program: &str) -> Command {
     let mut command = Command::new(program);
     #[cfg(target_os = "linux")]
@@ -1462,6 +1509,7 @@ pub fn run() {
             workspace_grant_access,
             workspace_allow_hidden_path,
             plugin_process_is_running,
+            set_native_background_blur,
             terminal_spawn,
             terminal_write,
             terminal_resize,

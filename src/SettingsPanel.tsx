@@ -92,8 +92,9 @@ export default function SettingsPanel({
             </>}
             {activeCategory === "appearance" && <>
               <section className="settings-section"><h3>Transparency and blur</h3>
-                {toggle("editorGlassEnabled", "Frosted glass", "Apply transparency across app surfaces. Linux blur depends on compositor settings.")}
+                {toggle("editorGlassEnabled", "Frosted glass", "Apply transparency across app surfaces.")}
                 {settings.editorGlassEnabled && <>
+                  {toggle("nativeBackgroundBlurEnabled", "Blur desktop background", "Use native OS blur when supported. Linux X11 is unsupported; system controls strength.")}
                   {transparency("glassAppTransparency", "Window background")}
                   {transparency("glassSidebarTransparency", "File viewer")}
                   {transparency("editorGlassTransparency", "Editor")}
@@ -102,8 +103,7 @@ export default function SettingsPanel({
                   {transparency("glassFloatingTransparency", "Menus and popovers")}
                   {transparency("glassSettingsTransparency", "Settings panel")}
                   {transparency("glassControlsTransparency", "Inputs and controls")}
-                  <label className="setting-field"><span>Blur <b>{settings.editorGlassBlur}px</b></span><input type="range" min="0" max="40" step="1" value={settings.editorGlassBlur} onChange={(event) => onChange({ editorGlassBlur: Number(event.target.value) })} /></label>
-                  <label className="setting-field"><span>Background saturation <b>{settings.editorGlassSaturation}%</b></span><input type="range" min="50" max="200" step="5" value={settings.editorGlassSaturation} onChange={(event) => onChange({ editorGlassSaturation: Number(event.target.value) })} /></label>
+                  <label className="setting-field"><span>In-app blur <b>{settings.editorGlassBlur}px</b></span><input type="range" min="0" max="40" step="1" value={settings.editorGlassBlur} onChange={(event) => onChange({ editorGlassBlur: Number(event.target.value) })} /></label>
                 </>}
               </section>
               <section className="settings-section"><h3>Interface</h3>
