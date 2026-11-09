@@ -44,6 +44,22 @@ const githubLoadedWorkspaces = new Set<string>();
 const githubFailedWorkspaces = new Set<string>();
 const githubReloadTokens = new Map<string, number>();
 const githubPendingLoads = new Map<string, { token: number; promise: Promise<void> }>();
+const githubWorkspaceOrder: string[] = [];
+const GITHUB_WORKSPACE_CACHE_LIMIT = 6;
+
+function touchGithubWorkspace(workspace: string) {
+  const index = githubWorkspaceOrder.indexOf(workspace);
+  if (index >= 0) githubWorkspaceOrder.splice(index, 1);
+  githubWorkspaceOrder.push(workspace);
+  while (githubWorkspaceOrder.length > GITHUB_WORKSPACE_CACHE_LIMIT) {
+    const oldest = githubWorkspaceOrder.shift();
+    if (oldest === undefined) break;
+    githubStatusCache.delete(oldest);
+    githubLoadedWorkspaces.delete(oldest);
+    githubFailedWorkspaces.delete(oldest);
+    githubReloadTokens.delete(oldest);
+  }
+}
 
 type SetupPlatform = "windows" | "linux" | "macos";
 type LinuxDistro = "debian" | "fedora" | "arch" | "opensuse" | "alpine" | "other";
@@ -243,6 +259,7 @@ export default function GithubPanel({ workspace, reloadToken }: { workspace: str
   }, [refresh]);
 
   useEffect(() => {
+    touchGithubWorkspace(workspace);
     setRepoName(workspace.split(/[\\/]/).filter(Boolean).at(-1) ?? "my-project");
     const pending = githubPendingLoads.get(workspace);
     if (pending?.token === reloadToken) {

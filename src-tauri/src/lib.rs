@@ -361,7 +361,11 @@ fn workspace_grant_access(app: tauri::AppHandle, root: String) -> Result<(), Str
     if !root.is_dir() {
         return Err("Workspace path is not a folder.".to_string());
     }
-    app.fs_scope()
+    let scope = app.fs_scope();
+    if scope.is_allowed(&root) {
+        return Ok(());
+    }
+    scope
         .allow_directory(root, true)
         .map_err(|error| error.to_string())
 }
@@ -383,6 +387,9 @@ fn workspace_allow_hidden_path(
         return Err("Hidden path is outside the workspace.".to_string());
     }
     let scope = app.fs_scope();
+    if scope.is_allowed(&path) {
+        return Ok(());
+    }
     if directory {
         scope
             .allow_directory(path, true)
@@ -1096,8 +1103,10 @@ fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let generation = Arc::new(AtomicU64::new(local_file_signature(&root)));
+    let last_request = Arc::new(AtomicU64::new(now_millis()));
     let server_stop = Arc::clone(&stop);
     let server_generation = Arc::clone(&generation);
+    let server_last_request = Arc::clone(&last_request);
     let server_root = root.clone();
     let server_thread = thread::spawn(move || {
         while !server_stop.load(Ordering::Relaxed) {
@@ -1105,8 +1114,14 @@ fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
                 Ok((stream, _)) => {
                     let request_root = server_root.clone();
                     let request_generation = Arc::clone(&server_generation);
+                    let request_last_request = Arc::clone(&server_last_request);
                     thread::spawn(move || {
-                        handle_local_request(stream, &request_root, &request_generation);
+                        handle_local_request(
+                            stream,
+                            &request_root,
+                            &request_generation,
+                            &request_last_request,
+                        );
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1119,6 +1134,7 @@ fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
 
     let watch_stop = Arc::clone(&stop);
     let watch_generation = Arc::clone(&generation);
+    let watch_last_request = Arc::clone(&last_request);
     let watch_root = root.clone();
     let watcher_thread = thread::spawn(move || {
         let mut previous = watch_generation.load(Ordering::Relaxed);
@@ -1126,6 +1142,10 @@ fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
             thread::sleep(Duration::from_millis(700));
             if watch_stop.load(Ordering::Relaxed) {
                 break;
+            }
+            // No browser polling the reload endpoint: skip the tree walk.
+            if now_millis().saturating_sub(watch_last_request.load(Ordering::Relaxed)) > 30_000 {
+                continue;
             }
             let current = local_file_signature(&watch_root);
             if current != previous {
@@ -1143,7 +1163,19 @@ fn create_local_http_server(root: PathBuf) -> Result<LocalHttpServer, String> {
     })
 }
 
-fn handle_local_request(mut stream: TcpStream, root: &Path, generation: &AtomicU64) {
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn handle_local_request(
+    mut stream: TcpStream,
+    root: &Path,
+    generation: &AtomicU64,
+    last_request: &AtomicU64,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request = Vec::with_capacity(1024);
     let mut buffer = [0_u8; 1024];
@@ -1203,6 +1235,7 @@ fn handle_local_request(mut stream: TcpStream, root: &Path, generation: &AtomicU
         return;
     };
     if relative == "__arc_live_reload" {
+        last_request.store(now_millis(), Ordering::Relaxed);
         let body = generation.load(Ordering::Relaxed).to_string();
         respond_live_request(
             &mut stream,
@@ -1478,7 +1511,7 @@ fn local_file_signature(root: &Path) -> u64 {
             }
             path.strip_prefix(root)
                 .unwrap_or(&path)
-                .to_string_lossy()
+                .as_os_str()
                 .hash(&mut hasher);
             if let Ok(metadata) = entry.metadata() {
                 metadata.len().hash(&mut hasher);

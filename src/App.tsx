@@ -51,7 +51,6 @@ import {
 } from '@codemirror/autocomplete';
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
-import { php } from '@codemirror/lang-php';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -105,10 +104,6 @@ import {
   SiYaml,
 } from 'react-icons/si';
 import { appDataDir, join } from '@tauri-apps/api/path';
-import SettingsPanel from './SettingsPanel';
-import GithubPanel from './GithubPanel';
-import PluginPanel from './PluginPanel';
-import ThemeMaker from './ThemeMaker';
 import './pluginExtensions.css';
 import './panel-layout.css';
 import { forgetTerminalOutput } from './terminalOutput';
@@ -133,6 +128,10 @@ import {
 } from './settings';
 
 const TerminalView = lazy(() => import('./TerminalView'));
+const SettingsPanel = lazy(() => import('./SettingsPanel'));
+const GithubPanel = lazy(() => import('./GithubPanel'));
+const PluginPanel = lazy(() => import('./PluginPanel'));
+const ThemeMaker = lazy(() => import('./ThemeMaker'));
 
 type DiskFile = { name: string; path: string; kind: 'file' | 'directory' };
 type FsEvent = {
@@ -635,6 +634,17 @@ function expandDocumentTemplate(view: EditorView, extension: string): boolean {
 const extensionOf = (name: string) =>
   name.split('.').pop()?.toLowerCase() ?? '';
 
+function contentFingerprint(value: string): string {
+  let hashA = 0x811c9dc5;
+  let hashB = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    hashA = Math.imul(hashA ^ code, 0x01000193);
+    hashB = Math.imul(hashB ^ code, 0x85ebca6b);
+  }
+  return `${value.length}:${(hashA >>> 0).toString(36)}:${(hashB >>> 0).toString(36)}`;
+}
+
 async function prettierFormat(
   name: string,
   content: string,
@@ -755,7 +765,7 @@ function PluginToolbarIcon({ name }: { name?: string }) {
 async function loadCodeLanguage(extension: string): Promise<Extension> {
   if (['html', 'htm', 'svg'].includes(extension))
     return (await import('@codemirror/lang-html')).html();
-  if (extension === 'php') return php();
+  if (extension === 'php') return (await import('@codemirror/lang-php')).php();
   if (['css', 'scss'].includes(extension))
     return (await import('@codemirror/lang-css')).css();
   if (['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx'].includes(extension)) {
@@ -1245,7 +1255,9 @@ function EditorPane({
       )}
       {file && <div className="editor-host" ref={host} />}
       {group.activePath === GITHUB_TAB_KEY && (
-        <GithubPanel workspace={workspace} reloadToken={githubReloadToken} />
+        <Suspense fallback={<div className="editor-empty" />}>
+          <GithubPanel workspace={workspace} reloadToken={githubReloadToken} />
+        </Suspense>
       )}
       {group.activePath === PLUGIN_TAB_KEY && pluginPanel}
       {pluginViewsByKey.has(group.activePath) && (
@@ -1382,6 +1394,7 @@ function App() {
   const fsEventQueue = useRef<FsEvent[]>([]);
   const fsApplyScheduled = useRef(false);
   const lastDiskWrite = useRef(new Map<string, string>());
+  const allowedHiddenPaths = useRef(new Set<string>());
   const settingsRef = useRef<AppSettings>(settings);
   const openFilesRef = useRef<OpenFile[]>([]);
   const groupsRef = useRef<EditorGroup[]>([]);
@@ -1468,6 +1481,19 @@ function App() {
       JSON.stringify({ ...settings, version: APP_SETTINGS_VERSION }),
     );
   }, [settings]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void (async () => {
+      try {
+        const trashRoot = await join(await appDataDir(), 'undo-trash');
+        if (await exists(trashRoot))
+          await remove(trashRoot, { recursive: true });
+      } catch {
+        // Best effort: a stale trash folder must not block startup.
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -1875,7 +1901,10 @@ function App() {
       }
     }
     if (doomed.size) {
-      for (const path of doomed) fileContents.current.delete(path);
+      for (const path of doomed) {
+        fileContents.current.delete(path);
+        lastDiskWrite.current.delete(path);
+      }
       setOpenFiles((current) =>
         current.filter((file) => !doomed.has(file.path)),
       );
@@ -1984,7 +2013,11 @@ function App() {
       try {
         const content = await readTextFile(`${root}/${relativePath}`);
         const lastWritten = lastDiskWrite.current.get(relativePath);
-        if (lastWritten !== undefined && lastWritten === content) continue;
+        if (
+          lastWritten !== undefined &&
+          lastWritten === contentFingerprint(content)
+        )
+          continue;
         if (open.dirty) {
           setDiskConflicts((current) =>
             current.has(relativePath)
@@ -2030,8 +2063,8 @@ function App() {
           if (!events.length) return;
           if (!watcherRoot.current) {
             // Watcher handle not wired yet (watch_project pending): retry.
-            if (fsEventQueue.current.length > 500) fsEventQueue.current = [];
-            fsEventQueue.current.push(...events);
+            fsEventQueue.current =
+              events.length > 500 ? events.slice(-500) : events;
             fsApplyScheduled.current = true;
             window.setTimeout(flush, 120);
             return;
@@ -2228,11 +2261,16 @@ function App() {
             )
               continue;
             if (entry.name.startsWith('.')) {
-              await invoke('workspace_allow_hidden_path', {
-                root: rootPath,
-                path: `${folder.folder}/${entry.name}`,
-                directory: entry.isDirectory,
-              });
+              const hiddenPath = `${folder.folder}/${entry.name}`;
+              const hiddenKey = `${rootPath}:${hiddenPath}`;
+              if (!allowedHiddenPaths.current.has(hiddenKey)) {
+                await invoke('workspace_allow_hidden_path', {
+                  root: rootPath,
+                  path: hiddenPath,
+                  directory: entry.isDirectory,
+                });
+                allowedHiddenPaths.current.add(hiddenKey);
+              }
             }
             const relative = folder.prefix
               ? `${folder.prefix}/${entry.name}`
@@ -2563,6 +2601,15 @@ function App() {
       setWorkspace(selected);
       setOpenFiles([]);
       fileContents.current.clear();
+      lastDiskWrite.current.clear();
+      allowedHiddenPaths.current.clear();
+      setDiskConflicts(new Set());
+      for (const batch of undoStack)
+        for (const entry of batch.entries)
+          void remove(entry.trashedPath, {
+            recursive: entry.entry.kind === 'directory',
+          }).catch(() => undefined);
+      setUndoStack([]);
       setGroups([{ id: 'group-1', activePath: '', tabs: [] }]);
       setLayout({ type: 'group', groupId: 'group-1' });
       setActiveGroupId('group-1');
@@ -2662,7 +2709,7 @@ function App() {
       try {
         await writeTextFile(`${workspace}/${file.path}`, content);
         fileContents.current.set(path, content);
-        lastDiskWrite.current.set(path, content);
+        lastDiskWrite.current.set(path, contentFingerprint(content));
         setDiskConflicts((current) => {
           if (!current.has(path)) return current;
           const next = new Set(current);
@@ -2815,6 +2862,13 @@ function App() {
       }
       if (!otherGroupsStillUseFile && !terminal) {
         fileContents.current.delete(path);
+        lastDiskWrite.current.delete(path);
+        setDiskConflicts((current) => {
+          if (!current.has(path)) return current;
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
         setOpenFiles((current) =>
           current.filter((entry) => entry.path !== path),
         );
@@ -3132,7 +3186,10 @@ function App() {
       );
     setUndoStack((current) => [...current, { workspace, entries: batch }]);
     for (const path of fileContents.current.keys())
-      if (affected(path)) fileContents.current.delete(path);
+      if (affected(path)) {
+        fileContents.current.delete(path);
+        lastDiskWrite.current.delete(path);
+      }
     setOpenFiles((current) => current.filter((file) => !affected(file.path)));
     const nextGroups = groups.map((group) => {
       const tabs = group.tabs.filter((path) => !affected(path));
@@ -4052,17 +4109,19 @@ function App() {
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
         pluginPanel={
-          <PluginPanel
-            plugins={pluginRuntime.plugins}
-            pluginDirectory={pluginRuntime.pluginDirectory}
-            availableBuiltins={pluginRuntime.availableBuiltins}
-            panels={pluginRuntime.panels}
-            onInstallPlugin={pluginRuntime.installFromFolder}
-            onInstallBuiltin={pluginRuntime.installBuiltin}
-            onTogglePlugin={pluginRuntime.setEnabled}
-            onUninstallPlugin={pluginRuntime.uninstall}
-            onOpenPanel={openPluginView}
-          />
+          <Suspense fallback={<div className="editor-empty" />}>
+            <PluginPanel
+              plugins={pluginRuntime.plugins}
+              pluginDirectory={pluginRuntime.pluginDirectory}
+              availableBuiltins={pluginRuntime.availableBuiltins}
+              panels={pluginRuntime.panels}
+              onInstallPlugin={pluginRuntime.installFromFolder}
+              onInstallBuiltin={pluginRuntime.installBuiltin}
+              onTogglePlugin={pluginRuntime.setEnabled}
+              onUninstallPlugin={pluginRuntime.uninstall}
+              onOpenPanel={openPluginView}
+            />
+          </Suspense>
         }
         settings={settings}
         theme={activeTheme}
@@ -4072,25 +4131,28 @@ function App() {
 
   if (themeMakerOpen)
     return (
-      <ThemeMaker
-        initialTheme={activeTheme}
-        themes={themes}
-        settings={settings}
-        onBack={() => {
-          setThemeMakerOpen(false);
-          setSettingsOpen(true);
-        }}
-        onSave={(theme) =>
-          void persistTheme(theme, customThemeIds.has(theme.id))
-        }
-        onCreate={(theme, name) => void createTheme(theme, name)}
-        onOpenFolder={(theme) => void openThemeFolder(theme)}
-        errorMessage={
-          message.startsWith('Could not') || message.startsWith('A theme named')
-            ? message
-            : ''
-        }
-      />
+      <Suspense fallback={null}>
+        <ThemeMaker
+          initialTheme={activeTheme}
+          themes={themes}
+          settings={settings}
+          onBack={() => {
+            setThemeMakerOpen(false);
+            setSettingsOpen(true);
+          }}
+          onSave={(theme) =>
+            void persistTheme(theme, customThemeIds.has(theme.id))
+          }
+          onCreate={(theme, name) => void createTheme(theme, name)}
+          onOpenFolder={(theme) => void openThemeFolder(theme)}
+          errorMessage={
+            message.startsWith('Could not') ||
+            message.startsWith('A theme named')
+              ? message
+              : ''
+          }
+        />
+      </Suspense>
     );
 
   return (
@@ -4654,18 +4716,20 @@ function App() {
         </>
       )}
       {settingsOpen && (
-        <SettingsPanel
-          settings={settings}
-          themes={themes}
-          customThemeIds={customThemeIds}
-          onChange={updateSettings}
-          onClose={() => setSettingsOpen(false)}
-          onOpenThemeMaker={() => {
-            setSettingsOpen(false);
-            setThemeMakerOpen(true);
-          }}
-          onDeleteTheme={(id) => void deleteTheme(id)}
-        />
+        <Suspense fallback={null}>
+          <SettingsPanel
+            settings={settings}
+            themes={themes}
+            customThemeIds={customThemeIds}
+            onChange={updateSettings}
+            onClose={() => setSettingsOpen(false)}
+            onOpenThemeMaker={() => {
+              setSettingsOpen(false);
+              setThemeMakerOpen(true);
+            }}
+            onDeleteTheme={(id) => void deleteTheme(id)}
+          />
+        </Suspense>
       )}
       {commandPaletteOpen && (
         <div
