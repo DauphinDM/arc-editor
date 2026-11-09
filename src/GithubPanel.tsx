@@ -397,6 +397,8 @@ export default function GithubPanel({ workspace, reloadToken }: { workspace: str
         <span><strong>{status.behind} new commit{status.behind === 1 ? "" : "s"}</strong> available to pull from GitHub.</span>
         <button className="github-secondary" disabled={busy} onClick={() => void perform(() => invoke("github_pull", { root: workspace }), "Pulled changes.")}>Pull now</button>
       </div>}
+      {status.ahead > 0 && <div className="github-feedback"><ArrowUpFromLine size={14} /> <strong>{status.ahead} local commit{status.ahead === 1 ? "" : "s"}</strong> ready to push.</div>}
+      {status.remote && status.ahead === 0 && status.behind === 0 && <div className="github-feedback success">Branch is up to date with GitHub.</div>}
 
       {!status.userName || !status.userEmail ? <IdentitySetup
         name={gitName}
