@@ -104,6 +104,7 @@ import {
   SiYaml,
 } from 'react-icons/si';
 import { appDataDir, join } from '@tauri-apps/api/path';
+import TitleBar from './TitleBar';
 import './pluginExtensions.css';
 import './panel-layout.css';
 import { forgetTerminalOutput } from './terminalOutput';
@@ -1311,29 +1312,61 @@ function SplitContainer({
   onResize: (id: string, ratio: number) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ start: number; size: number; ratio: number } | null>(
-    null,
-  );
+  const drag = useRef<{
+    start: number;
+    size: number;
+    ratio: number;
+    pending: number;
+  } | null>(null);
+  const frame = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (frame.current !== null) cancelAnimationFrame(frame.current);
+  }, []);
+  const applyRatio = (ratio: number) => {
+    const element = container.current;
+    if (!element) return;
+    const template = `${ratio}fr 5px ${1 - ratio}fr`;
+    if (node.direction === 'vertical')
+      element.style.gridTemplateColumns = template;
+    else element.style.gridTemplateRows = template;
+  };
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
     const bounds = container.current?.getBoundingClientRect();
     if (!bounds) return;
     event.preventDefault();
+    event.stopPropagation();
     drag.current = {
       start: node.direction === 'vertical' ? event.clientX : event.clientY,
       size: node.direction === 'vertical' ? bounds.width : bounds.height,
       ratio: node.ratio,
+      pending: node.ratio,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!drag.current) return;
+    const current = drag.current;
+    if (!current) return;
     const coordinate =
       node.direction === 'vertical' ? event.clientX : event.clientY;
-    const delta = (coordinate - drag.current.start) / drag.current.size;
-    onResize(
-      node.id,
-      Math.max(0.12, Math.min(0.88, drag.current.ratio + delta)),
-    );
+    const delta = (coordinate - current.start) / current.size;
+    current.pending = Math.max(0.12, Math.min(0.88, current.ratio + delta));
+    if (frame.current !== null) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null;
+      if (drag.current) applyRatio(drag.current.pending);
+    });
+  };
+  const finishResize = () => {
+    if (frame.current !== null) {
+      cancelAnimationFrame(frame.current);
+      frame.current = null;
+    }
+    const current = drag.current;
+    drag.current = null;
+    if (!current) return;
+    applyRatio(current.pending);
+    onResize(node.id, current.pending);
   };
   const template =
     node.direction === 'vertical'
@@ -1358,13 +1391,11 @@ function SplitContainer({
           node.direction === 'vertical' ? 'vertical' : 'horizontal'
         }
         onPointerDown={onPointerDown}
+        onMouseDown={(event) => event.stopPropagation()}
         onPointerMove={onPointerMove}
-        onPointerUp={() => {
-          drag.current = null;
-        }}
-        onPointerCancel={() => {
-          drag.current = null;
-        }}
+        onPointerUp={finishResize}
+        onPointerCancel={finishResize}
+        onLostPointerCapture={finishResize}
       >
         <span />
       </div>
@@ -1505,6 +1536,15 @@ function App() {
       setMessage(`Could not ${enabled ? 'enable' : 'disable'} desktop blur: ${String(error)}`);
     });
   }, [settings.editorGlassEnabled, settings.nativeBackgroundBlurEnabled]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void getCurrentWindow()
+      .setDecorations(!settings.titleBarEnabled)
+      .catch((error) =>
+        setMessage(`Could not update window decorations: ${String(error)}`),
+      );
+  }, [settings.titleBarEnabled]);
 
   const runPluginAction = async (action: PluginToolbarAction) => {
     try {
@@ -4157,13 +4197,15 @@ function App() {
 
   return (
     <main
-      className={`app-shell ${settings.appTheme === 'macos' ? 'app-theme-macos' : ''} ${settings.editorGlassEnabled ? 'editor-glass-enabled' : ''}`}
+      className={`app-shell ${settings.appTheme === 'macos' ? 'app-theme-macos' : ''} ${settings.editorGlassEnabled ? 'editor-glass-enabled' : ''} ${settings.titleBarEnabled ? '' : 'titlebar-off'}`}
       style={settings.interfaceFontFamily ? { fontFamily: settings.interfaceFontFamily } : undefined}
       onClick={() => {
         if (contextMenu) setContextMenu(null);
       }}
     >
       <style>{dynamicThemeCss}</style>
+      {settings.titleBarEnabled && <TitleBar />}
+      <div className="app-body">
       {!workspace &&
       terminals.length === 0 &&
       !groups.some((group) => group.tabs.includes(PLUGIN_TAB_KEY)) ? (
@@ -4299,15 +4341,36 @@ function App() {
               }}
             >
               <div className="viewer-heading">
-                <button
-                  className="workspace-header"
-                  title="Open another folder"
-                  onClick={() => void openWorkspace()}
-                >
-                  <FolderOpen size={14} />
-                  <span>{workspace.split(/[\\/]/).filter(Boolean).pop()}</span>
-                  <ChevronDown size={12} />
-                </button>
+                <div className="viewer-actions">
+                  <button
+                    className="tool-button"
+                    title="Settings (Ctrl+,)"
+                    onClick={() => setSettingsOpen(true)}
+                  >
+                    <SettingsIcon size={14} />
+                  </button>
+                  <button
+                    className="tool-button"
+                    title="Open plugins"
+                    onClick={openPluginPanel}
+                  >
+                    <Puzzle size={14} />
+                  </button>
+                  <button
+                    className="tool-button"
+                    title="Open GitHub"
+                    onClick={() => openGithubPanel(true)}
+                  >
+                    <Github size={14} />
+                  </button>
+                  <button
+                    className="tool-button"
+                    title="New terminal (Ctrl+T)"
+                    onClick={() => openTerminal()}
+                  >
+                    <TerminalIcon size={14} />
+                  </button>
+                </div>
                 <div className="viewer-actions">
                   <button
                     className="tool-button"
@@ -4318,6 +4381,13 @@ function App() {
                     }}
                   >
                     <Search size={14} />
+                  </button>
+                  <button
+                    className="tool-button"
+                    title="Open another folder"
+                    onClick={() => void openWorkspace()}
+                  >
+                    <FolderOpen size={14} />
                   </button>
                   <button
                     className="tool-button"
@@ -4441,38 +4511,6 @@ function App() {
                 )}
               </div>
               <div className="file-viewer-footer">
-                <button
-                  className="settings-launch"
-                  aria-label="Open settings (Ctrl+,)"
-                  title="Settings (Ctrl+,)"
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  <SettingsIcon size={15} />
-                </button>
-                <button
-                  className="settings-launch"
-                  aria-label="Open plugins"
-                  title="Open plugins"
-                  onClick={openPluginPanel}
-                >
-                  <Puzzle size={15} />
-                </button>
-                <button
-                  className="settings-launch"
-                  aria-label="Open GitHub"
-                  title="Open GitHub"
-                  onClick={() => openGithubPanel(true)}
-                >
-                  <Github size={15} />
-                </button>
-                <button
-                  className="settings-launch"
-                  aria-label="New terminal (Ctrl+T)"
-                  title="New terminal (Ctrl+T)"
-                  onClick={() => openTerminal()}
-                >
-                  <TerminalIcon size={15} />
-                </button>
                 {pluginRuntime.actions.map((action) => (
                   <button
                     key={action.id}
@@ -4484,6 +4522,12 @@ function App() {
                     <PluginToolbarIcon name={action.icon} />
                   </button>
                 ))}
+                <span
+                  className="file-viewer-project"
+                  title={workspace.split(/[\\/]/).filter(Boolean).pop()}
+                >
+                  {workspace.split(/[\\/]/).filter(Boolean).pop()}
+                </span>
               </div>
             </aside>
           )}
@@ -4778,6 +4822,7 @@ function App() {
           </section>
         </div>
       )}
+      </div>
     </main>
   );
 }

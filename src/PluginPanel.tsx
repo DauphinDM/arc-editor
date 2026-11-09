@@ -4,6 +4,7 @@ import { BookOpen, Download, FolderOpen, Plug, Puzzle, Trash2, X } from "lucide-
 import { join } from "@tauri-apps/api/path";
 import pluginApiMarkdown from "../PLUGIN_API.md?raw";
 import type { InstalledPlugin, PluginPanelContribution } from "./pluginRuntime";
+import "./GithubPanel.css";
 import "./PluginPanel.css";
 import "./PluginPanel.folder.css";
 import "./PluginPanel.docs.css";

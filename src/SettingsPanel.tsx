@@ -220,6 +220,7 @@ export default function SettingsPanel({
                   <option value="macos">Modern</option>
                 </select></label>
                 <div className="setting-note">App style and editor color theme are independent.</div>
+                {toggle("titleBarEnabled", "Custom title bar", "Use Arc's title bar. Turn off to use the system window frame.")}
               </section>
               <section className="settings-section"><h3>Editor colors</h3>
                 <label className="theme-search"><Search size={13} /><input value={themeSearch} onChange={(event) => setThemeSearch(event.target.value)} placeholder="Search color themes" /></label>
@@ -247,7 +248,6 @@ export default function SettingsPanel({
                   {transparency("glassFloatingTransparency", "Menus and popovers")}
                   {transparency("glassSettingsTransparency", "Settings panel")}
                   {transparency("glassControlsTransparency", "Inputs and controls")}
-                  <label className="setting-field"><span>In-app blur <b>{settings.editorGlassBlur}px</b></span><input type="range" min="0" max="40" step="1" value={settings.editorGlassBlur} onChange={(event) => onChange({ editorGlassBlur: Number(event.target.value) })} /></label>
                 </>}
               </section>
             </>}
