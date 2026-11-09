@@ -3,7 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
-  ArrowDownToLine, ArrowUpFromLine, Check, Circle, ExternalLink, GitBranch, Github,
+  ArrowDownToLine, ArrowUpFromLine, Check, ExternalLink, Frown, GitBranch, Github,
   LoaderCircle, Plus, RefreshCw, Upload,
 } from "lucide-react";
 import "./GithubPanel.css";
@@ -11,6 +11,7 @@ import "./GithubPanel.controls.css";
 import "./GithubPanel.updates.css";
 import "./GithubPanel.auth.css";
 import "./GithubPanel.setup.css";
+import "./GithubPanel.layout.css";
 import { forgetTerminalOutput, subscribeTerminalOutput, terminalOutputReady } from "./terminalOutput";
 
 type GithubChange = {
@@ -38,6 +39,12 @@ type GithubStatus = {
   userEmail: string;
 };
 
+const githubStatusCache = new Map<string, GithubStatus>();
+const githubLoadedWorkspaces = new Set<string>();
+const githubFailedWorkspaces = new Set<string>();
+const githubReloadTokens = new Map<string, number>();
+const githubPendingLoads = new Map<string, { token: number; promise: Promise<void> }>();
+
 type SetupPlatform = "windows" | "linux" | "macos";
 type LinuxDistro = "debian" | "fedora" | "arch" | "opensuse" | "alpine" | "other";
 
@@ -64,11 +71,12 @@ function SetupRequirement({ name, command, url, onOpen }: {
   </div>;
 }
 
-export default function GithubPanel({ workspace }: { workspace: string }) {
-  const [status, setStatus] = useState<GithubStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+export default function GithubPanel({ workspace, reloadToken }: { workspace: string; reloadToken: number }) {
+  const [status, setStatus] = useState<GithubStatus | null>(() => githubStatusCache.get(workspace) ?? null);
+  const [loading, setLoading] = useState(() => !githubLoadedWorkspaces.has(workspace));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [connectionFailed, setConnectionFailed] = useState(() => githubFailedWorkspaces.has(workspace));
   const [notice, setNotice] = useState("");
   const [repoName, setRepoName] = useState(workspace.split(/[\\/]/).filter(Boolean).at(-1) ?? "my-project");
   const [visibility, setVisibility] = useState("private");
@@ -86,31 +94,50 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
 
   const refresh = useCallback(async (fetchRemote = false): Promise<GithubStatus | null> => {
     if (!isTauri()) {
-      setError("GitHub tools are available in Arc desktop.");
-      setLoading(false);
+      if (githubReloadTokens.get(workspace) === reloadToken) {
+        githubLoadedWorkspaces.add(workspace);
+        githubFailedWorkspaces.add(workspace);
+        setConnectionFailed(true);
+        setLoading(false);
+      }
       return null;
     }
     setError("");
     try {
       let next = await invoke<GithubStatus>("github_status", { root: workspace });
-      setStatus(next);
-      setGitName((value) => value || next.userName);
-      setGitEmail((value) => value || next.userEmail);
-      if (fetchRemote && next.isGithubRepo && next.authenticated) {
-        await invoke("github_fetch", { root: workspace });
-        next = await invoke<GithubStatus>("github_status", { root: workspace });
+      if (githubReloadTokens.get(workspace) === reloadToken) {
+        githubStatusCache.set(workspace, next);
+        githubLoadedWorkspaces.add(workspace);
+        githubFailedWorkspaces.delete(workspace);
+        setConnectionFailed(false);
         setStatus(next);
         setGitName((value) => value || next.userName);
         setGitEmail((value) => value || next.userEmail);
       }
+      if (githubReloadTokens.get(workspace) !== reloadToken) return next;
+      if (fetchRemote && next.isGithubRepo && next.authenticated) {
+        await invoke("github_fetch", { root: workspace });
+        next = await invoke<GithubStatus>("github_status", { root: workspace });
+        if (githubReloadTokens.get(workspace) === reloadToken) {
+          githubStatusCache.set(workspace, next);
+          setStatus(next);
+          setGitName((value) => value || next.userName);
+          setGitEmail((value) => value || next.userEmail);
+        }
+      }
       return next;
     } catch (cause) {
-      setError(String(cause));
+      if (githubReloadTokens.get(workspace) === reloadToken) {
+        githubLoadedWorkspaces.add(workspace);
+        githubFailedWorkspaces.add(workspace);
+        setError(String(cause));
+        setConnectionFailed(true);
+      }
       return null;
     } finally {
-      setLoading(false);
+      if (githubReloadTokens.get(workspace) === reloadToken) setLoading(false);
     }
-  }, [workspace]);
+  }, [reloadToken, workspace]);
 
   const finishAuth = useCallback(async (id: string) => {
     const session = authSession.current;
@@ -217,8 +244,33 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
 
   useEffect(() => {
     setRepoName(workspace.split(/[\\/]/).filter(Boolean).at(-1) ?? "my-project");
-    void checkForUpdates();
-  }, [checkForUpdates, workspace]);
+    const pending = githubPendingLoads.get(workspace);
+    if (pending?.token === reloadToken) {
+      setLoading(true);
+      const restoreCachedStatus = () => {
+        setStatus(githubStatusCache.get(workspace) ?? null);
+        setConnectionFailed(githubFailedWorkspaces.has(workspace));
+        setLoading(false);
+      };
+      void pending.promise.then(restoreCachedStatus, restoreCachedStatus);
+      return;
+    }
+    if (githubLoadedWorkspaces.has(workspace) && githubReloadTokens.get(workspace) === reloadToken) {
+      setStatus(githubStatusCache.get(workspace) ?? null);
+      setConnectionFailed(githubFailedWorkspaces.has(workspace));
+      setLoading(false);
+      return;
+    }
+    githubReloadTokens.set(workspace, reloadToken);
+    setLoading(true);
+    const request = { token: reloadToken, promise: checkForUpdates() };
+    githubPendingLoads.set(workspace, request);
+    void request.promise.then(() => {
+      if (githubPendingLoads.get(workspace) === request) githubPendingLoads.delete(workspace);
+    }, () => {
+      if (githubPendingLoads.get(workspace) === request) githubPendingLoads.delete(workspace);
+    });
+  }, [checkForUpdates, reloadToken, workspace]);
 
   const perform = async (action: () => Promise<unknown>, success?: string) => {
     setBusy(true);
@@ -270,14 +322,22 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
     ? "https://github.com/cli/cli/blob/trunk/docs/install_windows.md"
     : setupPlatform === "macos" ? "https://cli.github.com/manual/installation" : "https://github.com/cli/cli/blob/trunk/docs/install_linux.md";
 
-  if (loading) return <div className="github-panel"><div className="github-loading"><LoaderCircle size={17} className="github-spin" /> Checking GitHub setup…</div></div>;
+  const displayedRepoName = status?.repoUrl
+    ?.replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/\.git$/i, "") ?? repoName;
 
-  return <div className="github-panel">
+  return <div className="github-panel" style={{ backgroundColor: "var(--bg, #111315)" }}>
     <header className="github-header">
-      <div className="github-heading"><Github size={19} /><div><strong>GitHub</strong><span>{workspace.split(/[\\/]/).filter(Boolean).at(-1)}</span></div></div>
-      <button className="github-icon-button" title="Fetch and refresh repository" disabled={busy} onClick={() => void checkForUpdates()}>{busy ? <LoaderCircle size={15} className="github-spin" /> : <RefreshCw size={15} />}</button>
+      <div className="github-heading"><GitBranch size={17} /><strong title={displayedRepoName}>{displayedRepoName}</strong></div>
+      <div className="github-header-actions">
+        {status?.repoUrl && <button className="github-icon-button" title="Open repository in browser" aria-label="Open repository in browser" onClick={() => void openLink(status.repoUrl!)}><ExternalLink size={15} /></button>}
+        <button className="github-icon-button" title="Fetch and refresh repository" aria-label="Fetch and refresh repository" disabled={busy} onClick={() => void checkForUpdates()}>{busy ? <LoaderCircle size={15} className="github-spin" /> : <RefreshCw size={15} />}</button>
+      </div>
     </header>
 
+    {loading ? <div className="github-loading"><LoaderCircle size={17} className="github-spin" /> Checking GitHub setup…</div>
+      : connectionFailed ? <div className="github-unavailable"><Frown size={30} /><span>Couldn’t connect to GitHub</span></div>
+        : <>
     {error && <div className="github-feedback error">{error}</div>}
     {notice && <div className="github-feedback success">{notice}</div>}
 
@@ -332,17 +392,6 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
         )}>{busy ? <LoaderCircle size={14} className="github-spin" /> : <Plus size={14} />} Create repository</button>
       </section>
     </> : <>
-      <section className="github-repo-summary">
-        <div className="github-repo-title"><div><span className="github-overline">CURRENT REPOSITORY</span><strong>{status.repoUrl?.replace("https://github.com/", "") ?? workspace.split(/[\\/]/).filter(Boolean).at(-1)}</strong></div>
-          {status.repoUrl && <button className="github-icon-button" title="Open repository in browser" onClick={() => void openLink(status.repoUrl!)}><ExternalLink size={15} /></button>}
-        </div>
-        <div className="github-repo-meta"><GitBranch size={13} /> <span>{status.branch ?? "No branch"}</span><span className="github-meta-spacer" />
-          {status.ahead > 0 && <span className="github-count"><ArrowUpFromLine size={12} /> {status.ahead}</span>}
-          {status.behind > 0 && <span className="github-count"><ArrowDownToLine size={12} /> {status.behind}</span>}
-          {status.ahead === 0 && status.behind === 0 && <span>Up to date</span>}
-        </div>
-      </section>
-
       {status.behind > 0 && <div className="github-incoming-banner">
         <ArrowDownToLine size={15} />
         <span><strong>{status.behind} new commit{status.behind === 1 ? "" : "s"}</strong> available to pull from GitHub.</span>
@@ -391,7 +440,7 @@ export default function GithubPanel({ workspace }: { workspace: string }) {
         <button className="github-secondary" disabled={busy || !status.remote} onClick={() => void perform(() => invoke("github_pull", { root: workspace }))}><ArrowDownToLine size={14} /> Pull</button>
         <button className="github-primary" disabled={busy || !status.remote || !status.branch} onClick={() => void perform(() => invoke("github_push", { root: workspace }))}><ArrowUpFromLine size={14} /> Push</button>
       </section>
-      <div className="github-footer"><Circle size={8} fill="currentColor" /> Connected to GitHub{status.remote ? ` · ${status.remote}` : ""}</div>
+    </>}
     </>}
   </div>;
 }

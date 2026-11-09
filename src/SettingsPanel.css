@@ -21,6 +21,14 @@
 .settings-main .setting-toggle{min-height:46px}
 .settings-main .setting-toggle+.setting-toggle{border-top:1px solid color-mix(in srgb,var(--settings-border,#2b3036) 60%,transparent)}
 .settings-main .setting-field{margin:13px 0}
+.settings-main .font-family-input{width:100%;height:31px;padding:0 9px;border:1px solid var(--settings-border,#343a42);border-radius:3px;background:var(--settings-raised,#202429);color:var(--settings-text,#d5d9e0);font:inherit;font-size:10px}
+.settings-main .font-family-input::placeholder{color:var(--settings-muted,#87929d)}
+.settings-main .font-preview{overflow:hidden;margin:0 0 13px;padding:10px;border:1px solid var(--settings-border,#343a40);border-radius:4px;background:var(--settings-raised,#202429);color:var(--settings-text,#d5d9e0);font-size:17px;text-overflow:ellipsis;white-space:nowrap}
+.app-shell.app-theme-macos .settings-main .font-family-input{border-color:var(--macos-border);border-radius:7px;background:color-mix(in srgb,var(--macos-sidebar) calc(100% - var(--glass-controls-transparency,0%)),transparent);color:var(--macos-text);font-family:inherit;font-size:12px}
+.app-shell.app-theme-macos .settings-main .font-family-input::placeholder{color:var(--macos-secondary)}
+.app-shell.app-theme-macos .settings-main .font-preview{border-color:var(--macos-border);border-radius:7px;background:color-mix(in srgb,var(--macos-sidebar) calc(100% - var(--glass-controls-transparency,0%)),transparent);color:var(--macos-text)}
+.settings-main .setting-field>.theme-color-picker{--theme-border:var(--settings-border,#353c43);--theme-raised:var(--settings-raised,#202429);--theme-text:var(--settings-text,#d5d9e0);--theme-secondary:var(--settings-muted,#aeb5bd);--theme-muted:var(--settings-muted,#87929d);--theme-selected:color-mix(in srgb,var(--settings-accent,#879bb2) 24%,var(--settings-raised,#202429));--theme-hover:var(--settings-raised,#2c333a);justify-content:flex-start}
+.settings-main .theme-color-popover{top:21px;right:auto;left:0}
 .settings-main .theme-search{margin:10px 0}
 .settings-main .theme-list{max-height:240px}
 @media(max-width:620px){

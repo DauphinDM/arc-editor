@@ -19,6 +19,7 @@ export type AppSettings = {
   terminalScrollbar: boolean;
   terminalSelectionColor: string;
   terminalShowTitle: boolean;
+  interfaceFontFamily: string;
   fontFamily: string;
   fontSize: number;
   lineHeight: number;
@@ -96,6 +97,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalScrollbar: true,
   terminalSelectionColor: "",
   terminalShowTitle: true,
+  interfaceFontFamily: "",
   fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace",
   fontSize: 13,
   lineHeight: 1.7,

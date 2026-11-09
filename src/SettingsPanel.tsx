@@ -1,16 +1,130 @@
-import { Code2, FolderOpen, Palette, RotateCcw, Search, Terminal, Trash2, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { RotateCcw, Search, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { DEFAULT_SETTINGS, DEFAULT_THEME, type AppSettings, type ThemeDefinition } from "./settings";
+import ThemeColorPicker from "./ThemeColorPicker";
 import "./SettingsPanel.css";
 
 const settingsCategories = [
-  { id: "editor", label: "Editor", description: "Formatting, editing behavior, and typography.", icon: Code2 },
-  { id: "appearance", label: "Appearance", description: "Transparency, interface style, and color themes.", icon: Palette },
-  { id: "terminal", label: "Terminal", description: "Shell text, cursor, and scrollback.", icon: Terminal },
-  { id: "files", label: "Files", description: "Workspace browsing preferences.", icon: FolderOpen },
+  { id: "editor", label: "Editor", description: "Formatting and editing behavior." },
+  { id: "typography", label: "Fonts & Typography", description: "Choose typefaces and tune reading density." },
+  { id: "appearance", label: "Appearance", description: "Transparency, interface style, and color themes." },
+  { id: "terminal", label: "Terminal", description: "Cursor and scrollback behavior." },
+  { id: "files", label: "Files", description: "Workspace browsing preferences." },
 ] as const;
 
 type SettingsCategory = typeof settingsCategories[number]["id"];
+type FontOption = { label: string; value: string };
+
+const interfaceFonts: FontOption[] = [
+  { label: "Theme default", value: "" },
+  { label: "System UI", value: "system-ui, sans-serif" },
+  { label: "Inter", value: "Inter, sans-serif" },
+  { label: "Roboto", value: "Roboto, sans-serif" },
+  { label: "Noto Sans", value: "'Noto Sans', sans-serif" },
+  { label: "Open Sans", value: "'Open Sans', sans-serif" },
+  { label: "Lato", value: "Lato, sans-serif" },
+  { label: "Ubuntu", value: "Ubuntu, sans-serif" },
+  { label: "Segoe UI", value: "'Segoe UI', sans-serif" },
+  { label: "Arial", value: "Arial, sans-serif" },
+];
+
+const editorFonts: FontOption[] = [
+  { label: "JetBrains Mono", value: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace" },
+  { label: "Fira Code", value: "'Fira Code', monospace" },
+  { label: "Cascadia Code", value: "'Cascadia Code', monospace" },
+  { label: "IBM Plex Mono", value: "'IBM Plex Mono', monospace" },
+  { label: "Source Code Pro", value: "'Source Code Pro', monospace" },
+  { label: "Iosevka", value: "Iosevka, monospace" },
+  { label: "Inconsolata", value: "Inconsolata, monospace" },
+  { label: "Hack", value: "Hack, monospace" },
+  { label: "Ubuntu Mono", value: "'Ubuntu Mono', monospace" },
+  { label: "SF Mono", value: "'SFMono-Regular', Consolas, monospace" },
+  { label: "Menlo", value: "Menlo, monospace" },
+  { label: "Consolas", value: "Consolas, monospace" },
+  { label: "System monospace", value: "ui-monospace, monospace" },
+];
+
+const terminalFonts: FontOption[] = [
+  { label: "JetBrains Mono", value: "'JetBrains Mono', monospace" },
+  ...editorFonts.slice(1),
+];
+
+function fontNameFromStack(stack: string) {
+  const value = stack.trim();
+  const quote = value[0];
+  if (quote !== "'" && quote !== '"') return value.split(",")[0].trim();
+  let name = "";
+  for (let index = 1; index < value.length; index += 1) {
+    if (value[index] === "\\" && index + 1 < value.length) {
+      name += value[index + 1];
+      index += 1;
+    } else if (value[index] === quote) {
+      return name;
+    } else {
+      name += value[index];
+    }
+  }
+  return name;
+}
+
+function fontStackFromName(name: string, fallback: string) {
+  const safeName = name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80);
+  if (!safeName.trim()) return "";
+  return `"${safeName.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}", ${fallback}`;
+}
+
+const genericFonts = new Set(["system-ui", "ui-monospace", "sans-serif", "serif", "monospace"]);
+const fontAvailability = new Map<string, boolean>();
+
+function isFontAvailable(stack: string) {
+  const family = fontNameFromStack(stack);
+  if (genericFonts.has(family.toLowerCase())) return true;
+  const cached = fontAvailability.get(family);
+  if (cached !== undefined) return cached;
+  const context = document.createElement("canvas").getContext("2d");
+  if (!context) return false;
+  const samples = ["mmmmmmmmmmlliWW", "0123456789", "Arc Editor"];
+  const fallbackWidths = samples.map((sample) => ["monospace", "serif", "sans-serif"].map((fallback) => {
+    context.font = `72px ${fallback}`;
+    return context.measureText(sample).width;
+  }));
+  const available = samples.some((sample, index) => {
+    context.font = `72px ${JSON.stringify(family)}, monospace`;
+    const width = context.measureText(sample).width;
+    return !fallbackWidths[index].includes(width);
+  });
+  fontAvailability.set(family, available);
+  return available;
+}
+
+function FontFamilySetting({ label, value, options, fallback, onChange }: {
+  label: string;
+  value: string;
+  options: FontOption[];
+  fallback: string;
+  onChange: (value: string) => void;
+}) {
+  const preset = options.find((option) => option.value === value);
+  const customName = preset ? "" : fontNameFromStack(value);
+  const [customDraft, setCustomDraft] = useState(customName);
+  useEffect(() => setCustomDraft(customName), [value]);
+  return <>
+    <label className="setting-field"><span>{label} preset</span><select value={preset ? value : "__custom"} onChange={(event) => {
+      const selected = options.find((option) => option.value === event.target.value);
+      if (selected) onChange(selected.value);
+    }}>
+      {!preset && <option value="__custom" disabled>Custom font name below</option>}
+      {options.map((option) => <option key={option.label} value={option.value}>{option.label}</option>)}
+    </select></label>
+    <label className="setting-field"><span>Custom {label.toLowerCase()} family</span><input className="font-family-input" type="text" value={customDraft} placeholder="Enter installed font name" onChange={(event) => {
+      setCustomDraft(event.target.value);
+      if (event.target.value.trim()) onChange(fontStackFromName(event.target.value, fallback));
+    }} onBlur={() => {
+      if (!customDraft.trim() && !preset) onChange(options[0]?.value ?? fallback);
+    }} /></label>
+    <div className="font-preview" style={{ fontFamily: value || undefined }}>Aa Bb Cc 0123</div>
+  </>;
+}
 
 export default function SettingsPanel({
   settings,
@@ -31,6 +145,11 @@ export default function SettingsPanel({
 }) {
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>("editor");
   const [themeSearch, setThemeSearch] = useState("");
+  const availableFonts = useMemo(() => ({
+    interface: interfaceFonts.filter((option) => !option.value || isFontAvailable(option.value)),
+    editor: editorFonts.filter((option) => isFontAvailable(option.value)),
+    terminal: terminalFonts.filter((option) => isFontAvailable(option.value)),
+  }), []);
   const filteredThemes = useMemo(() => themes.filter((theme) => theme.name.toLowerCase().includes(themeSearch.toLowerCase())), [themeSearch, themes]);
   const selectedTheme = themes.find((theme) => theme.id === settings.selectedTheme) ?? DEFAULT_THEME;
   const terminalSelectionColor = settings.terminalSelectionColor || selectedTheme.colors.selection.slice(0, 7);
@@ -52,9 +171,8 @@ export default function SettingsPanel({
         <nav className="settings-nav" aria-label="Settings categories">
           <div className="settings-nav-list">
             {settingsCategories.map((category) => {
-              const Icon = category.icon;
               return <button key={category.id} className="settings-nav-button" aria-current={activeCategory === category.id ? "page" : undefined} onClick={() => setActiveCategory(category.id)}>
-                <Icon size={16} aria-hidden="true" /><span>{category.label}</span>
+                <span>{category.label}</span>
               </button>;
             })}
           </div>
@@ -77,35 +195,25 @@ export default function SettingsPanel({
                 {toggle("bracketMatching", "Bracket matching", "Highlight matching brackets.")}
                 {toggle("autocomplete", "Autocomplete", "Show code completion suggestions.")}
                 {toggle("autoIndent", "Auto indent", "Indent new lines based on surrounding code.")}
-              </section>
-              <section className="settings-section"><h3>Typography</h3>
-                <label className="setting-field"><span>Font family</span><select value={settings.fontFamily} onChange={(event) => onChange({ fontFamily: event.target.value })}>
-                  <option value="'JetBrains Mono', 'SFMono-Regular', Consolas, monospace">JetBrains Mono</option>
-                  <option value="'Fira Code', monospace">Fira Code</option>
-                  <option value="'SFMono-Regular', Consolas, monospace">System monospace</option>
-                  <option value="ui-monospace, monospace">Platform default</option>
-                </select></label>
-                <label className="setting-field"><span>Font size <b>{settings.fontSize}px</b></span><input type="range" min="10" max="24" step="1" value={settings.fontSize} onChange={(event) => onChange({ fontSize: Number(event.target.value) })} /></label>
-                <label className="setting-field"><span>Line height <b>{settings.lineHeight.toFixed(1)}</b></span><input type="range" min="1.2" max="2.2" step="0.1" value={settings.lineHeight} onChange={(event) => onChange({ lineHeight: Number(event.target.value) })} /></label>
                 <label className="setting-field"><span>Tab size</span><select value={settings.tabSize} onChange={(event) => onChange({ tabSize: Number(event.target.value) })}><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="8">8 spaces</option></select></label>
               </section>
             </>}
-            {activeCategory === "appearance" && <>
-              <section className="settings-section"><h3>Transparency and blur</h3>
-                {toggle("editorGlassEnabled", "Frosted glass", "Apply transparency across app surfaces.")}
-                {settings.editorGlassEnabled && <>
-                  {toggle("nativeBackgroundBlurEnabled", "Blur desktop background", "Use native OS blur when supported. Linux X11 is unsupported; system controls strength.")}
-                  {transparency("glassAppTransparency", "Window background")}
-                  {transparency("glassSidebarTransparency", "File viewer")}
-                  {transparency("editorGlassTransparency", "Editor")}
-                  {transparency("glassTabsTransparency", "Tabs and toolbars")}
-                  {transparency("glassTerminalTransparency", "Terminal")}
-                  {transparency("glassFloatingTransparency", "Menus and popovers")}
-                  {transparency("glassSettingsTransparency", "Settings panel")}
-                  {transparency("glassControlsTransparency", "Inputs and controls")}
-                  <label className="setting-field"><span>In-app blur <b>{settings.editorGlassBlur}px</b></span><input type="range" min="0" max="40" step="1" value={settings.editorGlassBlur} onChange={(event) => onChange({ editorGlassBlur: Number(event.target.value) })} /></label>
-                </>}
+            {activeCategory === "typography" && <>
+              <section className="settings-section"><h3>App interface</h3>
+                <FontFamilySetting label="Interface font" value={settings.interfaceFontFamily} options={availableFonts.interface} fallback="sans-serif" onChange={(interfaceFontFamily) => onChange({ interfaceFontFamily })} />
+                <div className="setting-note">Custom font names must be installed on your system. Theme default follows Classic or Modern app styling.</div>
               </section>
+              <section className="settings-section"><h3>Code editor</h3>
+                <FontFamilySetting label="Editor font" value={settings.fontFamily} options={availableFonts.editor} fallback="monospace" onChange={(fontFamily) => onChange({ fontFamily })} />
+                <label className="setting-field"><span>Font size <b>{settings.fontSize}px</b></span><input type="range" min="10" max="24" step="1" value={settings.fontSize} onChange={(event) => onChange({ fontSize: Number(event.target.value) })} /></label>
+                <label className="setting-field"><span>Line height <b>{settings.lineHeight.toFixed(1)}</b></span><input type="range" min="1.2" max="2.2" step="0.1" value={settings.lineHeight} onChange={(event) => onChange({ lineHeight: Number(event.target.value) })} /></label>
+              </section>
+              <section className="settings-section"><h3>Terminal</h3>
+                <FontFamilySetting label="Terminal font" value={settings.terminalFontFamily} options={availableFonts.terminal} fallback="monospace" onChange={(terminalFontFamily) => onChange({ terminalFontFamily })} />
+                <label className="setting-field"><span>Font size <b>{settings.terminalFontSize}px</b></span><input type="range" min="10" max="24" step="1" value={settings.terminalFontSize} onChange={(event) => onChange({ terminalFontSize: Number(event.target.value) })} /></label>
+              </section>
+            </>}
+            {activeCategory === "appearance" && <>
               <section className="settings-section"><h3>Interface</h3>
                 <label className="setting-field"><span>App theme</span><select value={settings.appTheme} onChange={(event) => onChange({ appTheme: event.target.value as AppSettings["appTheme"] })}>
                   <option value="classic">Classic</option>
@@ -127,24 +235,32 @@ export default function SettingsPanel({
                 </div>
                 <button className="settings-action" onClick={onOpenThemeMaker}>Open Theme Maker</button>
               </section>
+              <section className="settings-section"><h3>Transparency and blur</h3>
+                {toggle("editorGlassEnabled", "Transparency", "Apply transparency across app surfaces.")}
+                {settings.editorGlassEnabled && <>
+                  {toggle("nativeBackgroundBlurEnabled", "Blur desktop background", "Use native OS blur when supported. Linux X11 is unsupported; system controls strength.")}
+                  {transparency("glassAppTransparency", "Window background")}
+                  {transparency("glassSidebarTransparency", "File viewer")}
+                  {transparency("editorGlassTransparency", "Editor")}
+                  {transparency("glassTabsTransparency", "Tabs and toolbars")}
+                  {transparency("glassTerminalTransparency", "Terminal")}
+                  {transparency("glassFloatingTransparency", "Menus and popovers")}
+                  {transparency("glassSettingsTransparency", "Settings panel")}
+                  {transparency("glassControlsTransparency", "Inputs and controls")}
+                  <label className="setting-field"><span>In-app blur <b>{settings.editorGlassBlur}px</b></span><input type="range" min="0" max="40" step="1" value={settings.editorGlassBlur} onChange={(event) => onChange({ editorGlassBlur: Number(event.target.value) })} /></label>
+                </>}
+              </section>
             </>}
             {activeCategory === "terminal" && <section className="settings-section"><h3>Terminal</h3>
-              <label className="setting-field"><span>Font family</span><select value={settings.terminalFontFamily} onChange={(event) => onChange({ terminalFontFamily: event.target.value })}>
-                <option value="'JetBrains Mono', monospace">JetBrains Mono</option>
-                <option value="'Fira Code', monospace">Fira Code</option>
-                <option value="'SFMono-Regular', Consolas, monospace">System monospace</option>
-                <option value="ui-monospace, monospace">Platform default</option>
-              </select></label>
-              <label className="setting-field"><span>Font size <b>{settings.terminalFontSize}px</b></span><input type="range" min="10" max="24" step="1" value={settings.terminalFontSize} onChange={(event) => onChange({ terminalFontSize: Number(event.target.value) })} /></label>
               <label className="setting-field"><span>Cursor shape</span><select value={settings.terminalCursorStyle} onChange={(event) => onChange({ terminalCursorStyle: event.target.value as AppSettings["terminalCursorStyle"] })}>
                 <option value="block">Block</option><option value="underline">Underline</option><option value="bar">Bar</option>
               </select></label>
               {toggle("terminalCursorBlink", "Blinking cursor", "Blink the terminal cursor.")}
-              <label className="setting-field"><span>Scrollback lines <b>{settings.terminalScrollback}</b></span><input type="range" min="500" max="5000" step="500" value={settings.terminalScrollback} onChange={(event) => onChange({ terminalScrollback: Number(event.target.value) })} /></label>
-              <label className="setting-field"><span>Padding <b>{settings.terminalPadding}px</b></span><input type="range" min="0" max="24" step="2" value={settings.terminalPadding} onChange={(event) => onChange({ terminalPadding: Number(event.target.value) })} /></label>
               {toggle("terminalScrollbar", "Show scrollbar", "Show the terminal's scrollback scrollbar.")}
               {toggle("terminalShowTitle", "Show shell title", "Use the title reported by the running shell in its tab.")}
-              <label className="setting-field"><span>Selection color</span><input type="color" value={terminalSelectionColor} onChange={(event) => onChange({ terminalSelectionColor: event.target.value })} /></label>
+              <label className="setting-field"><span>Scrollback lines <b>{settings.terminalScrollback}</b></span><input type="range" min="500" max="5000" step="500" value={settings.terminalScrollback} onChange={(event) => onChange({ terminalScrollback: Number(event.target.value) })} /></label>
+              <label className="setting-field"><span>Padding <b>{settings.terminalPadding}px</b></span><input type="range" min="0" max="24" step="2" value={settings.terminalPadding} onChange={(event) => onChange({ terminalPadding: Number(event.target.value) })} /></label>
+              <label className="setting-field"><span>Selection color</span><ThemeColorPicker label="Selection color" value={terminalSelectionColor} onChange={(value) => onChange({ terminalSelectionColor: value })} /></label>
               {settings.terminalSelectionColor && <button className="settings-action" onClick={() => onChange({ terminalSelectionColor: "" })}>Use theme selection color</button>}
             </section>}
             {activeCategory === "files" && <section className="settings-section"><h3>File viewer</h3>
