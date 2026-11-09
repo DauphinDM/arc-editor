@@ -109,6 +109,7 @@ import GithubPanel from './GithubPanel';
 import PluginPanel from './PluginPanel';
 import ThemeMaker from './ThemeMaker';
 import './pluginExtensions.css';
+import './panel-layout.css';
 import { forgetTerminalOutput } from './terminalOutput';
 import {
   usePluginRuntime,
@@ -174,6 +175,7 @@ type UndoBatch = { workspace: string; entries: DeletedEntry[] };
 const GITHUB_TAB_KEY = 'internal:github';
 const PLUGIN_TAB_KEY = 'internal:plugins';
 const PLUGIN_VIEW_PREFIX = 'internal:plugin-view:';
+const MIN_VIEWER_WIDTH = 140;
 
 function PluginViewHost({ panel }: { panel: PluginPanelContribution }) {
   const container = useRef<HTMLDivElement>(null);
@@ -776,6 +778,7 @@ function EditorPane({
   onSelect,
   onTerminalTitleChange,
   workspace,
+  githubReloadToken,
   pluginPanel,
   pluginViews,
   editorViews,
@@ -795,6 +798,7 @@ function EditorPane({
   onSelect: (id: GroupId, path: string) => void;
   onTerminalTitleChange: (id: string, title: string) => void;
   workspace: string;
+  githubReloadToken: number;
   pluginPanel: ReactNode;
   pluginViews: PluginPanelContribution[];
   editorViews: { current: Map<string, EditorView> };
@@ -952,7 +956,7 @@ function EditorPane({
             lineHeight: String(settings.lineHeight),
           },
           '.cm-tooltip-autocomplete ul': {
-            fontFamily: "'JetBrains Mono', monospace",
+            fontFamily: settings.fontFamily,
             fontSize: '12px',
             maxHeight: '250px',
           },
@@ -1172,7 +1176,7 @@ function EditorPane({
             <button
               key={key}
               className={`editor-tab ${key === group.activePath ? 'active' : ''}`}
-              draggable={!github && !plugins && !pluginView}
+              draggable={!pluginView}
               onDragStart={(event) => {
                 event.dataTransfer.setData('application/x-arc-editor-tab', key);
                 event.dataTransfer.effectAllowed = 'move';
@@ -1221,7 +1225,7 @@ function EditorPane({
       </div>
       {file && <div className="editor-host" ref={host} />}
       {group.activePath === GITHUB_TAB_KEY && (
-        <GithubPanel workspace={workspace} />
+        <GithubPanel workspace={workspace} reloadToken={githubReloadToken} />
       )}
       {group.activePath === PLUGIN_TAB_KEY && pluginPanel}
       {pluginViewsByKey.has(group.activePath) && (
@@ -1350,6 +1354,7 @@ function App() {
   const [groups, setGroups] = useState<EditorGroup[]>([
     { id: 'group-1', activePath: '', tabs: [] },
   ]);
+  const [githubReloadToken, setGithubReloadToken] = useState(0);
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const editorViews = useRef(new Map<string, EditorView>());
   const [layout, setLayout] = useState<LayoutNode>({
@@ -1430,6 +1435,17 @@ function App() {
       JSON.stringify({ ...settings, version: APP_SETTINGS_VERSION }),
     );
   }, [settings]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const enabled = settings.editorGlassEnabled && settings.nativeBackgroundBlurEnabled;
+    void invoke('set_native_background_blur', { enabled }).catch((error) => {
+      if (enabled) {
+        setSettings((current) => ({ ...current, nativeBackgroundBlurEnabled: false }));
+      }
+      setMessage(`Could not ${enabled ? 'enable' : 'disable'} desktop blur: ${String(error)}`);
+    });
+  }, [settings.editorGlassEnabled, settings.nativeBackgroundBlurEnabled]);
 
   const runPluginAction = async (action: PluginToolbarAction) => {
     try {
@@ -1523,7 +1539,7 @@ function App() {
     event.preventDefault();
     viewerDrag.current = {
       startX: event.clientX,
-      startWidth: settings.sidebarWidth,
+      startWidth: viewerOpen ? settings.sidebarWidth : MIN_VIEWER_WIDTH,
       pointerId: event.pointerId,
     };
   };
@@ -1534,7 +1550,7 @@ function App() {
       if (!drag || drag.pointerId !== event.pointerId) return;
       event.preventDefault();
       const width = Math.round(drag.startWidth + event.clientX - drag.startX);
-      if (width < 160) {
+      if (width < MIN_VIEWER_WIDTH) {
         setViewerOpen(false);
         return;
       }
@@ -1765,10 +1781,13 @@ function App() {
     return id;
   };
 
-  const openGithubPanel = () => {
+  const openGithubPanel = (reloadOnIcon = false) => {
     if (!workspace) {
       setMessage('Open a folder first.');
       return;
+    }
+    if (reloadOnIcon && !groups.some((group) => group.tabs.includes(GITHUB_TAB_KEY))) {
+      setGithubReloadToken((token) => token + 1);
     }
     setGroups((current) =>
       current.map((group) =>
@@ -2466,7 +2485,7 @@ function App() {
     placement?: SplitPlacement,
   ) => {
     const terminal = terminals.find((entry) => entry.key === path);
-    if (terminal) {
+    if (terminal || path === GITHUB_TAB_KEY || path === PLUGIN_TAB_KEY) {
       const targetGroup = placement
         ? createSplitGroup(groupId, placement)
         : groupId;
@@ -3591,6 +3610,7 @@ function App() {
         onSelect={setActiveTab}
         onTerminalTitleChange={updateTerminalTitle}
         workspace={workspace}
+        githubReloadToken={githubReloadToken}
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
         pluginPanel={
@@ -3638,6 +3658,7 @@ function App() {
   return (
     <main
       className={`app-shell ${settings.appTheme === 'macos' ? 'app-theme-macos' : ''} ${settings.editorGlassEnabled ? 'editor-glass-enabled' : ''}`}
+      style={settings.interfaceFontFamily ? { fontFamily: settings.interfaceFontFamily } : undefined}
       onClick={() => {
         if (contextMenu) setContextMenu(null);
       }}
@@ -3912,6 +3933,30 @@ function App() {
               <div className="file-viewer-footer">
                 <button
                   className="settings-launch"
+                  aria-label="Open settings (Ctrl+,)"
+                  title="Settings (Ctrl+,)"
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  <SettingsIcon size={15} />
+                </button>
+                <button
+                  className="settings-launch"
+                  aria-label="Open plugins"
+                  title="Open plugins"
+                  onClick={openPluginPanel}
+                >
+                  <Puzzle size={15} />
+                </button>
+                <button
+                  className="settings-launch"
+                  aria-label="Open GitHub"
+                  title="Open GitHub"
+                  onClick={() => openGithubPanel(true)}
+                >
+                  <Github size={15} />
+                </button>
+                <button
+                  className="settings-launch"
                   aria-label="New terminal (Ctrl+T)"
                   title="New terminal (Ctrl+T)"
                   onClick={() => openTerminal()}
@@ -3929,41 +3974,17 @@ function App() {
                     <PluginToolbarIcon name={action.icon} />
                   </button>
                 ))}
-                <button
-                  className="settings-launch"
-                  aria-label="Open GitHub"
-                  title="Open GitHub"
-                  onClick={openGithubPanel}
-                >
-                  <Github size={15} />
-                </button>
-                <button
-                  className="settings-launch"
-                  aria-label="Open plugins"
-                  title="Open plugins"
-                  onClick={openPluginPanel}
-                >
-                  <Puzzle size={15} />
-                </button>
-                <button
-                  className="settings-launch"
-                  aria-label="Open settings (Ctrl+,)"
-                  title="Settings (Ctrl+,)"
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  <SettingsIcon size={15} />
-                </button>
               </div>
             </aside>
           )}
-          {workspace && viewerOpen && (
+          {workspace && (
             <div
-              className="file-viewer-resizer"
+              className={`file-viewer-resizer ${viewerOpen ? '' : 'collapsed'}`}
               role="separator"
               tabIndex={0}
               aria-label="Resize file viewer"
               aria-orientation="vertical"
-              aria-valuemin={160}
+              aria-valuemin={MIN_VIEWER_WIDTH}
               aria-valuemax={480}
               aria-valuenow={settings.sidebarWidth}
               onPointerDown={beginViewerResize}
@@ -3974,8 +3995,11 @@ function App() {
                 const nextWidth =
                   settings.sidebarWidth +
                   (event.key === 'ArrowRight' ? 10 : -10);
-                if (nextWidth < 160) setViewerOpen(false);
-                else updateSettings({ sidebarWidth: Math.min(480, nextWidth) });
+                if (nextWidth < MIN_VIEWER_WIDTH) setViewerOpen(false);
+                else {
+                  setViewerOpen(true);
+                  updateSettings({ sidebarWidth: Math.min(480, nextWidth) });
+                }
               }}
             >
               <span />

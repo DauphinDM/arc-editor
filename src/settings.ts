@@ -19,6 +19,7 @@ export type AppSettings = {
   terminalScrollbar: boolean;
   terminalSelectionColor: string;
   terminalShowTitle: boolean;
+  interfaceFontFamily: string;
   fontFamily: string;
   fontSize: number;
   lineHeight: number;
@@ -27,9 +28,9 @@ export type AppSettings = {
   selectedTheme: string;
   appTheme: "classic" | "macos";
   editorGlassEnabled: boolean;
+  nativeBackgroundBlurEnabled: boolean;
   editorGlassTransparency: number;
   editorGlassBlur: number;
-  editorGlassSaturation: number;
   glassAppTransparency: number;
   glassSidebarTransparency: number;
   glassTabsTransparency: number;
@@ -96,6 +97,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   terminalScrollbar: true,
   terminalSelectionColor: "",
   terminalShowTitle: true,
+  interfaceFontFamily: "",
   fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, monospace",
   fontSize: 13,
   lineHeight: 1.7,
@@ -104,9 +106,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   selectedTheme: "midnight",
   appTheme: "classic",
   editorGlassEnabled: true,
+  nativeBackgroundBlurEnabled: true,
   editorGlassTransparency: 28,
   editorGlassBlur: 18,
-  editorGlassSaturation: 130,
   glassAppTransparency: 20,
   glassSidebarTransparency: 20,
   glassTabsTransparency: 14,
@@ -210,9 +212,11 @@ export function migrateStorageNamespace(): void {
 
 export function loadSettings(): AppSettings {
   try {
-    const stored = JSON.parse(localStorage.getItem("arc.settings") ?? "null") as (Partial<AppSettings> & { version?: number }) | null;
+    const stored = JSON.parse(localStorage.getItem("arc.settings") ?? "null") as (Partial<AppSettings> & { version?: number; editorGlassSaturation?: unknown }) | null;
     if (!stored) return DEFAULT_SETTINGS;
-    const settings = { ...DEFAULT_SETTINGS, ...stored };
+    const saved = { ...stored };
+    delete saved.editorGlassSaturation;
+    const settings = { ...DEFAULT_SETTINGS, ...saved };
     // Previous default made the entire app background fully transparent.
     if (stored.version !== APP_SETTINGS_VERSION && stored.glassAppTransparency === 100) {
       settings.glassAppTransparency = DEFAULT_SETTINGS.glassAppTransparency;
@@ -248,7 +252,6 @@ export function themeCss(theme: ThemeDefinition, settings: AppSettings): string 
   const transparency = (value: number) => settings.editorGlassEnabled ? Math.max(0, Math.min(100, value)) : 0;
   const glass = (color: string, value: number) => themeColorWithOpacity(color, 1 - transparency(value) / 100);
   const glassBlur = Math.max(0, Math.min(40, settings.editorGlassBlur));
-  const glassSaturation = Math.max(50, Math.min(200, settings.editorGlassSaturation));
   const appBackground = glass(c.background, settings.glassAppTransparency);
   const sidebarBackground = glass(c.sidebar, settings.glassSidebarTransparency);
   const editorBackground = glass(c.editor, settings.editorGlassTransparency);
@@ -264,7 +267,7 @@ export function themeCss(theme: ThemeDefinition, settings: AppSettings): string 
     ? 0.18 * (1 - transparency(settings.glassFloatingTransparency) / 100)
     : 0.18;
   return `
-    .app-shell { --settings-muted:${c.muted}; --settings-text:${c.text}; --settings-raised:${c.raised}; --settings-border:${c.border}; --settings-accent:${c.function}; --settings-track:${c.hover}; --editor-glass-blur:${glassBlur}px; --editor-glass-saturation:${glassSaturation}%; --glass-app-transparency:${transparency(settings.glassAppTransparency)}%; --glass-sidebar-transparency:${transparency(settings.glassSidebarTransparency)}%; --glass-tabs-transparency:${transparency(settings.glassTabsTransparency)}%; --glass-terminal-transparency:${transparency(settings.glassTerminalTransparency)}%; --glass-floating-transparency:${transparency(settings.glassFloatingTransparency)}%; --glass-settings-transparency:${transparency(settings.glassSettingsTransparency)}%; --glass-controls-transparency:${transparency(settings.glassControlsTransparency)}%; --glass-overlay-alpha:${overlayAlpha}; --glass-macos-overlay-alpha:${macOverlayAlpha}; background:${appBackground}; color:${c.text}; }
+    .app-shell { --settings-muted:${c.muted}; --settings-text:${c.text}; --settings-raised:${c.raised}; --settings-border:${c.border}; --settings-accent:${c.function}; --settings-track:${c.hover}; --editor-glass-blur:${glassBlur}px; --glass-app-transparency:${transparency(settings.glassAppTransparency)}%; --glass-sidebar-transparency:${transparency(settings.glassSidebarTransparency)}%; --glass-tabs-transparency:${transparency(settings.glassTabsTransparency)}%; --glass-terminal-transparency:${transparency(settings.glassTerminalTransparency)}%; --glass-floating-transparency:${transparency(settings.glassFloatingTransparency)}%; --glass-settings-transparency:${transparency(settings.glassSettingsTransparency)}%; --glass-controls-transparency:${transparency(settings.glassControlsTransparency)}%; --glass-overlay-alpha:${overlayAlpha}; --glass-macos-overlay-alpha:${macOverlayAlpha}; background:${appBackground}; color:${c.text}; }
     .settings-backdrop,.modal-backdrop { background:rgba(0,0,0,${overlayAlpha}); }
     .file-viewer { background:${sidebarBackground}; border-color:${c.border}; }
     .terminal-stack,.terminal-host,.terminal-view { background:${terminalBackground}; }

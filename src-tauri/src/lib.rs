@@ -434,12 +434,82 @@ fn plugin_process_is_running(names: Vec<String>) -> Result<bool, String> {
     }
 }
 
+#[tauri::command]
+fn set_native_background_blur(window: tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            window_vibrancy::apply_acrylic(&window, None)
+        } else {
+            window_vibrancy::clear_acrylic(&window)
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if enabled {
+            window_vibrancy_wayland::apply_blur(&window, None)
+        } else {
+            match window_vibrancy_wayland::clear_blur(&window) {
+                Err(
+                    window_vibrancy_wayland::Error::UnsupportedPlatform(_)
+                    | window_vibrancy_wayland::Error::UnsupportedPlatformVersion(_),
+                ) => Ok(()),
+                result => result,
+            }
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if enabled {
+            window_vibrancy::apply_vibrancy(
+                &window,
+                window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground,
+                None,
+                None,
+            )
+        } else {
+            window_vibrancy::clear_vibrancy(&window).map(|_| ())
+        }
+        .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (window, enabled);
+        Err("Native desktop blur is unsupported on this platform.".to_string())
+    }
+}
+
+fn external_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "linux")]
+    if let (Some(appdir), Some(library_path)) =
+        (env::var_os("APPDIR"), env::var_os("LD_LIBRARY_PATH"))
+    {
+        let appdir = PathBuf::from(appdir);
+        let host_paths = env::split_paths(&library_path).filter(|path| !path.starts_with(&appdir));
+        if let Ok(host_paths) = env::join_paths(host_paths) {
+            if host_paths.is_empty() {
+                command.env_remove("LD_LIBRARY_PATH");
+            } else {
+                command.env("LD_LIBRARY_PATH", host_paths);
+            }
+        }
+    }
+    command
+}
+
 fn gh_command() -> Command {
-    Command::new("gh")
+    external_command("gh")
+}
+
+fn git_command() -> Command {
+    external_command("git")
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
+    git_command()
         .args(args)
         .current_dir(root)
         .output()
@@ -597,7 +667,7 @@ fn github_status(root: String) -> Result<GithubStatus, String> {
     let root = PathBuf::from(root)
         .canonicalize()
         .map_err(|error| format!("Could not access workspace: {error}"))?;
-    let git_installed = Command::new("git")
+    let git_installed = git_command()
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -715,13 +785,13 @@ fn github_configure_identity(name: String, email: String) -> Result<(), String> 
         return Err("Enter both your Git name and email.".to_string());
     }
     require_success(
-        Command::new("git")
+        git_command()
             .args(["config", "--global", "user.name", name])
             .output()
             .map_err(|error| format!("Could not run Git: {error}"))?,
     )?;
     require_success(
-        Command::new("git")
+        git_command()
             .args(["config", "--global", "user.email", email])
             .output()
             .map_err(|error| format!("Could not run Git: {error}"))?,
@@ -733,13 +803,13 @@ fn github_configure_identity(name: String, email: String) -> Result<(), String> 
 fn github_stage(root: String, path: String, stage: bool) -> Result<(), String> {
     let root = resolve_git_root(Path::new(&root))?;
     let output = if stage {
-        Command::new("git")
+        git_command()
             .args(["add", "--"])
             .arg(path)
             .current_dir(root)
             .output()
     } else {
-        Command::new("git")
+        git_command()
             .args(["reset", "--"])
             .arg(path)
             .current_dir(root)
@@ -757,7 +827,7 @@ fn github_commit(root: String, message: String) -> Result<(), String> {
     if message.is_empty() {
         return Err("Enter a commit message.".to_string());
     }
-    let output = Command::new("git")
+    let output = git_command()
         .args(["commit", "-m", message])
         .current_dir(root)
         .output()
@@ -771,7 +841,7 @@ fn github_fetch(root: String) -> Result<(), String> {
     let root = resolve_git_root(Path::new(&root))?;
     let remote = github_remote_name(&root)
         .ok_or_else(|| "Add a GitHub remote before checking for updates.".to_string())?;
-    let output = Command::new("git")
+    let output = git_command()
         .args(["fetch", &remote])
         .current_dir(root)
         .output()
@@ -790,7 +860,7 @@ fn github_pull(root: String) -> Result<(), String> {
     if branch.is_empty() {
         return Err("Create or switch to a branch before pulling.".to_string());
     }
-    let output = Command::new("git")
+    let output = git_command()
         .args(["pull", "--rebase", &remote, &branch])
         .current_dir(root)
         .output()
@@ -809,7 +879,7 @@ fn github_push(root: String) -> Result<(), String> {
     if branch.is_empty() {
         return Err("Create or switch to a branch before pushing.".to_string());
     }
-    let output = Command::new("git")
+    let output = git_command()
         .args(["push", "--set-upstream", &remote, &branch])
         .current_dir(root)
         .output()
@@ -821,7 +891,7 @@ fn github_push(root: String) -> Result<(), String> {
 #[tauri::command]
 fn github_switch_branch(root: String, branch: String) -> Result<(), String> {
     let root = resolve_git_root(Path::new(&root))?;
-    let output = Command::new("git")
+    let output = git_command()
         .args(["switch", &branch])
         .current_dir(root)
         .output()
@@ -838,13 +908,13 @@ fn github_create_branch(root: String, branch: String) -> Result<(), String> {
         return Err("Enter a branch name.".to_string());
     }
     require_success(
-        Command::new("git")
+        git_command()
             .args(["check-ref-format", "--branch", branch])
             .current_dir(&root)
             .output()
             .map_err(|error| format!("Could not run Git: {error}"))?,
     )?;
-    let output = Command::new("git")
+    let output = git_command()
         .args(["switch", "-c", branch])
         .current_dir(root)
         .output()
@@ -882,13 +952,13 @@ fn github_create_repo(root: String, name: String, visibility: String) -> Result<
     let repo_root = if let Some(repo_root) = existing_root {
         repo_root
     } else {
-        let init = Command::new("git")
+        let init = git_command()
             .args(["init", "--initial-branch=main"])
             .current_dir(&root)
             .output()
             .map_err(|error| format!("Could not run Git: {error}"))?;
         if !init.status.success() {
-            let fallback = Command::new("git")
+            let fallback = git_command()
                 .arg("init")
                 .current_dir(&root)
                 .output()
@@ -926,7 +996,7 @@ fn github_create_repo(root: String, name: String, visibility: String) -> Result<
         let branch = git_output(&repo_root, &["branch", "--show-current"])?;
         let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
         if !branch.is_empty() {
-            let push = Command::new("git")
+            let push = git_command()
                 .args(["push", "--set-upstream", &remote, &branch])
                 .current_dir(&repo_root)
                 .output()
@@ -1439,6 +1509,7 @@ pub fn run() {
             workspace_grant_access,
             workspace_allow_hidden_path,
             plugin_process_is_running,
+            set_native_background_blur,
             terminal_spawn,
             terminal_write,
             terminal_resize,

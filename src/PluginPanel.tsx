@@ -2,10 +2,13 @@ import { useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { BookOpen, Download, FolderOpen, Plug, Puzzle, Trash2, X } from "lucide-react";
 import { join } from "@tauri-apps/api/path";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import pluginApiMarkdown from "../PLUGIN_API.md?raw";
 import type { InstalledPlugin, PluginPanelContribution } from "./pluginRuntime";
 import "./PluginPanel.css";
 import "./PluginPanel.folder.css";
+import "./PluginPanel.docs.css";
 
 export default function PluginPanel({
   plugins,
@@ -96,16 +99,22 @@ export default function PluginPanel({
 
   return <div className="plugin-panel">
     <header className="plugin-header">
-      <div className="plugin-heading"><Puzzle size={19} /><div><strong>Plugins</strong><span>Manage built-in plugins and install local plugins</span></div></div>
-      <div className="plugin-header-actions"><button className="github-secondary" onClick={() => setShowDocs(true)}><BookOpen size={14} /> API documentation</button><button className="github-primary" disabled={busy} onClick={() => void install()}><Download size={14} /> Install from folder</button></div>
+      {showDocs ? <>
+        <div className="plugin-heading"><BookOpen size={17} /><div><strong>Plugin API documentation</strong></div></div>
+        <div className="plugin-header-actions"><button className="github-secondary" onClick={downloadApiGuide}><Download size={13} /> Download .md</button><button className="github-secondary" onClick={() => setShowDocs(false)}><X size={14} /> Back to plugins</button></div>
+      </> : <>
+        <div className="plugin-heading"><Puzzle size={19} /><div><strong>Plugins</strong></div></div>
+        <div className="plugin-header-actions"><button className="github-secondary" disabled={!pluginDirectory} onClick={() => void openPluginFolder()}><FolderOpen size={14} /> Plugin folder</button><button className="github-secondary" onClick={() => setShowDocs(true)}><BookOpen size={14} /> API documentation</button><button className="github-primary" disabled={busy} onClick={() => void install()}><Download size={14} /> Install from folder</button></div>
+      </>}
     </header>
 
     {error && <div className="github-feedback error">{error}</div>}
 
-    <section className="plugin-content">
-      <div className="plugin-folder-row"><div><span>Plugin folder</span><code>{pluginDirectory || "Preparing plugin folder…"}</code></div><button className="github-secondary" disabled={!pluginDirectory} onClick={() => void openPluginFolder()}><FolderOpen size={13} /> Open</button></div>
-      <p className="plugin-intro">Each installed plugin is a package in Arc’s plugins folder. Plugins add their own actions and context menu items.</p>
+    {showDocs ? <main className="plugin-docs-content">
+      <article className="plugin-docs-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{pluginApiMarkdown}</ReactMarkdown></article>
+    </main> : <section className="plugin-content">
       <div className="plugin-section-heading"><h2>Installed plugins</h2><span>{plugins.length}</span></div>
+      <div className="plugin-installed-list">
       {plugins.length ? plugins.map((plugin) => <article className="plugin-card" key={plugin.id}>
         <div className="plugin-card-icon"><Puzzle size={16} /></div>
         <div className="plugin-card-details"><strong>{plugin.name}<small>{plugin.builtin ? "Built-in" : plugin.version}</small></strong><span>{plugin.description || plugin.id}</span><code>{plugin.id}</code></div>
@@ -113,6 +122,7 @@ export default function PluginPanel({
         <button className="github-icon-button" title={`Open ${plugin.name} files`} aria-label={`Open ${plugin.name} files`} disabled={!pluginDirectory || busy} onClick={() => void openPluginFiles(plugin.id)}><FolderOpen size={14} /></button>
         <button className="github-icon-button plugin-uninstall" title={`Uninstall ${plugin.name}`} disabled={busy} onClick={() => void uninstall(plugin)}><Trash2 size={14} /></button>
       </article>) : <div className="plugin-empty">No local plugins installed yet.</div>}
+      </div>
 
       {availableBuiltins.length > 0 && <>
         <div className="plugin-section-heading"><h2>Included plugins</h2><span>{availableBuiltins.length}</span></div>
@@ -132,44 +142,6 @@ export default function PluginPanel({
         </article>)}
       </>}
 
-      <section className="plugin-help">
-        <h2>Install a local plugin</h2>
-        <p>Select folder containing <code>plugin.json</code> and a self-contained <code>main.js</code>. Arc copies both into app data.</p>
-        <p>Plugin code runs inside Arc. Install code only from sources you trust.</p>
-        <pre><code>{`plugin.json
-{
-  "id": "hello-world",
-  "name": "Hello World",
-  "version": "1.0.0",
-  "description": "Example toolbar plugin",
-  "main": "main.js"
-}
-
-main.js
-export function activate(api) {
-  api.registerAction({
-    id: "hello",
-    label: "Hello",
-    icon: "puzzle",
-    onClick: () => api.notify("Hello from plugin!")
-  });
-}`}</code></pre>
-        <p>Plugins can control workspace files, editor, terminals, settings, themes, and app UI. Register commands for <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>. Open API documentation for complete examples.</p>
-        <pre><code>{`api.registerContextMenuItem({
-  id: "inspect",
-  label: "Inspect with plugin",
-  onClick: ({ workspace, target }) => {
-    api.notify(target?.path ?? workspace);
-  }
-});`}</code></pre>
-        <p>Plugin entry file uses standard JavaScript ES module syntax.</p>
-      </section>
-    </section>
-    {showDocs && <div className="plugin-docs-backdrop" onClick={() => setShowDocs(false)}>
-      <section className="plugin-docs-dialog" role="dialog" aria-modal="true" aria-label="Plugin API documentation" onClick={(event) => event.stopPropagation()}>
-        <header><div><BookOpen size={16} /><strong>Plugin API documentation</strong></div><div><button className="github-secondary" onClick={downloadApiGuide}><Download size={13} /> Download .md for coding agents</button><button className="github-icon-button" aria-label="Close documentation" onClick={() => setShowDocs(false)}><X size={15} /></button></div></header>
-        <pre>{pluginApiMarkdown}</pre>
-      </section>
-    </div>}
+    </section>}
   </div>;
 }

@@ -1,6 +1,6 @@
 [package]
 name = "arc"
-version = "0.1.1"
+version = "0.1.2"
 description = "A focused workspace for building the web"
 authors = ["Arc"]
 edition = "2021"
@@ -20,6 +20,12 @@ tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+window-vibrancy-wayland = { package = "window-vibrancy", git = "https://github.com/tauri-apps/window-vibrancy.git", rev = "0d2bf22b77318690b54a27fa0505437718fd69f6" }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+window-vibrancy = "0.8.1"
 
 [profile.release]
 opt-level = "z"

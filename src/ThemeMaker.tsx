@@ -1,6 +1,7 @@
-import { useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, type CSSProperties } from "react";
 import { ArrowLeft, FolderOpen, Plus, Save } from "lucide-react";
 import { themeColorWithOpacity, THEME_COLOR_GROUPS, type AppSettings, type ThemeColors, type ThemeDefinition } from "./settings";
+import ThemeColorPicker from "./ThemeColorPicker";
 
 const sample = [
   { number: "1", parts: [{ text: "const", color: "keyword" }, { text: " greeting", color: "text" }, { text: " = ", color: "operator" }, { text: "'Hello, Arc!'", color: "string" }, { text: ";", color: "operator" }] },
@@ -11,85 +12,6 @@ const sample = [
   { number: "6", parts: [{ text: "", color: "text" }] },
   { number: "7", parts: [{ text: "// Theme preview", color: "comment" }] },
 ];
-
-function rgbFromHex(hex: string) {
-  const value = hex.slice(1, 7);
-  return [0, 2, 4].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16));
-}
-
-function hsvFromRgb([red, green, blue]: number[]) {
-  const r = red / 255;
-  const g = green / 255;
-  const b = blue / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  let hue = 0;
-  if (delta) {
-    if (max === r) hue = 60 * (((g - b) / delta) % 6);
-    else if (max === g) hue = 60 * ((b - r) / delta + 2);
-    else hue = 60 * ((r - g) / delta + 4);
-  }
-  return { h: (hue + 360) % 360, s: max ? delta / max : 0, v: max };
-}
-
-function rgbFromHsv({ h, s, v }: { h: number; s: number; v: number }) {
-  const chroma = v * s;
-  const segment = h / 60;
-  const x = chroma * (1 - Math.abs(segment % 2 - 1));
-  const match = v - chroma;
-  const rgb = segment < 1 ? [chroma, x, 0]
-    : segment < 2 ? [x, chroma, 0]
-      : segment < 3 ? [0, chroma, x]
-        : segment < 4 ? [0, x, chroma]
-          : segment < 5 ? [x, 0, chroma] : [chroma, 0, x];
-  return rgb.map((channel) => Math.round((channel + match) * 255));
-}
-
-function hexWithRgb(hex: string, rgb: number[]) {
-  return `#${rgb.map((channel) => Math.round(Math.max(0, Math.min(255, channel))).toString(16).padStart(2, "0")).join("")}${hex.length === 9 ? hex.slice(7) : ""}`;
-}
-
-function ThemeColorPicker({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const [hexDraft, setHexDraft] = useState(value.slice(0, 7));
-  const [hsv, setHsv] = useState(() => hsvFromRgb(rgbFromHex(value)));
-  useEffect(() => {
-    setHexDraft(value.slice(0, 7));
-    setHsv(hsvFromRgb(rgbFromHex(value)));
-  }, [value]);
-  const updateSv = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const next = {
-      ...hsv,
-      s: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
-      v: 1 - Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
-    };
-    setHsv(next);
-    onChange(hexWithRgb(value, rgbFromHsv(next)));
-  };
-  const updateHue = (h: number) => {
-    const next = { ...hsv, h };
-    setHsv(next);
-    onChange(hexWithRgb(value, rgbFromHsv(next)));
-  };
-
-  return <div className="theme-color-picker">
-    <button className="theme-color-swatch" aria-label={`Change ${label} color`} title={`${label}: ${value}`} style={{ backgroundColor: value.slice(0, 7), borderColor: "#ffffff70" }} onClick={() => setOpen((current) => !current)} />
-    {open && <div className="theme-color-popover">
-      <strong>{label}</strong>
-      <label className="theme-picker-hex">Hex<input value={hexDraft} spellCheck={false} onChange={(event) => {
-        setHexDraft(event.target.value);
-        if (/^#[0-9a-f]{6}$/i.test(event.target.value)) onChange(`${event.target.value}${value.length === 9 ? value.slice(7) : ""}`);
-      }} /></label>
-      <div className="theme-picker-sv" role="group" aria-label="Saturation and brightness" style={{ backgroundColor: `hsl(${hsv.h} 100% 50%)` }} onPointerDown={(event) => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); updateSv(event); }} onPointerMove={(event) => { if (event.buttons) updateSv(event); }}>
-        <i className="theme-picker-marker" style={{ left: `${hsv.s * 100}%`, top: `${(1 - hsv.v) * 100}%` }} />
-      </div>
-      <label className="theme-picker-hue"><span>Hue</span><input aria-label="Hue" type="range" min="0" max="360" value={Math.round(hsv.h)} onChange={(event) => updateHue(Number(event.target.value))} /></label>
-      <button className="theme-picker-done" onClick={() => setOpen(false)}>Done</button>
-    </div>}
-  </div>;
-}
 
 export default function ThemeMaker({
   initialTheme,
@@ -112,6 +34,7 @@ export default function ThemeMaker({
 }) {
   const [theme, setTheme] = useState<ThemeDefinition>(() => ({ ...initialTheme, colors: { ...initialTheme.colors } }));
   const [error, setError] = useState("");
+  const [colorPickerOpen, setColorPickerOpen] = useState(false);
   const glassFill = (color: string, transparency: number) => themeColorWithOpacity(
     color,
     1 - (settings.editorGlassEnabled ? Math.max(0, Math.min(100, transparency)) : 0) / 100,
@@ -128,11 +51,11 @@ export default function ThemeMaker({
     onCreate(theme, name);
   };
 
-  return <main className={`theme-maker-page ${settings.appTheme === "macos" ? "app-theme-macos" : ""} ${settings.editorGlassEnabled ? "editor-glass-enabled" : ""}`} style={{
+  return <main className={`theme-maker-page ${settings.appTheme === "macos" ? "app-theme-macos" : ""} ${settings.editorGlassEnabled ? "editor-glass-enabled" : ""} ${colorPickerOpen ? "color-picker-open" : ""}`} style={{
     background: glassFill(theme.colors.background, settings.glassAppTransparency),
     color: theme.colors.text,
+    fontFamily: settings.interfaceFontFamily || undefined,
     "--editor-glass-blur": `${settings.editorGlassBlur}px`,
-    "--editor-glass-saturation": `${settings.editorGlassSaturation}%`,
     "--glass-app-transparency": `${settings.editorGlassEnabled ? settings.glassAppTransparency : 0}%`,
     "--glass-sidebar-transparency": `${settings.editorGlassEnabled ? settings.glassSidebarTransparency : 0}%`,
     "--glass-controls-transparency": `${settings.editorGlassEnabled ? settings.glassControlsTransparency : 0}%`,
@@ -140,6 +63,7 @@ export default function ThemeMaker({
     "--glass-controls-surface": glassFill(theme.colors.raised, settings.glassControlsTransparency),
     "--glass-floating-surface": glassFill(theme.colors.raised, settings.glassFloatingTransparency),
     "--theme-raised": theme.colors.raised,
+    "--theme-raised-opaque": theme.colors.raised.slice(0, 7),
     "--theme-border": theme.colors.border,
     "--theme-text": theme.colors.text,
     "--theme-secondary": theme.colors.secondaryText,
@@ -170,7 +94,7 @@ export default function ThemeMaker({
           <h2>{group.name}</h2>
           {group.keys.map((key) => <label className="theme-color-row" key={key}>
             <span>{key === "invalidBackground" ? "Invalid background" : key.replace(/[A-Z]/g, (letter) => ` ${letter.toLowerCase()}`)}</span>
-            <ThemeColorPicker label={key} value={theme.colors[key]} onChange={(value) => updateColor(key, value)} />
+            <ThemeColorPicker label={key} value={theme.colors[key]} onChange={(value) => updateColor(key, value)} onOpenChange={setColorPickerOpen} />
           </label>)}
         </section>)}
       </aside>
