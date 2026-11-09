@@ -4277,6 +4277,16 @@ function App() {
                     return;
                   handleTreeDrop(event, '');
                 }}
+                onClick={(event) => {
+                  // Empty space below the last row selects the workspace
+                  // root (VS Code behavior): new files land at the root.
+                  if ((event.target as HTMLElement).closest('.tree-row, input'))
+                    return;
+                  setSelectedPaths(new Set());
+                  setSelectedPath('');
+                  setSelectedDirectory('');
+                  selectionAnchor.current = '';
+                }}
               >
                 {newItemKind && (
                   <div className="tree-create-row">
