@@ -53,6 +53,7 @@ import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
 import { php } from '@codemirror/lang-php';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
@@ -130,18 +131,16 @@ import {
   type AppSettings,
   type ThemeDefinition,
 } from './settings';
-import {
-  WORKSPACE_SNAPSHOT_VERSION,
-  deserializeLayoutNode,
-  gcWorkspaces,
-  loadWorkspaceState,
-  saveWorkspaceState,
-  serializeLayoutNode,
-} from './workspaceState';
 
 const TerminalView = lazy(() => import('./TerminalView'));
 
 type DiskFile = { name: string; path: string; kind: 'file' | 'directory' };
+type FsEvent = {
+  root: string;
+  kind: 'created' | 'removed' | 'renamed' | 'modified';
+  paths: string[];
+  isDir?: boolean;
+};
 type OpenFile = {
   path: string;
   name: string;
@@ -217,21 +216,6 @@ async function requestWorkspaceAccess(root: string): Promise<boolean> {
   if (!approved) return false;
   await invoke('workspace_grant_access', { root });
   return true;
-}
-
-function shouldPersistWorkspace(): boolean {
-  return isTauri();
-}
-
-function relativeTerminalCwd(cwd: string, root: string): string {
-  if (cwd === root) return '.';
-  return cwd.startsWith(`${root}/`) ? cwd.slice(root.length + 1) : cwd;
-}
-
-function absoluteTerminalCwd(cwd: string, root: string): string {
-  if (!cwd || cwd === '.' || cwd === './') return root;
-  if (cwd.startsWith('/')) return cwd;
-  return `${root}/${cwd}`;
 }
 
 function matchesPluginShortcut(
@@ -802,6 +786,9 @@ function EditorPane({
   onTerminalTitleChange,
   workspace,
   githubReloadToken,
+  diskConflict,
+  onConflictReload,
+  onConflictKeep,
   pluginPanel,
   pluginViews,
   editorViews,
@@ -822,6 +809,9 @@ function EditorPane({
   onTerminalTitleChange: (id: string, title: string) => void;
   workspace: string;
   githubReloadToken: number;
+  diskConflict?: boolean;
+  onConflictReload?: (path: string) => void;
+  onConflictKeep?: (path: string) => void;
   pluginPanel: ReactNode;
   pluginViews: PluginPanelContribution[];
   editorViews: { current: Map<string, EditorView> };
@@ -1246,6 +1236,13 @@ function EditorPane({
         )}
         <div className="tab-spacer" />
       </div>
+      {file && diskConflict && (
+        <div className="disk-conflict">
+          <span>{file.name} changed on disk.</span>
+          <button onClick={() => onConflictReload?.(file.path)}>Reload</button>
+          <button onClick={() => onConflictKeep?.(file.path)}>Keep mine</button>
+        </div>
+      )}
       {file && <div className="editor-host" ref={host} />}
       {group.activePath === GITHUB_TAB_KEY && (
         <GithubPanel workspace={workspace} reloadToken={githubReloadToken} />
@@ -1378,6 +1375,19 @@ function App() {
     { id: 'group-1', activePath: '', tabs: [] },
   ]);
   const [githubReloadToken, setGithubReloadToken] = useState(0);
+  const [diskConflicts, setDiskConflicts] = useState<Set<string>>(new Set());
+  const watcherRoot = useRef('');
+  const activeWatchRoot = useRef('');
+  const watchGeneration = useRef(0);
+  const fsEventQueue = useRef<FsEvent[]>([]);
+  const fsApplyScheduled = useRef(false);
+  const lastDiskWrite = useRef(new Map<string, string>());
+  const settingsRef = useRef<AppSettings>(settings);
+  const openFilesRef = useRef<OpenFile[]>([]);
+  const groupsRef = useRef<EditorGroup[]>([]);
+  const processFsEventsRef = useRef<(events: FsEvent[]) => Promise<void>>(
+    async () => undefined,
+  );
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const editorViews = useRef(new Map<string, EditorView>());
   const [layout, setLayout] = useState<LayoutNode>({
@@ -1424,29 +1434,6 @@ function App() {
   const splitCounter = useRef(0);
   const terminalCounter = useRef(0);
   const tree = useMemo(() => makeTree(files), [files]);
-  const latestWorkspaceState = useRef<{
-    workspace: string;
-    layout: LayoutNode;
-    groups: EditorGroup[];
-    activeGroupId: GroupId;
-    expanded: Set<string>;
-    viewerOpen: boolean;
-    viewerWidth: number;
-    selectedPath: string;
-    terminals: TerminalSession[];
-  } | null>(null);
-  latestWorkspaceState.current = {
-    workspace,
-    layout,
-    groups,
-    activeGroupId,
-    expanded,
-    viewerOpen,
-    viewerWidth: settings.sidebarWidth,
-    selectedPath,
-    terminals,
-  };
-  const restoringWorkspace = useRef(false);
   const visibleTreeNodes = useMemo(() => {
     const visible: { node: TreeNode; depth: number }[] = [];
     const visit = (nodes: TreeNode[], depth: number) =>
@@ -1786,182 +1773,323 @@ function App() {
     return newGroupId;
   };
 
-  const writeWorkspaceNow = async () => {
-    if (!shouldPersistWorkspace() || restoringWorkspace.current) return;
-    const snapshot = latestWorkspaceState.current;
-    if (!snapshot || !snapshot.workspace) return;
-    try {
-      const activeIndex = snapshot.groups.findIndex(
-        (group) => group.id === snapshot.activeGroupId,
-      );
-      await saveWorkspaceState(snapshot.workspace, {
-        version: WORKSPACE_SNAPSHOT_VERSION,
-        workspace: snapshot.workspace,
-        savedAt: new Date().toISOString(),
-        layout:
-          serializeLayoutNode(snapshot.layout, (groupId) =>
-            Math.max(
-              0,
-              snapshot.groups.findIndex((group) => group.id === groupId),
-            ),
-          ) ??
-          { type: 'group', group: Math.max(0, activeIndex) },
-        groups: snapshot.groups.map((group) => ({
-          active: group.activePath,
-          tabs: [...group.tabs],
-        })),
-        activeGroup: Math.max(0, activeIndex),
-        viewer: { open: snapshot.viewerOpen, width: snapshot.viewerWidth },
-        expandedDirs: [...snapshot.expanded],
-        selectedPath: snapshot.selectedPath,
-        terminals: snapshot.terminals.map((terminal) => ({
-          key: terminal.key,
-          title: terminal.title,
-          cwd: relativeTerminalCwd(terminal.cwd, snapshot.workspace),
-          command: terminal.command,
-        })),
-      });
-    } catch {
-      // Persistence must never break the session.
-    }
-  };
+  // ---- Live file tree updates (backend watcher) ----
 
-  const restoreForWorkspace = async (root: string) => {
-    if (!shouldPersistWorkspace()) return;
-    const stored = await loadWorkspaceState(root).catch(() => null);
-    if (!stored) return;
-    restoringWorkspace.current = true;
-    try {
-      groupCounter.current = 0;
-    splitCounter.current = 0;
-    const terminalKeyMap = new Map<string, string>();
-    const nextTerminals: TerminalSession[] = [];
-    if (settings.restoreTerminals) {
-      for (const terminal of stored.terminals) {
-        const id = `terminal-${Date.now()}-${++terminalCounter.current}`;
-        const key = `terminal:${id}`;
-        terminalKeyMap.set(terminal.key, key);
-        nextTerminals.push({
-          id,
-          key,
-          cwd: absoluteTerminalCwd(terminal.cwd, root),
-          title: terminal.title,
-          command: terminal.command,
-        });
+  const processFsEvents = async (events: FsEvent[]) => {
+    if (!watcherRoot.current) return;
+    const root = watcherRoot.current;
+    const showHidden = settingsRef.current.showHiddenFiles;
+    const hidden = (relativePath: string) =>
+      !showHidden && relativePath.split('/').some((part) => part.startsWith('.'));
+    const relative = (absolutePath: string) =>
+      absolutePath.startsWith(`${root}/`)
+        ? absolutePath.slice(root.length + 1)
+        : absolutePath === root
+          ? ''
+          : '';
+    const removals: string[] = [];
+    const created: DiskFile[] = [];
+    const renames = new Map<string, string>();
+    const modified: string[] = [];
+    let rootGone = false;
+
+    for (const event of events) {
+      if (event.root !== root) continue;
+      if (event.kind === 'modified') {
+        const relativePath = relative(event.paths[0]);
+        if (relativePath) modified.push(relativePath);
+        continue;
       }
-    }
-    const isSpecialTab = (key: string) =>
-      key.startsWith('internal:') || key.startsWith('terminal:');
-    const candidates = new Set<string>();
-    for (const group of stored.groups)
-      for (const tab of group.tabs) if (!isSpecialTab(tab)) candidates.add(tab);
-    const loadedFiles = await Promise.all(
-      [...candidates].map(async (relative) => {
-        try {
-          const metadata = await stat(`${root}/${relative}`);
-          if (metadata.isDirectory) return null;
-          const content = await readTextFile(`${root}/${relative}`);
-          return {
-            relative,
-            content,
-            name: relative.split('/').pop() ?? relative,
-          };
-        } catch {
-          return null;
+      if (event.kind === 'removed') {
+        const relativePath = relative(event.paths[0]);
+        removals.push(relativePath);
+        if (!relativePath) rootGone = true;
+        continue;
+      }
+      if (event.kind === 'created') {
+        const relativePath = relative(event.paths[0]);
+        if (relativePath && !hidden(relativePath)) {
+          created.push({
+            name: relativePath.split('/').at(-1) ?? relativePath,
+            path: relativePath,
+            kind: event.isDir ? 'directory' : 'file',
+          });
         }
-      }),
-    );
-    const survivors = new Set(
-      loadedFiles.flatMap((entry) => (entry ? [entry.relative] : [])),
-    );
-    const remapStoredTab = (tab: string): string | null => {
-      if (tab.startsWith('internal:')) return tab;
-      if (tab.startsWith('terminal:'))
-        return terminalKeyMap.get(tab) ?? null;
-      return survivors.has(tab) ? tab : null;
-    };
-    const nextGroups = stored.groups.map((group) => {
-      const tabs: string[] = [];
-      for (const tab of group.tabs) {
-        const next = remapStoredTab(tab);
-        if (next && !tabs.includes(next)) tabs.push(next);
+        continue;
       }
-      const active = remapStoredTab(group.active);
-      return {
-        id: `group-${++groupCounter.current}`,
-        activePath: active ?? tabs.at(-1) ?? '',
-        tabs,
-      };
-    });
-    if (!nextGroups.length || nextGroups.every((group) => !group.tabs.length)) {
-      // Nothing survived: fall back to the default single empty group.
-      groupCounter.current = 1;
-      setGroups([{ id: 'group-1', activePath: '', tabs: [] }]);
-      setLayout({ type: 'group', groupId: 'group-1' });
-      setActiveGroupId('group-1');
-      return;
-    }
-    const nextExpanded = new Set(
-      (
-        await Promise.all(
-          stored.expandedDirs.map(async (directory) => {
-            try {
-              const metadata = await stat(`${root}/${directory}`);
-              return metadata.isDirectory ? directory : null;
-            } catch {
-              return null;
-            }
-          }),
-        )
-      ).filter((entry): entry is string => Boolean(entry)),
-    );
-    let nextSelectedPath = '';
-    if (stored.selectedPath) {
-      try {
-        const metadata = await stat(`${root}/${stored.selectedPath}`);
-        if (!metadata.isDirectory) nextSelectedPath = stored.selectedPath;
-      } catch {
-        // drop the stale selection
+      if (event.kind === 'renamed') {
+        const from = relative(event.paths[0]);
+        const to = relative(event.paths[1] ?? '');
+        if (!to) continue;
+        renames.set(from, to);
+        removals.push(from);
+        if (!hidden(to)) {
+          created.push({
+            name: to.split('/').at(-1) ?? to,
+            path: to,
+            kind: event.isDir ? 'directory' : 'file',
+          });
+        }
       }
     }
-    const nextLayout =
-      deserializeLayoutNode(
-        stored.layout,
-        (index) => nextGroups[index]?.id ?? nextGroups[0].id,
-        () => `split-${++splitCounter.current}`,
-      ) ?? { type: 'group', groupId: nextGroups[0].id };
-    setOpenFiles(
-      survivors.size
-        ? loadedFiles.flatMap((entry) => {
-            if (!entry) return [];
-            return [
-              { path: entry.relative, name: entry.name, revision: 0, dirty: false },
-            ];
-          })
-        : [],
-    );
-    fileContents.current.clear();
-    for (const loaded of loadedFiles)
-      if (loaded) fileContents.current.set(loaded.relative, loaded.content);
-    setGroups(nextGroups);
-    setLayout(nextLayout);
-    setActiveGroupId(nextGroups[stored.activeGroup]?.id ?? nextGroups[0].id);
-    setTerminals(nextTerminals);
-    setExpanded(nextExpanded);
-    setSelectedPath(nextSelectedPath);
-    setViewerOpen(stored.viewer.open !== false);
-    if (Number.isFinite(stored.viewer.width))
-      updateSettings({
-        sidebarWidth: Math.min(
-          480,
-          Math.max(MIN_VIEWER_WIDTH, stored.viewer.width),
-        ),
+
+    if (rootGone) {
+      setFiles([]);
+    } else if (removals.length > 0 || created.length > 0) {
+      setFiles((current) => {
+        const next = current.filter(
+          (file) =>
+            !removals.some(
+              (relativePath) =>
+                relativePath &&
+                (file.path === relativePath ||
+                  file.path.startsWith(`${relativePath}/`)),
+            ),
+        );
+        const added: DiskFile[] = [];
+        const seen = new Set(next.map((file) => file.path));
+        for (const entry of created) {
+          if (seen.has(entry.path)) continue;
+          added.push(entry);
+          seen.add(entry.path);
+        }
+        return added.length ? [...next, ...added] : next;
       });
-    setMessage('');
-    } finally {
-      restoringWorkspace.current = false;
+    }
+
+    const doomed = new Set<string>();
+    for (const relativePath of removals) {
+      if (!relativePath) continue;
+      for (const file of openFilesRef.current) {
+        if (
+          (file.path === relativePath ||
+            file.path.startsWith(`${relativePath}/`)) &&
+          !file.dirty &&
+          ![...renames.keys()].some(
+            (from) =>
+              file.path === from || file.path.startsWith(`${from}/`),
+          )
+        ) {
+          doomed.add(file.path);
+        }
+      }
+    }
+    if (doomed.size) {
+      for (const path of doomed) fileContents.current.delete(path);
+      setOpenFiles((current) =>
+        current.filter((file) => !doomed.has(file.path)),
+      );
+      normalizeGroups(
+        groupsRef.current.map((group) => {
+          const tabs = group.tabs.filter((tab) => !doomed.has(tab));
+          return {
+            ...group,
+            tabs,
+            activePath: doomed.has(group.activePath)
+              ? (tabs.at(-1) ?? '')
+              : group.activePath,
+          };
+        }),
+      );
+    }
+    if (renames.size > 0) {
+      const remap = (path: string) => {
+        let next = path;
+        for (const [from, to] of renames) {
+          if (next === from) next = to;
+          else if (from && next.startsWith(`${from}/`))
+            next = `${to}${next.slice(from.length)}`;
+        }
+        return next;
+      };
+      const touches = (path: string) =>
+        [...renames.keys()].some(
+          (from) => path === from || path.startsWith(`${from}/`),
+        );
+      if (openFilesRef.current.some((file) => touches(file.path))) {
+        fileContents.current = new Map(
+          [...fileContents.current].map(([path, content]) => [
+            remap(path),
+            content,
+          ]),
+        );
+        lastDiskWrite.current = new Map(
+          [...lastDiskWrite.current].map(([path, content]) => [
+            remap(path),
+            content,
+          ]),
+        );
+        setOpenFiles((current) =>
+          current.map((file) => {
+            const next = remap(file.path);
+            return next === file.path
+              ? file
+              : {
+                  ...file,
+                  path: next,
+                  name: next.split('/').pop() ?? file.name,
+                };
+          }),
+        );
+        setGroups((current) =>
+          current.map((group) => ({
+            ...group,
+            tabs: group.tabs.map(remap),
+            activePath: group.activePath ? remap(group.activePath) : '',
+          })),
+        );
+        setDiskConflicts((current) => new Set([...current].map(remap)));
+        setExpanded((current) => new Set([...current].map(remap)));
+      }
+    }
+
+    // Tree selection: renamed folders re-point; deleted folders fall back to
+    // the workspace root so new files/folders land somewhere that exists.
+    if (removals.length > 0 || renames.size > 0) {
+      const remapSelection = (path: string) => {
+        let next = path;
+        for (const [from, to] of renames) {
+          if (next === from) next = to;
+          else if (from && next.startsWith(`${from}/`))
+            next = `${to}${next.slice(from.length)}`;
+        }
+        for (const removedRel of removals) {
+          if (
+            removedRel &&
+            (next === removedRel || next.startsWith(`${removedRel}/`))
+          )
+            return '';
+        }
+        return next;
+      };
+      if (selectedPath) setSelectedPath(remapSelection(selectedPath));
+      if (selectedDirectory) setSelectedDirectory(remapSelection(selectedDirectory));
+      if (selectedPaths.size)
+        setSelectedPaths((current) => {
+          const next = new Set<string>();
+          for (const path of current) {
+            const remapped = remapSelection(path);
+            if (remapped) next.add(remapped);
+          }
+          return next;
+        });
+      selectionAnchor.current = remapSelection(selectionAnchor.current);
+    }
+
+    for (const relativePath of modified) {
+      const open = openFilesRef.current.find(
+        (file) => file.path === relativePath,
+      );
+      if (!open) continue;
+      try {
+        const content = await readTextFile(`${root}/${relativePath}`);
+        const lastWritten = lastDiskWrite.current.get(relativePath);
+        if (lastWritten !== undefined && lastWritten === content) continue;
+        if (open.dirty) {
+          setDiskConflicts((current) =>
+            current.has(relativePath)
+              ? current
+              : new Set(current).add(relativePath),
+          );
+          continue;
+        }
+        fileContents.current.set(relativePath, content);
+        setOpenFiles((current) =>
+          current.map((file) =>
+            file.path === relativePath
+              ? { ...file, revision: file.revision + 1, dirty: false }
+              : file,
+          ),
+        );
+      } catch {
+        // The file vanished; the follow-up remove event closes the tab.
+      }
     }
   };
+  useEffect(() => {
+    processFsEventsRef.current = processFsEvents;
+  });
+
+  useEffect(() => {
+    settingsRef.current = settings;
+    openFilesRef.current = openFiles;
+    groupsRef.current = groups;
+  });
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const unlistenAll = Promise.all([
+      listen<FsEvent>('fs-changed', (event) => {
+        fsEventQueue.current.push(event.payload);
+        if (fsApplyScheduled.current) return;
+        fsApplyScheduled.current = true;
+        const flush = () => {
+          fsApplyScheduled.current = false;
+          const events = fsEventQueue.current;
+          fsEventQueue.current = [];
+          if (!events.length) return;
+          if (!watcherRoot.current) {
+            // Watcher handle not wired yet (watch_project pending): retry.
+            if (fsEventQueue.current.length > 500) fsEventQueue.current = [];
+            fsEventQueue.current.push(...events);
+            fsApplyScheduled.current = true;
+            window.setTimeout(flush, 120);
+            return;
+          }
+          void processFsEventsRef.current(events);
+        };
+        window.requestAnimationFrame(flush);
+      }),
+      listen<string>('fs-watcher-error', (event) => {
+        setMessage(event.payload);
+      }),
+    ]);
+    return () => {
+      void unlistenAll.then((unlisten) => unlisten.forEach((fn) => fn()));
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const generation = ++watchGeneration.current;
+    let cancelled = false;
+    const unwatchPath = async (path: string) => {
+      try {
+        await invoke('unwatch_project', { root: path });
+      } catch {
+        // best effort
+      }
+    };
+    void (async () => {
+      const previous = activeWatchRoot.current;
+      if (previous) await unwatchPath(previous);
+      if (!workspace) {
+        watcherRoot.current = '';
+        activeWatchRoot.current = '';
+        return;
+      }
+      try {
+        const watched = await invoke<string>('watch_project', {
+          root: workspace,
+        });
+        if (cancelled || generation !== watchGeneration.current) {
+          // A newer run owns the watcher (watch_project replaces the backend
+          // watcher outright); never unwatch from a stale run.
+          return;
+        }
+        watcherRoot.current = watched;
+        activeWatchRoot.current = watched;
+      } catch (error) {
+        if (cancelled) return;
+        watcherRoot.current = '';
+        activeWatchRoot.current = '';
+        setMessage(`Live file updates unavailable: ${String(error)}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace]);
 
   const updateTerminalTitle = useCallback((id: string, title: string) => {
     setTerminals((current) =>
@@ -2064,6 +2192,10 @@ function App() {
         'build',
         '.next',
         'target',
+        '__pycache__',
+        '.venv',
+        'venv',
+        '.cache',
       ]);
       const pending = [{ folder: rootPath, prefix: '' }];
       let pendingIndex = 0;
@@ -2143,64 +2275,28 @@ function App() {
   }, [viewerOpen, workspace]);
 
   useEffect(() => {
-    if (workspace) void refreshWorkspace(workspace);
+    // Fallback when the backend watcher is unavailable (watch reached its
+    // limit, unsupported mount): refresh the tree when the window regains
+    // focus so external edits are still picked up eventually.
+    if (!isTauri() || !workspace) return;
+    const rescan = () => {
+      if (document.visibilityState !== 'visible') return;
+      // With the backend watcher healthy the tree stays live; rescan only
+      // serves as the fallback for watch failure / unsupported mounts.
+      if (watcherRoot.current) return;
+      void refreshWorkspace(workspace);
+    };
+    window.addEventListener('focus', rescan);
+    document.addEventListener('visibilitychange', rescan);
+    return () => {
+      window.removeEventListener('focus', rescan);
+      document.removeEventListener('visibilitychange', rescan);
+    };
   }, [refreshWorkspace, workspace]);
 
   useEffect(() => {
-    if (!workspace || !shouldPersistWorkspace()) return;
-    const handle = window.setTimeout(() => {
-      void writeWorkspaceNow();
-    }, 300);
-    return () => window.clearTimeout(handle);
-  }, [
-    layout,
-    groups,
-    openFiles,
-    activeGroupId,
-    expanded,
-    viewerOpen,
-    terminals,
-    settings.sidebarWidth,
-    workspace,
-  ]);
-
-  useEffect(() => {
-    if (!shouldPersistWorkspace()) return;
-    const flush = () => {
-      void writeWorkspaceNow();
-    };
-    window.addEventListener('blur', flush);
-    const interval = window.setInterval(flush, 60000);
-    const appWindow = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    let closeHandled = false;
-    void appWindow
-      .onCloseRequested(async (event) => {
-        if (closeHandled) return;
-        event.preventDefault();
-        closeHandled = true;
-        await writeWorkspaceNow();
-        await appWindow.destroy();
-      })
-      .then((unlistenFn) => {
-        if (disposed) unlistenFn();
-        else unlisten = unlistenFn;
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      window.removeEventListener('blur', flush);
-      window.clearInterval(interval);
-      unlisten?.();
-      unlisten = undefined;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!shouldPersistWorkspace()) return;
-    void gcWorkspaces().catch(() => undefined);
-  }, []);
+    if (workspace) void refreshWorkspace(workspace);
+  }, [refreshWorkspace, workspace]);
 
   const parentDirectory = (path: string) =>
     path.split('/').slice(0, -1).join('/');
@@ -2440,7 +2536,6 @@ function App() {
         }
         await refreshWorkspace(previousWorkspace);
         setWorkspace(previousWorkspace);
-        await restoreForWorkspace(previousWorkspace);
         setMessage('');
       } catch {
         localStorage.removeItem('arc.lastWorkspace');
@@ -2460,7 +2555,6 @@ function App() {
       }
       await refreshWorkspace(selected);
       localStorage.setItem('arc.lastWorkspace', selected);
-      await writeWorkspaceNow();
       terminals.forEach((terminal) => {
         forgetTerminalOutput(terminal.id);
         void invoke('terminal_close', { id: terminal.id });
@@ -2484,7 +2578,6 @@ function App() {
       setRenamingPath('');
       setRenameName('');
       setContextMenu(null);
-      await restoreForWorkspace(selected);
       setMessage('');
     } catch (error) {
       setMessage(`Could not open workspace: ${String(error)}`);
@@ -2569,6 +2662,13 @@ function App() {
       try {
         await writeTextFile(`${workspace}/${file.path}`, content);
         fileContents.current.set(path, content);
+        lastDiskWrite.current.set(path, content);
+        setDiskConflicts((current) => {
+          if (!current.has(path)) return current;
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
         setOpenFiles((current) =>
           current.map((entry) =>
             entry.path === path
@@ -2644,6 +2744,43 @@ function App() {
     },
     [openFiles, updateFile],
   );
+
+  const reloadFromDisk = useCallback(
+    async (path: string) => {
+      if (!workspace) return;
+      setDiskConflicts((current) => {
+        if (!current.has(path)) return current;
+        const next = new Set(current);
+        next.delete(path);
+        return next;
+      });
+      const file = openFilesRef.current.find((entry) => entry.path === path);
+      if (!file) return;
+      try {
+        const content = await readTextFile(`${workspace}/${path}`);
+        fileContents.current.set(path, content);
+        setOpenFiles((current) =>
+          current.map((entry) =>
+            entry.path === path
+              ? { ...entry, revision: entry.revision + 1, dirty: false }
+              : entry,
+          ),
+        );
+      } catch (error) {
+        setMessage(`Could not reload ${file.name}: ${String(error)}`);
+      }
+    },
+    [workspace],
+  );
+
+  const keepBuffer = useCallback((path: string) => {
+    setDiskConflicts((current) => {
+      if (!current.has(path)) return current;
+      const next = new Set(current);
+      next.delete(path);
+      return next;
+    });
+  }, []);
 
   const closeTab = useCallback(
     async (groupId: GroupId, path: string) => {
@@ -3137,7 +3274,23 @@ function App() {
         setCommandPaletteOpen(false);
         return;
       }
+      const hadMenu = Boolean(contextMenu);
       setContextMenu(null);
+      if (hadMenu) return;
+      const inViewer =
+        !settingsOpen &&
+        !themeMakerOpen &&
+        Boolean(target.closest('.file-viewer')) &&
+        !target.matches("input, textarea, [contenteditable='true']");
+      if (inViewer && !renamingPath && !newItemKind) {
+        // Escape deselects (VS Code behavior): selection falls back to root.
+        if (selectedPath || selectedPaths.size) {
+          setSelectedPath('');
+          setSelectedPaths(new Set());
+          setSelectedDirectory('');
+          selectionAnchor.current = '';
+        }
+      }
       return;
     }
     if (event.key === 'F2' && selectedPath) {
@@ -3893,6 +4046,9 @@ function App() {
         onTerminalTitleChange={updateTerminalTitle}
         workspace={workspace}
         githubReloadToken={githubReloadToken}
+        diskConflict={diskConflicts.has(group.activePath)}
+        onConflictReload={reloadFromDisk}
+        onConflictKeep={keepBuffer}
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
         pluginPanel={
@@ -4169,6 +4325,16 @@ function App() {
                   if ((event.target as HTMLElement).closest('.tree-row'))
                     return;
                   handleTreeDrop(event, '');
+                }}
+                onClick={(event) => {
+                  // Empty space below the last row selects the workspace
+                  // root (VS Code behavior): new files land at the root.
+                  if ((event.target as HTMLElement).closest('.tree-row, input'))
+                    return;
+                  setSelectedPaths(new Set());
+                  setSelectedPath('');
+                  setSelectedDirectory('');
+                  selectionAnchor.current = '';
                 }}
               >
                 {newItemKind && (
