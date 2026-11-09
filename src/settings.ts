@@ -9,6 +9,7 @@ export type AppSettings = {
   autocomplete: boolean;
   autoIndent: boolean;
   showHiddenFiles: boolean;
+  restoreTerminals: boolean;
   sidebarWidth: number;
   terminalFontFamily: string;
   terminalFontSize: number;
@@ -87,6 +88,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autocomplete: true,
   autoIndent: true,
   showHiddenFiles: false,
+  restoreTerminals: true,
   sidebarWidth: 244,
   terminalFontFamily: "'JetBrains Mono', monospace",
   terminalFontSize: 12,

@@ -130,6 +130,14 @@ import {
   type AppSettings,
   type ThemeDefinition,
 } from './settings';
+import {
+  WORKSPACE_SNAPSHOT_VERSION,
+  deserializeLayoutNode,
+  gcWorkspaces,
+  loadWorkspaceState,
+  saveWorkspaceState,
+  serializeLayoutNode,
+} from './workspaceState';
 
 const TerminalView = lazy(() => import('./TerminalView'));
 
@@ -209,6 +217,21 @@ async function requestWorkspaceAccess(root: string): Promise<boolean> {
   if (!approved) return false;
   await invoke('workspace_grant_access', { root });
   return true;
+}
+
+function shouldPersistWorkspace(): boolean {
+  return isTauri();
+}
+
+function relativeTerminalCwd(cwd: string, root: string): string {
+  if (cwd === root) return '.';
+  return cwd.startsWith(`${root}/`) ? cwd.slice(root.length + 1) : cwd;
+}
+
+function absoluteTerminalCwd(cwd: string, root: string): string {
+  if (!cwd || cwd === '.' || cwd === './') return root;
+  if (cwd.startsWith('/')) return cwd;
+  return `${root}/${cwd}`;
 }
 
 function matchesPluginShortcut(
@@ -1401,6 +1424,29 @@ function App() {
   const splitCounter = useRef(0);
   const terminalCounter = useRef(0);
   const tree = useMemo(() => makeTree(files), [files]);
+  const latestWorkspaceState = useRef<{
+    workspace: string;
+    layout: LayoutNode;
+    groups: EditorGroup[];
+    activeGroupId: GroupId;
+    expanded: Set<string>;
+    viewerOpen: boolean;
+    viewerWidth: number;
+    selectedPath: string;
+    terminals: TerminalSession[];
+  } | null>(null);
+  latestWorkspaceState.current = {
+    workspace,
+    layout,
+    groups,
+    activeGroupId,
+    expanded,
+    viewerOpen,
+    viewerWidth: settings.sidebarWidth,
+    selectedPath,
+    terminals,
+  };
+  const restoringWorkspace = useRef(false);
   const visibleTreeNodes = useMemo(() => {
     const visible: { node: TreeNode; depth: number }[] = [];
     const visit = (nodes: TreeNode[], depth: number) =>
@@ -1740,6 +1786,183 @@ function App() {
     return newGroupId;
   };
 
+  const writeWorkspaceNow = async () => {
+    if (!shouldPersistWorkspace() || restoringWorkspace.current) return;
+    const snapshot = latestWorkspaceState.current;
+    if (!snapshot || !snapshot.workspace) return;
+    try {
+      const activeIndex = snapshot.groups.findIndex(
+        (group) => group.id === snapshot.activeGroupId,
+      );
+      await saveWorkspaceState(snapshot.workspace, {
+        version: WORKSPACE_SNAPSHOT_VERSION,
+        workspace: snapshot.workspace,
+        savedAt: new Date().toISOString(),
+        layout:
+          serializeLayoutNode(snapshot.layout, (groupId) =>
+            Math.max(
+              0,
+              snapshot.groups.findIndex((group) => group.id === groupId),
+            ),
+          ) ??
+          { type: 'group', group: Math.max(0, activeIndex) },
+        groups: snapshot.groups.map((group) => ({
+          active: group.activePath,
+          tabs: [...group.tabs],
+        })),
+        activeGroup: Math.max(0, activeIndex),
+        viewer: { open: snapshot.viewerOpen, width: snapshot.viewerWidth },
+        expandedDirs: [...snapshot.expanded],
+        selectedPath: snapshot.selectedPath,
+        terminals: snapshot.terminals.map((terminal) => ({
+          key: terminal.key,
+          title: terminal.title,
+          cwd: relativeTerminalCwd(terminal.cwd, snapshot.workspace),
+          command: terminal.command,
+        })),
+      });
+    } catch {
+      // Persistence must never break the session.
+    }
+  };
+
+  const restoreForWorkspace = async (root: string) => {
+    if (!shouldPersistWorkspace()) return;
+    const stored = await loadWorkspaceState(root).catch(() => null);
+    if (!stored) return;
+    restoringWorkspace.current = true;
+    try {
+      groupCounter.current = 0;
+    splitCounter.current = 0;
+    const terminalKeyMap = new Map<string, string>();
+    const nextTerminals: TerminalSession[] = [];
+    if (settings.restoreTerminals) {
+      for (const terminal of stored.terminals) {
+        const id = `terminal-${Date.now()}-${++terminalCounter.current}`;
+        const key = `terminal:${id}`;
+        terminalKeyMap.set(terminal.key, key);
+        nextTerminals.push({
+          id,
+          key,
+          cwd: absoluteTerminalCwd(terminal.cwd, root),
+          title: terminal.title,
+          command: terminal.command,
+        });
+      }
+    }
+    const isSpecialTab = (key: string) =>
+      key.startsWith('internal:') || key.startsWith('terminal:');
+    const candidates = new Set<string>();
+    for (const group of stored.groups)
+      for (const tab of group.tabs) if (!isSpecialTab(tab)) candidates.add(tab);
+    const loadedFiles = await Promise.all(
+      [...candidates].map(async (relative) => {
+        try {
+          const metadata = await stat(`${root}/${relative}`);
+          if (metadata.isDirectory) return null;
+          const content = await readTextFile(`${root}/${relative}`);
+          return {
+            relative,
+            content,
+            name: relative.split('/').pop() ?? relative,
+          };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const survivors = new Set(
+      loadedFiles.flatMap((entry) => (entry ? [entry.relative] : [])),
+    );
+    const remapStoredTab = (tab: string): string | null => {
+      if (tab.startsWith('internal:')) return tab;
+      if (tab.startsWith('terminal:'))
+        return terminalKeyMap.get(tab) ?? null;
+      return survivors.has(tab) ? tab : null;
+    };
+    const nextGroups = stored.groups.map((group) => {
+      const tabs: string[] = [];
+      for (const tab of group.tabs) {
+        const next = remapStoredTab(tab);
+        if (next && !tabs.includes(next)) tabs.push(next);
+      }
+      const active = remapStoredTab(group.active);
+      return {
+        id: `group-${++groupCounter.current}`,
+        activePath: active ?? tabs.at(-1) ?? '',
+        tabs,
+      };
+    });
+    if (!nextGroups.length || nextGroups.every((group) => !group.tabs.length)) {
+      // Nothing survived: fall back to the default single empty group.
+      groupCounter.current = 1;
+      setGroups([{ id: 'group-1', activePath: '', tabs: [] }]);
+      setLayout({ type: 'group', groupId: 'group-1' });
+      setActiveGroupId('group-1');
+      return;
+    }
+    const nextExpanded = new Set(
+      (
+        await Promise.all(
+          stored.expandedDirs.map(async (directory) => {
+            try {
+              const metadata = await stat(`${root}/${directory}`);
+              return metadata.isDirectory ? directory : null;
+            } catch {
+              return null;
+            }
+          }),
+        )
+      ).filter((entry): entry is string => Boolean(entry)),
+    );
+    let nextSelectedPath = '';
+    if (stored.selectedPath) {
+      try {
+        const metadata = await stat(`${root}/${stored.selectedPath}`);
+        if (!metadata.isDirectory) nextSelectedPath = stored.selectedPath;
+      } catch {
+        // drop the stale selection
+      }
+    }
+    const nextLayout =
+      deserializeLayoutNode(
+        stored.layout,
+        (index) => nextGroups[index]?.id ?? nextGroups[0].id,
+        () => `split-${++splitCounter.current}`,
+      ) ?? { type: 'group', groupId: nextGroups[0].id };
+    setOpenFiles(
+      survivors.size
+        ? loadedFiles.flatMap((entry) => {
+            if (!entry) return [];
+            return [
+              { path: entry.relative, name: entry.name, revision: 0, dirty: false },
+            ];
+          })
+        : [],
+    );
+    fileContents.current.clear();
+    for (const loaded of loadedFiles)
+      if (loaded) fileContents.current.set(loaded.relative, loaded.content);
+    setGroups(nextGroups);
+    setLayout(nextLayout);
+    setActiveGroupId(nextGroups[stored.activeGroup]?.id ?? nextGroups[0].id);
+    setTerminals(nextTerminals);
+    setExpanded(nextExpanded);
+    setSelectedPath(nextSelectedPath);
+    setViewerOpen(stored.viewer.open !== false);
+    if (Number.isFinite(stored.viewer.width))
+      updateSettings({
+        sidebarWidth: Math.min(
+          480,
+          Math.max(MIN_VIEWER_WIDTH, stored.viewer.width),
+        ),
+      });
+    setMessage('');
+    } finally {
+      restoringWorkspace.current = false;
+    }
+  };
+
   const updateTerminalTitle = useCallback((id: string, title: string) => {
     setTerminals((current) =>
       current.map((terminal) =>
@@ -1922,6 +2145,58 @@ function App() {
   useEffect(() => {
     if (workspace) void refreshWorkspace(workspace);
   }, [refreshWorkspace, workspace]);
+
+  useEffect(() => {
+    if (!workspace || !shouldPersistWorkspace()) return;
+    const handle = window.setTimeout(() => {
+      void writeWorkspaceNow();
+    }, 300);
+    return () => window.clearTimeout(handle);
+  }, [
+    layout,
+    groups,
+    openFiles,
+    activeGroupId,
+    expanded,
+    viewerOpen,
+    terminals,
+    settings.sidebarWidth,
+    workspace,
+  ]);
+
+  useEffect(() => {
+    if (!shouldPersistWorkspace()) return;
+    const flush = () => {
+      void writeWorkspaceNow();
+    };
+    window.addEventListener('blur', flush);
+    const interval = window.setInterval(flush, 60000);
+    const appWindow = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let closeHandled = false;
+    void appWindow
+      .onCloseRequested(async (event) => {
+        if (closeHandled) return;
+        event.preventDefault();
+        closeHandled = true;
+        await writeWorkspaceNow();
+        await appWindow.destroy();
+      })
+      .then((unlistenFn) => {
+        unlisten = unlistenFn;
+      })
+      .catch(() => undefined);
+    return () => {
+      window.removeEventListener('blur', flush);
+      window.clearInterval(interval);
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!shouldPersistWorkspace()) return;
+    void gcWorkspaces().catch(() => undefined);
+  }, []);
 
   const parentDirectory = (path: string) =>
     path.split('/').slice(0, -1).join('/');
@@ -2161,6 +2436,7 @@ function App() {
         }
         await refreshWorkspace(previousWorkspace);
         setWorkspace(previousWorkspace);
+        await restoreForWorkspace(previousWorkspace);
         setMessage('');
       } catch {
         localStorage.removeItem('arc.lastWorkspace');
@@ -2180,6 +2456,7 @@ function App() {
       }
       await refreshWorkspace(selected);
       localStorage.setItem('arc.lastWorkspace', selected);
+      await writeWorkspaceNow();
       terminals.forEach((terminal) => {
         forgetTerminalOutput(terminal.id);
         void invoke('terminal_close', { id: terminal.id });
@@ -2203,6 +2480,7 @@ function App() {
       setRenamingPath('');
       setRenameName('');
       setContextMenu(null);
+      await restoreForWorkspace(selected);
       setMessage('');
     } catch (error) {
       setMessage(`Could not open workspace: ${String(error)}`);

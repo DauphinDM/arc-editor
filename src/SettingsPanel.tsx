@@ -265,6 +265,7 @@ export default function SettingsPanel({
             </section>}
             {activeCategory === "files" && <section className="settings-section"><h3>File viewer</h3>
               {toggle("showHiddenFiles", "Show hidden files", "Include dotfiles and hidden folders in workspace tree.")}
+              {toggle("restoreTerminals", "Reopen terminals", "Recreate previous terminal tabs when reopening a folder (commands are re-run).")}
             </section>}
           </div>
         </section>
