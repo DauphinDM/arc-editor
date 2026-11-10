@@ -4209,18 +4209,25 @@ function mcpContentResult(value: unknown): { content: { type: string; text: stri
 }
 
 async function handleArcMcpRequest(request: { method: string; url: string; headers: Record<string, string>; body: Uint8Array }): Promise<{ status?: number; headers?: Record<string, string>; body?: string | Uint8Array }> {
+  const cors = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "authorization, content-type, mcp-session-id",
+    "access-control-expose-headers": "mcp-session-id",
+  };
+  if (request.method === "OPTIONS") return { status: 204, headers: cors, body: "" };
   const authorization = request.headers.authorization ?? request.headers.Authorization ?? "";
-  if (authorization !== `Bearer ${arcMcpToken}`) return { status: 401, headers: { "content-type": "text/plain" }, body: "Unauthorized" };
-  if (request.method !== "POST") return { status: 405, headers: { "content-type": "text/plain", allow: "POST" }, body: "Method not allowed" };
+  if (authorization !== `Bearer ${arcMcpToken}`) return { status: 401, headers: { ...cors, "content-type": "text/plain" }, body: "Unauthorized" };
+  if (request.method !== "POST") return { status: 405, headers: { ...cors, "content-type": "text/plain", allow: "POST" }, body: "Method not allowed" };
   let message: { id?: number | string; method?: string; params?: Record<string, unknown> };
   try { message = JSON.parse(new TextDecoder().decode(request.body)); }
   catch { return { status: 400, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }) }; }
-  const respond = (result: unknown) => ({ status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }) });
-  const fail = (code: number, text: string) => ({ status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code, message: text } }) });
+  const respond = (result: unknown) => ({ status: 200, headers: { ...cors, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }) });
+  const fail = (code: number, text: string) => ({ status: 200, headers: { ...cors, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code, message: text } }) });
   const entries = [...mcpExposures.values()];
   const method = message.method ?? "";
   if (!method) return fail(-32600, "Invalid request");
-  if (method.startsWith("notifications/")) return { status: 202, headers: {}, body: "" };
+  if (method.startsWith("notifications/")) return { status: 202, headers: cors, body: "" };
   try {
     if (method === "initialize") return respond({
       protocolVersion: "2025-06-18",

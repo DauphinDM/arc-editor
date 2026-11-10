@@ -1,0 +1,7 @@
+{
+  "id": "api-tester",
+  "name": "API Tester",
+  "version": "1.0.0",
+  "description": "Exercises every Arc plugin API feature and logs what worked and what failed.",
+  "main": "main.js"
+}
