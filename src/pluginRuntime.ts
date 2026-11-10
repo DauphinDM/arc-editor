@@ -1,13 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { readText as readClipboardText, writeHtml as writeClipboardHtml, writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
-import { copyFile, exists, mkdir, readDir, readTextFile, remove, writeTextFile } from "@tauri-apps/plugin-fs";
-import type { EditorView } from "@codemirror/view";
+import { copyFile, exists, mkdir, readDir, readFile, readTextFile, remove, rename as renameFile, stat as statFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import type { Extension } from "@codemirror/state";
+import { Decoration, EditorView as CodeMirrorView, type EditorView, type DecorationSet } from "@codemirror/view";
+import { autocompletion, type Completion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
+import { foldService } from "@codemirror/language";
+import { hoverTooltip } from "@codemirror/view";
+import * as codeMirrorLanguage from "@codemirror/language";
+import * as codeMirrorView from "@codemirror/view";
+import * as codeMirrorState from "@codemirror/state";
+import * as codeMirrorAutocomplete from "@codemirror/autocomplete";
+import * as codeMirrorHighlight from "@lezer/highlight";
 import type { AppSettings, ThemeDefinition } from "./settings";
 
 const builtinManifestSources = import.meta.glob<string>("../plugins/*/plugin.json", { eager: true, query: "?raw", import: "default" });
@@ -83,6 +93,38 @@ export type PluginPanelDefinition = {
 
 export type PluginPanelContribution = PluginPanelDefinition & { pluginId: string; pluginName: string };
 
+export type PluginKeybinding = {
+  commandId: string;
+  shortcut: string;
+  condition?: string;
+  pluginId: string;
+  pluginName: string;
+};
+
+export type PluginLanguageProviderKind =
+  | "completion"
+  | "hover"
+  | "definition"
+  | "reference"
+  | "rename"
+  | "formatting"
+  | "codeAction"
+  | "codeLens"
+  | "inlayHints"
+  | "signatureHelp"
+  | "documentSymbol"
+  | "workspaceSymbol"
+  | "semanticTokens"
+  | "folding"
+  | "selectionRange";
+
+export type PluginLanguageProviderEntry = {
+  kind: PluginLanguageProviderKind;
+  selector: PluginLanguageSelector;
+  provider: unknown;
+  pluginId: string;
+};
+
 export type PluginEventName = "workspace:changed" | "editor:active" | "editor:changed" | "file:saved" | "settings:changed" | "terminal:opened" | "terminal:closed";
 
 export type PluginEditorSnapshot = {
@@ -102,6 +144,112 @@ export type PluginAppSnapshot = {
   theme: ThemeDefinition;
 };
 
+export type PluginDisposable = { dispose: () => void };
+export type PluginRange = { from: number; to: number };
+export type PluginPosition = { line: number; column: number; offset: number };
+export type PluginEditorContext = {
+  path: string;
+  uri: string;
+  name: string;
+  language: string;
+  version: number;
+  cursor: PluginPosition;
+  selection: PluginRange;
+  selections: PluginRange[];
+  dirty: boolean;
+  focused: boolean;
+  visibleRanges: PluginRange[];
+};
+export type PluginEdit = { range: PluginRange; text: string };
+export type PluginWorkspaceEdit = {
+  changes?: Record<string, PluginEdit[]>;
+  documentChanges?: { uri: string; edits: PluginEdit[]; version?: number }[];
+};
+export type PluginLanguageSelector = string | { language?: string; scheme?: string; pattern?: string } | (string | { language?: string; scheme?: string; pattern?: string })[];
+export type PluginLanguageDefinition = {
+  id: string;
+  name: string;
+  extensions?: string[];
+  filenames?: string[];
+  aliases?: string[];
+  configuration?: Record<string, unknown>;
+  load: () => Extension | Promise<Extension>;
+};
+export type PluginLanguageContribution = PluginLanguageDefinition & { pluginId: string; pluginName: string };
+export type PluginCompletionProvider = {
+  provideCompletionItems: (context: { path: string; language: string; text: string; offset: number; line: string; from: number; to: number }) => Completion[] | Promise<Completion[]>;
+  resolveCompletionItem?: (item: Completion) => Completion | Promise<Completion>;
+};
+export type PluginHoverProvider = {
+  provideHover: (context: { path: string; language: string; text: string; offset: number; line: string }) => unknown;
+};
+export type PluginLocationProvider = {
+  provideLocations: (context: { path: string; language: string; text: string; offset: number; word: string }) => unknown;
+};
+export type PluginRangeProvider = {
+  provideRanges: (context: { path: string; language: string; text: string; offset: number }) => unknown;
+};
+export type PluginFormattingProvider = {
+  provideFormatting: (document: { path: string; language: string; text: string; range?: PluginRange }) => string | Promise<string>;
+};
+export type PluginFoldingProvider = {
+  provideFoldingRange: (context: { path: string; language: string; text: string; line: number }) => PluginRange | null;
+};
+export type PluginGrammar = { load: () => Extension | Promise<Extension> };
+export type PluginDiagnosticsCollection = {
+  set: (uri: string, items: unknown[]) => void;
+  delete: (uri: string) => void;
+  clear: () => void;
+  dispose: () => void;
+};
+export type PluginOutputChannel = {
+  append: (text: string) => void;
+  appendLine: (text: string) => void;
+  show: () => void;
+  clear: () => void;
+  dispose: () => void;
+  readonly id: string;
+};
+export type PluginProcessHandle = {
+  id: string;
+  write: (data: string | Uint8Array) => Promise<void>;
+  closeStdin: () => Promise<void>;
+  onStdout: (handler: (chunk: string) => void) => () => void;
+  onStderr: (handler: (chunk: string) => void) => () => void;
+  onExit: (handler: (event: { code: number | null; signal: string | null }) => void) => () => void;
+  onError: (handler: (error: string) => void) => () => void;
+  stop: (options?: { timeoutMs?: number }) => Promise<void>;
+};
+export type PluginSocketHandle = {
+  write: (bytes: Uint8Array) => Promise<void>;
+  onData: (handler: (bytes: Uint8Array) => void) => () => void;
+  onError: (handler: (error: string) => void) => () => void;
+  onClose: (handler: () => void) => () => void;
+  close: () => Promise<void>;
+};
+export type PluginWebSocketHandle = {
+  send: (data: string | Uint8Array) => void;
+  close: (code?: number, reason?: string) => void;
+  onMessage: (handler: (data: string | Uint8Array) => void) => () => void;
+  onError: (handler: (error: string) => void) => () => void;
+  onClose: (handler: (event: { code: number; reason: string }) => void) => () => void;
+};
+export type PluginMcpServerDefinition = {
+  type?: "stdio" | "http";
+  command?: string;
+  executable?: string;
+  args?: string[];
+  url?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+};
+export type PluginMcpServerHandle = PluginDisposable & {
+  id: string;
+  serverInfo: unknown;
+  capabilities: Record<string, unknown>;
+  call: (method: string, params?: unknown) => Promise<unknown>;
+};
+
 export type PluginApi = {
   plugin: { id: string; name: string; version: string };
   workspace: string;
@@ -110,6 +258,26 @@ export type PluginApi = {
   openUrl: (url: string) => Promise<void>;
   openTerminal: (command?: string) => void;
   notify: (message: string) => void;
+  supports: (capability: string) => boolean;
+  disposables: { add: <T>(resource: T) => () => void };
+  lifecycle: {
+    onDeactivate: (handler: () => void | Promise<void>) => () => void;
+    onShutdown: (handler: () => void | Promise<void>) => () => void;
+  };
+  timers: {
+    setTimeout: (handler: () => void, delay: number) => number;
+    setInterval: (handler: () => void, interval: number) => number;
+    clearTimeout: (id: number) => void;
+    clearInterval: (id: number) => void;
+  };
+  workers: { create: (scriptPath: string) => Worker };
+  codemirror: {
+    language: typeof codeMirrorLanguage;
+    view: typeof codeMirrorView;
+    state: typeof codeMirrorState;
+    autocomplete: typeof codeMirrorAutocomplete;
+    highlight: typeof codeMirrorHighlight;
+  };
   app: {
     getState: () => PluginAppSnapshot;
     openWorkspace: () => Promise<void>;
@@ -121,28 +289,100 @@ export type PluginApi = {
   };
   files: {
     list: (path?: string) => Promise<{ path: string; name: string; kind: "file" | "directory" }[]>;
+    listRecursive: (path?: string, options?: { exclude?: string[]; maxDepth?: number; maxResults?: number }) => Promise<{ path: string; name: string; kind: "file" | "directory" }[]>;
+    watch: (pattern: string, handler: (event: { kind: string; path: string }) => void, options?: { ignore?: string[] }) => () => void;
+    find: (pattern: string, options?: { exclude?: string[]; maxResults?: number }) => Promise<string[]>;
+    searchText: (query: string | RegExp, options?: { exclude?: string[]; maxResults?: number; include?: string }) => Promise<{ path: string; line: number; column: number; preview: string }[]>;
     read: (path: string) => Promise<string>;
+    readBytes: (path: string) => Promise<Uint8Array>;
     write: (path: string, content: string) => Promise<void>;
+    writeBytes: (path: string, bytes: Uint8Array) => Promise<void>;
+    writeAtomic: (path: string, content: string) => Promise<void>;
+    openReadStream: (path: string) => Promise<{ read: (size?: number) => Promise<Uint8Array | null>; close: () => Promise<void> }>;
+    openWriteStream: (path: string) => Promise<{ write: (bytes: Uint8Array) => Promise<void>; close: () => Promise<void> }>;
+    stat: (path: string) => Promise<{ isFile: boolean; isDirectory: boolean; isSymlink: boolean; size: number; mtime: number | null; atime: number | null; birthtime: number | null }>;
+    exists: (path: string) => Promise<boolean>;
     create: (path: string, content?: string) => Promise<void>;
     createDirectory: (path: string) => Promise<void>;
     delete: (path: string) => Promise<void>;
     rename: (path: string, nextPath: string) => Promise<void>;
     copy: (path: string, destination: string) => Promise<void>;
+    move: (source: string, destination: string, options?: { overwrite?: boolean }) => Promise<void>;
+    trash: (path: string) => Promise<void>;
     open: (path: string) => Promise<void>;
     refresh: () => Promise<void>;
+    registerProvider: (scheme: string, provider: { read: (path: string) => Promise<Uint8Array>; write?: (path: string, bytes: Uint8Array) => Promise<void>; list?: (path: string) => Promise<{ name: string; kind: "file" | "directory" }[]> }) => () => void;
+  };
+  paths: {
+    join: (...parts: string[]) => string;
+    resolve: (...parts: string[]) => string;
+    relative: (from: string, to: string) => string;
+    toUri: (path: string) => string;
+    fromUri: (uri: string) => string;
+    basename: (path: string) => string;
+    dirname: (path: string) => string;
+    extname: (path: string) => string;
+    normalize: (path: string) => string;
   };
   editor: {
     getActive: () => PluginEditorSnapshot | null;
+    getContext: () => PluginEditorContext | null;
+    getLastActive: () => PluginEditorContext | null;
+    getLanguage: (path?: string) => string | null;
+    getCursor: (path?: string) => PluginPosition | null;
+    getSelections: (path?: string) => PluginRange[];
+    getVisibleRanges: (path?: string) => PluginRange[];
     getText: (path?: string) => string | null;
     setText: (text: string, path?: string) => void;
     insertText: (text: string, path?: string) => void;
     getSelection: (path?: string) => { from: number; to: number } | null;
     setSelection: (from: number, to?: number, path?: string) => void;
+    replaceRange: (range: PluginRange, text: string, path?: string) => void;
+    applyEdits: (edits: PluginEdit[], path?: string, expectedVersion?: number) => void;
+    applyWorkspaceEdit: (edit: PluginWorkspaceEdit) => Promise<void>;
+    insertSnippet: (snippet: string, range?: PluginRange, path?: string) => void;
+    revealRange: (range: PluginRange, path?: string) => void;
+    openAt: (path: string, line: number, column?: number) => Promise<void>;
+    setLanguage: (languageId: string, path?: string) => void;
+    registerDecorationType: (options: { className?: string; style?: string; gutter?: boolean }) => string;
+    setDecorations: (type: string, ranges: PluginRange[], path?: string) => void;
+    openDiff: (leftUri: string, rightUri: string, title?: string) => Promise<void>;
+    registerContentProvider: (scheme: string, provider: { read: (uri: string) => string | Promise<string>; write?: (uri: string, content: string) => void | Promise<void> }) => () => void;
+    registerCustomEditor: (filePattern: string, provider: { mount: (container: HTMLElement, context: { path: string; read: () => Promise<string> }) => void | (() => void) }) => () => void;
+    onWillSave: (handler: (event: { path: string; content: string }) => string | void | Promise<string | void>) => () => void;
+    onActiveChanged: (handler: (context: PluginEditorContext | null) => void) => () => void;
+    onContextChanged: (handler: (context: PluginEditorContext | null) => void) => () => void;
+    onSelectionChanged: (handler: (context: PluginEditorContext | null) => void) => () => void;
+    onDocumentOpened: (handler: (event: { path: string; name: string }) => void) => () => void;
+    onDocumentClosed: (handler: (event: { path: string }) => void) => () => void;
+    onDocumentChanged: (handler: (event: { path: string; content: string; version: number }) => void) => () => void;
+    onDocumentSaved: (handler: (event: { path: string; content: string }) => void) => () => void;
     focus: (path?: string) => void;
     open: (path: string) => Promise<void>;
     save: (path?: string) => Promise<boolean>;
     format: (path?: string) => Promise<void>;
   };
+  languages: {
+    register: (definition: PluginLanguageDefinition) => () => void;
+    registerCompletionProvider: (selector: PluginLanguageSelector, provider: PluginCompletionProvider) => () => void;
+    registerHoverProvider: (selector: PluginLanguageSelector, provider: PluginHoverProvider) => () => void;
+    registerDefinitionProvider: (selector: PluginLanguageSelector, provider: PluginLocationProvider) => () => void;
+    registerReferenceProvider: (selector: PluginLanguageSelector, provider: PluginLocationProvider) => () => void;
+    registerRenameProvider: (selector: PluginLanguageSelector, provider: PluginLocationProvider) => () => void;
+    registerFormattingProvider: (selector: PluginLanguageSelector, provider: PluginFormattingProvider) => () => void;
+    registerCodeActionProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerCodeLensProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerInlayHintsProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerSignatureHelpProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerDocumentSymbolProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerWorkspaceSymbolProvider: (provider: PluginLocationProvider) => () => void;
+    registerSemanticTokensProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerFoldingProvider: (selector: PluginLanguageSelector, provider: PluginFoldingProvider) => () => void;
+    registerSelectionRangeProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
+    registerGrammar: (languageId: string, grammar: PluginGrammar) => () => void;
+    startServer: (options: { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; language?: string; initializationOptions?: unknown }) => Promise<PluginProcessHandle>;
+  };
+  diagnostics: { createCollection: (name: string) => PluginDiagnosticsCollection };
   terminal: {
     open: (command?: string) => string | null;
     list: () => { id: string; title: string; cwd: string }[];
@@ -151,7 +391,12 @@ export type PluginApi = {
     close: (id: string) => Promise<void>;
   };
   settings: { get: () => AppSettings; update: (patch: Partial<AppSettings>) => void };
-  themes: { list: () => { id: string; name: string }[]; set: (id: string) => boolean };
+  themes: {
+    list: () => { id: string; name: string }[];
+    set: (id: string) => boolean;
+    getColors: () => Record<string, string>;
+    onChanged: (handler: (theme: ThemeDefinition) => void) => () => void;
+  };
   dialogs: {
     openFile: (options?: { multiple?: boolean; filters?: { name: string; extensions: string[] }[] }) => Promise<string | string[] | null>;
     openFolder: () => Promise<string | null>;
@@ -166,19 +411,48 @@ export type PluginApi = {
     setFullscreen: (fullscreen: boolean) => Promise<void>;
     setAlwaysOnTop: (alwaysOnTop: boolean) => Promise<void>;
     center: () => Promise<void>;
+    isFocused: () => Promise<boolean>;
+    onFocusChanged: (handler: (focused: boolean) => void) => () => void;
+    getVisibility: () => { visible: boolean; minimized: boolean; hidden: boolean };
+    onVisibilityChanged: (handler: (visibility: { visible: boolean; minimized: boolean; hidden: boolean }) => void) => () => void;
+    getIdleTime: () => number;
   };
   ui: {
     notify: (message: string) => void;
     confirm: (message: string) => boolean;
     prompt: (message: string, defaultValue?: string) => string | null;
     registerAction: (action: PluginActionDefinition) => void;
+    updateAction: (id: string, changes: Partial<Omit<PluginActionDefinition, "id">>) => void;
     registerContextMenuItem: (item: PluginContextMenuDefinition) => void;
+    registerMenuItem: (menu: string, item: PluginContextMenuDefinition & { when?: string; group?: string }) => () => void;
     registerStatusItem: (item: PluginStatusItemDefinition) => void;
+    updateStatusItem: (id: string, changes: Partial<Omit<PluginStatusItemDefinition, "id">>) => void;
     registerCommand: (command: PluginCommandDefinition) => void;
     registerPanel: (panel: PluginPanelDefinition) => void;
+    registerSidebarView: (options: PluginPanelDefinition & { icon?: string; order?: number }) => () => void;
+    registerBottomView: (options: PluginPanelDefinition & { icon?: string; order?: number }) => () => void;
+    registerTreeView: (options: { id: string; title: string; getChildren: (element?: unknown) => unknown[] | Promise<unknown[]>; onSelect?: (element: unknown) => void; icon?: string }) => () => void;
+    registerCustomTab: (options: PluginPanelDefinition & { icon?: string }) => () => void;
+    setViewBadge: (viewId: string, badge?: string | number | null) => void;
+    showQuickPick: (items: { label: string; description?: string; detail?: string; value?: unknown }[], options?: { placeHolder?: string; canPickMany?: boolean }) => Promise<unknown | unknown[] | null>;
+    showInputBox: (options?: { prompt?: string; value?: string; password?: boolean; placeHolder?: string; validate?: (value: string) => string | null | undefined }) => Promise<string | null>;
+    showProgress: <T>(options: { title: string; cancellable?: boolean }, task: (report: (message: string, increment?: number) => void) => T | Promise<T>) => Promise<T>;
+    showNotification: (message: string, options?: { severity?: "info" | "warning" | "error"; actions?: { label: string; run: () => void }[]; progress?: boolean }) => string;
+    createOutputChannel: (name: string) => PluginOutputChannel;
+    setContext: (key: string, value: unknown) => void;
+    focusView: (id: string) => void;
+    closeView: (id: string) => void;
     addStyles: (css: string) => () => void;
   };
-  commands: { list: () => { id: string; title: string; description?: string; pluginName: string }[]; execute: (id: string) => Promise<void> };
+  commands: {
+    list: () => { id: string; title: string; description?: string; pluginName: string }[];
+    execute: (id: string) => Promise<void>;
+    onExecuted: (handler: (event: { id: string; pluginId: string; success: boolean }) => void) => () => void;
+  };
+  keybindings: {
+    register: (commandId: string, shortcut: string, condition?: string) => () => void;
+    unregister: (commandId: string, shortcut: string) => void;
+  };
   events: {
     on: (event: string, listener: (payload: unknown) => void) => () => void;
     emit: (event: string, payload?: unknown) => void;
@@ -188,12 +462,147 @@ export type PluginApi = {
     set: (key: string, value: unknown) => void;
     remove: (key: string) => void;
     clear: () => void;
+    workspace: {
+      get: <T = unknown>(key: string, fallback?: T) => T;
+      set: (key: string, value: unknown) => void;
+      remove: (key: string) => void;
+      clear: () => void;
+    };
+  };
+  configuration: {
+    register: (schema: { id: string; title?: string; properties: Record<string, { type: string; default?: unknown; description?: string; scope?: "global" | "workspace" }> }) => () => void;
+    get: <T = unknown>(key: string, fallback?: T) => T;
+    update: (key: string, value: unknown, scope?: "global" | "workspace") => void;
+    onChanged: (handler: (event: { key: string; value: unknown }) => void) => () => void;
+  };
+  secrets: {
+    get: (key: string) => Promise<string | null>;
+    set: (key: string, value: string) => Promise<void>;
+    delete: (key: string) => Promise<void>;
+  };
+  workspaceFolders: {
+    get: () => Promise<{ path: string; name: string; index: number }[]>;
+    onChanged: (handler: (folders: { path: string; name: string; index: number }[]) => void) => () => void;
+  };
+  workspaceTrust: {
+    isTrusted: () => boolean;
+    onChanged: (handler: (trusted: boolean) => void) => () => void;
+  };
+  icons: {
+    register: (name: string, svg: string) => () => void;
+    unregister: (name: string) => void;
+    get: (name: string) => string | null;
+  };
+  assets: {
+    url: (relativePath: string) => Promise<string>;
+    readText: (relativePath: string) => Promise<string>;
+    readBytes: (relativePath: string) => Promise<Uint8Array>;
+    resolvePath: (relativePath: string) => Promise<string>;
+  };
+  plugins: {
+    list: () => { id: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean }[];
+    get: (id: string) => { id: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean } | null;
+    whenAvailable: (id: string) => Promise<void>;
+    onChanged: (handler: () => void) => () => void;
+  };
+  services: {
+    register: (name: string, implementation: unknown) => () => void;
+    get: (name: string) => unknown;
+    whenAvailable: (name: string) => Promise<unknown>;
+  };
+  process: {
+    isRunning: (names: string[]) => Promise<boolean>;
+    spawn: (executable: string, args?: string[], options?: { cwd?: string; env?: Record<string, string> }) => Promise<PluginProcessHandle>;
+    which: (executable: string) => Promise<string | null>;
+    exec: (executable: string, args?: string[], options?: { cwd?: string; env?: Record<string, string>; timeoutMs?: number }) => Promise<{ stdout: string; stderr: string; code: number | null; signal: string | null }>;
+  };
+  pty: {
+    spawn: (executable: string, args?: string[], options?: { cwd?: string; env?: Record<string, string> }) => Promise<PluginProcessHandle>;
+  };
+  ipc: {
+    connectUnix: (path: string, options?: { timeoutMs?: number }) => Promise<PluginSocketHandle>;
+    connectPipe: (name: string, options?: { timeoutMs?: number }) => Promise<PluginSocketHandle>;
+  };
+  net: {
+    fetch: (url: string, options?: RequestInit & { timeoutMs?: number }) => Promise<Response>;
+    connectTcp: (host: string, port: number, options?: { timeoutMs?: number }) => Promise<PluginSocketHandle>;
+    listenHttp: (handler: (request: { method: string; url: string; headers: Record<string, string>; body: Uint8Array }) => Promise<{ status?: number; headers?: Record<string, string>; body?: string | Uint8Array }>, options?: { port?: number; host?: string }) => Promise<{ url: string; close: () => Promise<void> }>;
+    connectWebSocket: (url: string, options?: { protocols?: string | string[] }) => Promise<PluginWebSocketHandle>;
+    connectEventSource: (url: string, options?: { reconnect?: boolean }) => { onMessage: (handler: (event: { data: string; event: string; id: string }) => void) => () => void; onError: (handler: (error: string) => void) => () => void; close: () => void };
+    download: (url: string, destination: string, options?: { onProgress?: (received: number, total: number | null) => void; signal?: AbortSignal }) => Promise<{ path: string; bytes: number }>;
+    isOnline: () => boolean;
+    onOnlineChanged: (handler: (online: boolean) => void) => () => void;
+  };
+  git: {
+    getRepositories: () => Promise<string[]>;
+    getStatus: (repository?: string) => Promise<unknown>;
+    getBranch: (repository?: string) => Promise<unknown>;
+    getDiff: (repository?: string, path?: string, options?: { staged?: boolean }) => Promise<string>;
+    onChanged: (repository: string, handler: () => void) => () => void;
+  };
+  tasks: {
+    registerProvider: (type: string, provider: { provideTasks: () => unknown[] | Promise<unknown[]>; resolveTask?: (task: unknown) => unknown }) => () => void;
+    run: (task: unknown) => Promise<{ id: string; stop: () => Promise<void>; onExit: (handler: (event: { code: number | null }) => void) => () => void }>;
+    onStarted: (handler: (event: { id: string; task: unknown }) => void) => () => void;
+    onFinished: (handler: (event: { id: string; code: number | null }) => void) => () => void;
+  };
+  tests: { createController: (id: string, label: string) => { id: string; label: string; setItems: (items: unknown[]) => void; reportResult: (item: unknown) => void; dispose: () => void } };
+  debug: {
+    registerAdapter: (type: string, factory: unknown) => () => void;
+    start: (configuration: unknown) => Promise<{ id: string; stop: () => Promise<void> }>;
+    stop: (sessionId: string) => Promise<void>;
+    getActiveSession: () => unknown;
+    onSessionChanged: (handler: (session: unknown) => void) => () => void;
+  };
+  auth: {
+    registerProvider: (id: string, provider: { getSessions?: (scopes: string[]) => unknown; createSession?: (scopes: string[]) => unknown; removeSession?: (sessionId: string) => unknown }) => () => void;
+    getSession: (providerId: string, scopes: string[], options?: { createIfNone?: boolean }) => Promise<unknown>;
+  };
+  links: {
+    registerUriHandler: (handler: (uri: string) => void) => () => void;
+    createCallbackUrl: (path: string) => string;
+  };
+  mcp: {
+    registerServer: (id: string, definition: PluginMcpServerDefinition) => () => void;
+    unregisterServer: (id: string) => void;
+    listServers: () => unknown[];
+    getServer: (id: string) => unknown;
+    connect: (id: string, options?: { timeoutMs?: number }) => Promise<PluginMcpServerHandle>;
+    disconnect: (id: string) => Promise<void>;
+    restart: (id: string) => Promise<PluginMcpServerHandle>;
+    getCapabilities: (id: string) => Record<string, unknown> | null;
+    onServerChanged: (handler: (event: { id: string; state: string; error?: string }) => void) => () => void;
+    onLog: (handler: (event: { serverId: string; level: string; message: string }) => void) => () => void;
+    setLogLevel: (serverId: string, level: string) => Promise<void>;
+    ping: (serverId: string, options?: { timeoutMs?: number }) => Promise<boolean>;
+    listTools: (serverId: string, options?: { cursor?: string }) => Promise<unknown>;
+    callTool: (serverId: string, name: string, args?: Record<string, unknown>, options?: { timeoutMs?: number }) => Promise<unknown>;
+    onToolsChanged: (serverId: string, handler: () => void) => () => void;
+    listResources: (serverId: string, options?: { cursor?: string }) => Promise<unknown>;
+    listResourceTemplates: (serverId: string, options?: { cursor?: string }) => Promise<unknown>;
+    readResource: (serverId: string, uri: string) => Promise<unknown>;
+    subscribeResource: (serverId: string, uri: string, handler: () => void) => () => void;
+    onResourcesChanged: (serverId: string, handler: () => void) => () => void;
+    listPrompts: (serverId: string, options?: { cursor?: string }) => Promise<unknown>;
+    getPrompt: (serverId: string, name: string, args?: Record<string, string>) => Promise<unknown>;
+    onPromptsChanged: (serverId: string, handler: () => void) => () => void;
+    complete: (serverId: string, reference: unknown, argument: unknown) => Promise<unknown>;
+    setRoots: (serverId: string, roots: { uri: string; name?: string }[]) => Promise<void>;
+    onSamplingRequest: (handler: (request: unknown) => unknown) => () => void;
+    onElicitationRequest: (handler: (request: unknown) => unknown) => () => void;
+    onAuthorizationRequired: (handler: (request: unknown) => unknown) => () => void;
+    exposeTool: (definition: unknown, handler: unknown) => () => void;
+    exposeResource: (definition: unknown, handler: unknown) => () => void;
+    exposeResourceTemplate: (definition: unknown, handler: unknown) => () => void;
+    exposePrompt: (definition: unknown, handler: unknown) => () => void;
+    notifyResourceChanged: (uri: string) => void;
+    getExposure: () => unknown;
+    onExposureChanged: (handler: () => void) => () => void;
   };
   localServer: {
     start: (root: string, entry?: string) => Promise<{ root: string; url: string }>;
     stop: () => Promise<boolean>;
   };
-  process: { isRunning: (names: string[]) => Promise<boolean> };
   registerAction: (action: PluginActionDefinition) => void;
   registerContextMenuItem: (item: PluginContextMenuDefinition) => void;
 };
@@ -217,7 +626,16 @@ type PluginHostActions = {
   formatFile: (path: string) => Promise<void>;
   getEditor: (path?: string) => EditorView | null;
   getEditorSnapshot: (path?: string) => PluginEditorSnapshot | null;
+  getEditorContext: (path?: string) => PluginEditorContext | null;
+  getLastActiveContext: () => PluginEditorContext | null;
+  setEditorLanguage: (path: string, languageId: string) => void;
   setEditorText: (path: string, text: string) => void;
+  closePluginPanel: (id: string) => void;
+  getWorkspaceFolders: () => { path: string; name: string; index: number }[];
+  isWorkspaceTrusted: () => boolean;
+  getGitStatus: () => Promise<unknown>;
+  getGitBranch: () => Promise<unknown>;
+  getGitDiff: (path?: string, staged?: boolean) => Promise<string>;
   getTerminals: () => { id: string; title: string; cwd: string }[];
   openTerminal: (command?: string) => string | null;
   writeTerminal: (id: string, data: string) => Promise<void>;
@@ -225,7 +643,18 @@ type PluginHostActions = {
   closeTerminal: (id: string) => Promise<void>;
 };
 
-type ActivePlugin = { source: string; url: string; active: boolean; cleanup?: () => void; disposables: (() => void)[] };
+type ActivePlugin = {
+  source: string;
+  url: string;
+  active: boolean;
+  cleanup?: () => void;
+  disposables: (() => void)[];
+  deactivateHandlers: (() => void | Promise<void>)[];
+  shutdownHandlers: (() => void | Promise<void>)[];
+  timers: Set<number>;
+  workers: Set<Worker>;
+  contexts: Map<string, unknown>;
+};
 
 type PluginModule = {
   activate: (api: PluginApi) => void | (() => void) | Promise<void | (() => void)>;
@@ -280,18 +709,32 @@ export function usePluginRuntime(
   const [commands, setCommands] = useState<PluginCommand[]>([]);
   const [statusItems, setStatusItems] = useState<PluginStatusItem[]>([]);
   const [panels, setPanels] = useState<PluginPanelContribution[]>([]);
+  const [languages, setLanguages] = useState<PluginLanguageContribution[]>([]);
+  const [keybindings, setKeybindings] = useState<PluginKeybinding[]>([]);
+  const [iconRegistry, setIconRegistry] = useState<Record<string, string>>({});
   const [pluginDirectory, setPluginDirectory] = useState("");
   const hostActionsRef = useRef(hostActions);
   hostActionsRef.current = hostActions;
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
+  activeWorkspace = workspace;
+  const pluginsRef = useRef<InstalledPlugin[]>([]);
+  pluginsRef.current = plugins;
+  const languagesRef = useRef<PluginLanguageContribution[]>([]);
+  languagesRef.current = languages;
+  const grammars = useRef(new Map<string, Extension | Promise<Extension>>());
   const activeModules = useRef(new Map<string, ActivePlugin>());
   const listeners = useRef(new Map<string, Set<(payload: unknown) => void>>());
   const commandRef = useRef(new Map<string, PluginCommand>());
   commandRef.current = new Map(commands.map((command) => [command.id, command]));
+  const pluginsChangedListeners = useRef(new Set<() => void>());
+  const configurationListeners = useRef(new Set<(event: { key: string; value: unknown }) => void>());
 
   const emitEvent = useCallback((event: string, payload?: unknown) => {
     listeners.current.get(event)?.forEach((listener) => {
+      try { listener(payload); } catch (error) { notify(`Plugin event listener failed: ${String(error)}`); }
+    });
+    pluginEventListeners.get(event)?.forEach((listener) => {
       try { listener(payload); } catch (error) { notify(`Plugin event listener failed: ${String(error)}`); }
     });
     window.dispatchEvent(new CustomEvent(`arc:${event}`, { detail: payload }));
@@ -347,6 +790,13 @@ export function usePluginRuntime(
       const plugin = desired.get(id);
       if (plugin && plugin.source === active.source) continue;
       active.active = false;
+      active.timers.forEach((timer) => { window.clearTimeout(timer); window.clearInterval(timer); });
+      active.timers.clear();
+      active.workers.forEach((worker) => worker.terminate());
+      active.workers.clear();
+      for (const handler of active.deactivateHandlers) {
+        try { void handler(); } catch { /* Plugin cleanup must not interrupt other plugins. */ }
+      }
       active.disposables.forEach((dispose) => { try { dispose(); } catch { /* Plugin cleanup must not interrupt other plugins. */ } });
       try { active.cleanup?.(); } catch { /* Plugin cleanup must not interrupt other plugins. */ }
       URL.revokeObjectURL(active.url);
@@ -356,12 +806,25 @@ export function usePluginRuntime(
       setCommands((current) => current.filter((command) => command.pluginId !== id));
       setStatusItems((current) => current.filter((item) => item.pluginId !== id));
       setPanels((current) => current.filter((panel) => panel.pluginId !== id));
+      setLanguages((current) => current.filter((language) => language.pluginId !== id));
+      setKeybindings((current) => current.filter((binding) => binding.pluginId !== id));
+      pluginLanguageProviders.splice(0, pluginLanguageProviders.length, ...pluginLanguageProviders.filter((provider) => provider.pluginId !== id));
     }
 
     for (const plugin of desired.values()) {
       if (activeModules.current.has(plugin.id)) continue;
       const url = URL.createObjectURL(new Blob([plugin.source], { type: "text/javascript" }));
-      const active: ActivePlugin = { source: plugin.source, url, active: true, disposables: [] };
+      const active: ActivePlugin = {
+        source: plugin.source,
+        url,
+        active: true,
+        disposables: [],
+        deactivateHandlers: [],
+        shutdownHandlers: [],
+        timers: new Set(),
+        workers: new Set(),
+        contexts: new Map(),
+      };
       activeModules.current.set(plugin.id, active);
       void (async () => {
         try {
@@ -407,13 +870,145 @@ export function usePluginRuntime(
             const panel = { ...definition, id: `${plugin.id}:${definition.id}`, pluginId: plugin.id, pluginName: plugin.name };
             setPanels((current) => [...current.filter((entry) => entry.id !== panel.id), panel]);
           };
+          const registerView = (method: "sidebar" | "bottom" | "customTab") => (definition: PluginPanelDefinition & { icon?: string; order?: number }) => {
+            const panel = { ...definition, id: `${plugin.id}:${definition.id}`, pluginId: plugin.id, pluginName: plugin.name };
+            registerPanel(panel);
+            active.contexts.set(`view:${method}:${panel.id}`, definition);
+            const dispose = () => setPanels((current) => current.filter((entry) => entry.id !== panel.id));
+            active.disposables.push(dispose);
+            return dispose;
+          };
+          const registerLanguage = (definition: PluginLanguageDefinition) => {
+            if (!active.active || activeModules.current.get(plugin.id) !== active) return () => undefined;
+            validateId(definition.id);
+            if (!definition.name.trim() || typeof definition.load !== "function") throw new Error(`Plugin ${plugin.name} registered an invalid language.`);
+            const contribution: PluginLanguageContribution = {
+              ...definition,
+              id: `${plugin.id}:${definition.id}`,
+              pluginId: plugin.id,
+              pluginName: plugin.name,
+            };
+            setLanguages((current) => [...current.filter((entry) => entry.id !== contribution.id), contribution]);
+            const dispose = () => setLanguages((current) => current.filter((entry) => entry.id !== contribution.id));
+            active.disposables.push(dispose);
+            return dispose;
+          };
+          const registerProvider = (kind: PluginLanguageProviderKind) => (selector: PluginLanguageSelector, provider: unknown) => {
+            if (!active.active || activeModules.current.get(plugin.id) !== active) return () => undefined;
+            const entry: PluginLanguageProviderEntry = { kind, selector, provider, pluginId: plugin.id };
+            pluginLanguageProviders.push(entry);
+            const dispose = () => {
+              const index = pluginLanguageProviders.indexOf(entry);
+              if (index >= 0) pluginLanguageProviders.splice(index, 1);
+            };
+            active.disposables.push(dispose);
+            return dispose;
+          };
+          const registerGrammar = (languageId: string, grammar: PluginGrammar) => {
+            if (!active.active || activeModules.current.get(plugin.id) !== active) return () => undefined;
+            if (!languageId.trim() || typeof grammar.load !== "function") throw new Error(`Plugin ${plugin.name} registered an invalid grammar.`);
+            grammars.current.set(languageId, grammar.load());
+            const dispose = () => grammars.current.delete(languageId);
+            active.disposables.push(dispose);
+            return dispose;
+          };
+          const createCollection = (name: string): PluginDiagnosticsCollection => {
+            const diagnostics = new Map<string, unknown[]>();
+            const dispose = () => {
+              diagnostics.clear();
+              emitEvent("diagnostics:changed", { name, uri: null, items: [] });
+            };
+            active.disposables.push(dispose);
+            return {
+              set: (uri, items) => {
+                diagnostics.set(uri, items);
+                emitEvent("diagnostics:changed", { name, uri, items });
+              },
+              delete: (uri) => {
+                diagnostics.delete(uri);
+                emitEvent("diagnostics:changed", { name, uri, items: null });
+              },
+              clear: () => {
+                diagnostics.clear();
+                emitEvent("diagnostics:changed", { name, uri: null, items: null });
+              },
+              dispose,
+            };
+          };
+          const emitCommandExecuted = (command: PluginCommand, success: boolean) => {
+            emitEvent("command:executed", { id: command.id, pluginId: command.pluginId, success });
+          };
           const resolveFilePath = (path: string, allowRoot = false) => pluginWorkspacePath(workspaceRef.current, path, allowRoot);
+          const providerFor = (path: string) => {
+            const match = /^([a-z][a-z0-9+.-]*):/i.exec(path);
+            return match ? fileProviders.get(match[1]) ?? null : null;
+          };
+          const resolvePluginAsset = async (relativePath: string) => {
+            const root = await join(await appDataDir(), "plugins", plugin.id);
+            const resolved = pluginAssetPath(root, relativePath);
+            return resolved;
+          };
           const scopedStorageKey = (key: string) => `arc.plugin.${plugin.id}.${key}`;
+          const workspaceStorageKey = (key: string) => `${scopedStorageKey("workspace")}.${encodeURIComponent(workspaceRef.current)}.${key}`;
           const getEditor = (path?: string) => hostActionsRef.current.getEditor(path);
           const runCommand = async (id: string) => {
             const command = commandRef.current.get(id.includes(":") ? id : `${plugin.id}:${id}`);
             if (!command) throw new Error(`Unknown plugin command: ${id}`);
-            await command.run();
+            try {
+              await command.run();
+              emitCommandExecuted(command, true);
+            } catch (error) {
+              emitCommandExecuted(command, false);
+              throw error;
+            }
+          };
+          activeLanguageContext = () => {
+            const context = hostActionsRef.current.getEditorContext();
+            if (!context) return null;
+            const editor = hostActionsRef.current.getEditor(context.path);
+            if (!editor) return null;
+            const offset = editor.state.selection.main.head;
+            const line = editor.state.doc.lineAt(offset);
+            const text = editor.state.doc.toString();
+            const word = /[A-Za-z0-9_$-]*$/.exec(text.slice(0, offset))?.[0] ?? "";
+            return { path: context.path, language: context.language, text, offset, line: line.text, lineFrom: line.from, lineTo: line.to, word };
+          };
+          const outputChannels = new Map<string, PluginOutputChannel>();
+          const makeOutputChannel = (name: string): PluginOutputChannel => {
+            let buffer = "";
+            const panelId = `${plugin.id}:output-${slugify(name)}`;
+            const publish = () => setPanels((current) => [
+              ...current.filter((entry) => entry.id !== panelId),
+              {
+                id: panelId,
+                title: name,
+                pluginId: plugin.id,
+                pluginName: plugin.name,
+                mount: (container: HTMLElement) => {
+                  const pre = document.createElement("pre");
+                  pre.className = "arc-plugin-output";
+                  pre.textContent = buffer;
+                  container.replaceChildren(pre);
+                  return () => container.replaceChildren();
+                },
+              },
+            ]);
+            const channel: PluginOutputChannel = {
+              id: panelId,
+              append: (text) => { buffer += text; publish(); },
+              appendLine: (text) => { buffer += `${text}\n`; publish(); },
+              show: () => hostActionsRef.current.openPluginPanel(panelId),
+              clear: () => { buffer = ""; publish(); },
+              dispose: () => {
+                outputChannels.delete(name);
+                setPanels((current) => current.filter((entry) => entry.id !== panelId));
+              },
+            };
+            outputChannels.set(name, channel);
+            publish();
+            const dispose = () => channel.dispose();
+            active.disposables.push(dispose);
+            return channel;
           };
           const api: PluginApi = {
             plugin: { id: plugin.id, name: plugin.name, version: plugin.version },
@@ -423,6 +1018,78 @@ export function usePluginRuntime(
             openUrl: (externalUrl) => openUrl(externalUrl),
             openTerminal: (command) => hostActionsRef.current.openTerminal(command),
             notify,
+            supports: (capability) => SUPPORTED_CAPABILITIES.has(capability),
+            disposables: {
+              add: <T,>(resource: T) => {
+                const dispose = toDisposer(resource);
+                if (dispose) active.disposables.push(dispose);
+                return dispose ?? (() => undefined);
+              },
+            },
+            lifecycle: {
+              onDeactivate: (handler) => {
+                active.deactivateHandlers.push(handler);
+                const dispose = () => {
+                  const index = active.deactivateHandlers.indexOf(handler);
+                  if (index >= 0) active.deactivateHandlers.splice(index, 1);
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onShutdown: (handler) => {
+                active.shutdownHandlers.push(handler);
+                const dispose = () => {
+                  const index = active.shutdownHandlers.indexOf(handler);
+                  if (index >= 0) active.shutdownHandlers.splice(index, 1);
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            timers: {
+              setTimeout: (handler, delay) => {
+                const timer = window.setTimeout(() => {
+                  active.timers.delete(timer);
+                  handler();
+                }, delay);
+                active.timers.add(timer);
+                return timer;
+              },
+              setInterval: (handler, interval) => {
+                const timer = window.setInterval(handler, interval);
+                active.timers.add(timer);
+                return timer;
+              },
+              clearTimeout: (id) => {
+                active.timers.delete(id);
+                window.clearTimeout(id);
+              },
+              clearInterval: (id) => {
+                active.timers.delete(id);
+                window.clearInterval(id);
+              },
+            },
+            workers: {
+              create: (scriptPath) => {
+                if (typeof Worker === "undefined") throw new Error("Web Workers are not available.");
+                const url = new URL(scriptPath, window.location.href);
+                const worker = new Worker(url, { type: "module" });
+                active.workers.add(worker);
+                const originalTerminate = worker.terminate.bind(worker);
+                worker.terminate = () => {
+                  active.workers.delete(worker);
+                  originalTerminate();
+                };
+                return worker;
+              },
+            },
+            codemirror: {
+              language: codeMirrorLanguage,
+              view: codeMirrorView,
+              state: codeMirrorState,
+              autocomplete: codeMirrorAutocomplete,
+              highlight: codeMirrorHighlight,
+            },
             app: {
               getState: () => hostActionsRef.current.getAppState(),
               openWorkspace: () => hostActionsRef.current.openWorkspace(),
@@ -434,6 +1101,11 @@ export function usePluginRuntime(
             },
             files: {
               list: async (path = "") => {
+                const provider = providerFor(path);
+                if (provider?.list) {
+                  const entries = await provider.list(path);
+                  return entries.map((entry) => ({ name: entry.name, path: `${path.replace(/\/$/, "")}/${entry.name}`, kind: entry.kind }));
+                }
                 const directory = await resolveFilePath(path, true);
                 const entries = await readDir(directory);
                 return entries.map((entry) => ({
@@ -442,8 +1114,45 @@ export function usePluginRuntime(
                   kind: entry.isDirectory ? "directory" as const : "file" as const,
                 }));
               },
-              read: (path) => readTextFile(resolveFilePath(path)),
+              listRecursive: (path = "", options) => listWorkspaceFiles(hostActionsRef.current.getAppState().workspace, path, options),
+              watch: (pattern, handler, options) => {
+                let disposed = false;
+                let unlisten: (() => void) | null = null;
+                void listen<{ root: string; kind: string; paths: string[] }>("fs-changed", (event) => {
+                  if (disposed) return;
+                  const root = hostActionsRef.current.getAppState().workspace;
+                  for (const absolute of event.payload.paths) {
+                    const relative = absolute.startsWith(root) ? absolute.slice(root.length).replace(/^[\\/]+/, "").replace(/\\/g, "/") : absolute.replace(/\\/g, "/");
+                    if (!matchGlob(relative, pattern) || (options?.ignore ?? []).some((ignore) => matchGlob(relative, ignore))) continue;
+                    handler({ kind: event.payload.kind, path: relative });
+                  }
+                }).then((stop) => {
+                  unlisten = stop;
+                  if (disposed) stop();
+                }).catch(() => undefined);
+                const dispose = () => {
+                  disposed = true;
+                  unlisten?.();
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              find: async (pattern, options) => {
+                const files = await listWorkspaceFiles(hostActionsRef.current.getAppState().workspace, "", { exclude: options?.exclude, maxResults: options?.maxResults ?? 5000 });
+                return files.filter((entry) => entry.kind === "file" && matchGlob(entry.path, pattern)).map((entry) => entry.path);
+              },
+              searchText: (query, options) => searchWorkspaceText(hostActionsRef.current.getAppState().workspace, query, options),
+              read: async (path) => {
+                const provider = providerFor(path);
+                return provider ? new TextDecoder().decode(await provider.read(path)) : readTextFile(resolveFilePath(path));
+              },
+              readBytes: async (path) => {
+                const provider = providerFor(path);
+                return provider ? provider.read(path) : readFile(resolveFilePath(path));
+              },
               write: async (path, content) => {
+                const provider = providerFor(path);
+                if (provider?.write) { await provider.write(path, new TextEncoder().encode(content)); return; }
                 const destination = await resolveFilePath(path);
                 await mkdir(await parentDirectoryPath(destination), { recursive: true });
                 if (hostActionsRef.current.getEditorSnapshot(path)) {
@@ -454,6 +1163,82 @@ export function usePluginRuntime(
                   emitEvent("file:saved", { path });
                 }
                 await hostActionsRef.current.refreshWorkspace();
+              },
+              writeBytes: async (path, bytes) => {
+                const provider = providerFor(path);
+                if (provider?.write) { await provider.write(path, bytes); return; }
+                const destination = await resolveFilePath(path);
+                await mkdir(await parentDirectoryPath(destination), { recursive: true });
+                await writeFile(destination, bytes);
+                await hostActionsRef.current.refreshWorkspace();
+              },
+              writeAtomic: async (path, content) => {
+                const destination = await resolveFilePath(path);
+                await mkdir(await parentDirectoryPath(destination), { recursive: true });
+                const temporary = `${destination}.${Date.now()}.arc-tmp`;
+                await writeTextFile(temporary, content);
+                try {
+                  await renameFile(temporary, destination);
+                } catch (error) {
+                  await remove(temporary).catch(() => undefined);
+                  throw error;
+                }
+                await hostActionsRef.current.refreshWorkspace();
+              },
+              openReadStream: async (path) => {
+                const bytes = await readFile(resolveFilePath(path));
+                let offset = 0;
+                return {
+                  read: async (size = 64 * 1024) => {
+                    if (offset >= bytes.length) return null;
+                    const chunk = bytes.slice(offset, offset + Math.max(1, size));
+                    offset += chunk.length;
+                    return chunk;
+                  },
+                  close: async () => undefined,
+                };
+              },
+              openWriteStream: async (path) => {
+                const destination = await resolveFilePath(path);
+                const chunks: Uint8Array[] = [];
+                let closed = false;
+                return {
+                  write: async (bytes) => {
+                    if (closed) throw new Error("Write stream is closed.");
+                    chunks.push(bytes);
+                  },
+                  close: async () => {
+                    if (closed) return;
+                    closed = true;
+                    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+                    const merged = new Uint8Array(total);
+                    let offset = 0;
+                    for (const chunk of chunks) {
+                      merged.set(chunk, offset);
+                      offset += chunk.length;
+                    }
+                    await mkdir(await parentDirectoryPath(destination), { recursive: true });
+                    await writeFile(destination, merged);
+                    await hostActionsRef.current.refreshWorkspace();
+                  },
+                };
+              },
+              stat: async (path) => {
+                const info = await statFile(resolveFilePath(path));
+                const timestamps = info as FileInfoWithTimes;
+                return {
+                  isFile: info.isFile,
+                  isDirectory: info.isDirectory,
+                  isSymlink: info.isSymlink,
+                  size: info.size,
+                  mtime: timestamps.mtime ? new Date(timestamps.mtime).getTime() : null,
+                  atime: timestamps.atime ? new Date(timestamps.atime).getTime() : null,
+                  birthtime: timestamps.birthtime ? new Date(timestamps.birthtime).getTime() : null,
+                };
+              },
+              exists: async (path) => {
+                if (providerFor(path)) return true;
+                return exists(await resolveFilePath(path));
               },
               create: async (path, content = "") => {
                 const destination = await resolveFilePath(path);
@@ -475,7 +1260,7 @@ export function usePluginRuntime(
                 await resolveFilePath(nextPath);
                 const oldParts = path.replace(/\\/g, "/").split("/");
                 const nextParts = nextPath.replace(/\\/g, "/").split("/");
-                if (oldParts.slice(0, -1).join("/") !== nextParts.slice(0, -1).join("/")) throw new Error("Rename cannot move files to another directory.");
+                if (oldParts.slice(0, -1).join("/") !== nextParts.slice(0, -1).join("/")) throw new Error("Rename cannot move files to another directory. Use move().");
                 await hostActionsRef.current.renameFile(path, nextParts.at(-1) ?? "");
               },
               copy: async (path, destination) => {
@@ -485,14 +1270,55 @@ export function usePluginRuntime(
                 await copyFile(source, target);
                 await hostActionsRef.current.refreshWorkspace();
               },
+              move: async (sourcePath, destinationPath, options) => {
+                const source = await resolveFilePath(sourcePath);
+                const destination = await resolveFilePath(destinationPath);
+                if (!options?.overwrite && await exists(destination)) throw new Error(`Destination already exists: ${destinationPath}`);
+                if (options?.overwrite && await exists(destination)) await remove(destination, { recursive: true });
+                await mkdir(await parentDirectoryPath(destination), { recursive: true });
+                await renameFile(source, destination);
+                await hostActionsRef.current.refreshWorkspace();
+              },
+              trash: async (path) => {
+                const absolute = await resolveFilePath(path);
+                await invoke("plugin_trash_path", { path: absolute });
+                await hostActionsRef.current.refreshWorkspace();
+              },
               open: async (path) => {
                 await resolveFilePath(path);
                 await hostActionsRef.current.openFile(path);
               },
               refresh: () => hostActionsRef.current.refreshWorkspace(),
+              registerProvider: (scheme, provider) => {
+                fileProviders.set(scheme, provider);
+                const dispose = () => fileProviders.delete(scheme);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            paths: {
+              join: (...parts) => joinNativePath(...parts),
+              resolve: (...parts) => resolveNativePath(...parts),
+              relative: (from, to) => relativeNativePath(from, to),
+              toUri: (path) => pathToUri(path),
+              fromUri: (uri) => uriToPath(uri),
+              basename: (path) => path.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) ?? "",
+              dirname: (path) => parentDirectoryPath(path),
+              extname: (path) => {
+                const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) ?? "";
+                const index = name.lastIndexOf(".");
+                return index <= 0 ? "" : name.slice(index);
+              },
+              normalize: (path) => path.replace(/\\/g, "/").replace(/\/+/g, "/"),
             },
             editor: {
               getActive: () => hostActionsRef.current.getEditorSnapshot(),
+              getContext: () => hostActionsRef.current.getEditorContext(),
+              getLastActive: () => hostActionsRef.current.getLastActiveContext(),
+              getLanguage: (path) => hostActionsRef.current.getEditorContext(path)?.language ?? null,
+              getCursor: (path) => hostActionsRef.current.getEditorContext(path)?.cursor ?? null,
+              getSelections: (path) => hostActionsRef.current.getEditorContext(path)?.selections ?? [],
+              getVisibleRanges: (path) => hostActionsRef.current.getEditorContext(path)?.visibleRanges ?? [],
               getText: (path) => getEditor(path)?.state.doc.toString() ?? hostActionsRef.current.getEditorSnapshot(path)?.text ?? null,
               setText: (text, path) => {
                 const snapshot = hostActionsRef.current.getEditorSnapshot(path);
@@ -524,6 +1350,112 @@ export function usePluginRuntime(
                 editor.dispatch({ selection: { anchor: from, head: to } });
                 editor.focus();
               },
+              replaceRange: (range, text, path) => {
+                const editor = getEditor(path);
+                if (!editor) throw new Error("No open editor matches that path.");
+                editor.dispatch({ changes: { from: range.from, to: range.to, insert: text }, selection: { anchor: range.from + text.length } });
+              },
+              applyEdits: (edits, path, expectedVersion) => {
+                const editor = getEditor(path);
+                if (!editor) throw new Error("No open editor matches that path.");
+                if (expectedVersion !== undefined && editor.state.doc.length !== expectedVersion && expectedVersion !== hostActionsRef.current.getEditorContext(path)?.version) {
+                  throw new Error("Editor document version does not match expectedVersion.");
+                }
+                const changes = [...edits]
+                  .sort((a, b) => b.range.from - a.range.from)
+                  .map((edit) => ({ from: edit.range.from, to: edit.range.to, insert: edit.text }));
+                editor.dispatch({ changes });
+              },
+              applyWorkspaceEdit: async (edit) => {
+                const entries: { path: string; edits: PluginEdit[]; version?: number }[] = [];
+                if (edit.changes) for (const [path, edits] of Object.entries(edit.changes)) entries.push({ path, edits });
+                if (edit.documentChanges) for (const change of edit.documentChanges) entries.push({ path: uriToPath(change.uri), edits: change.edits, version: change.version });
+                for (const entry of entries) {
+                  const editor = getEditor(entry.path);
+                  if (!editor) throw new Error(`No open editor matches ${entry.path}.`);
+                  if (entry.version !== undefined && entry.version !== hostActionsRef.current.getEditorContext(entry.path)?.version) throw new Error(`Document version mismatch for ${entry.path}.`);
+                }
+                for (const entry of entries) {
+                  const editor = getEditor(entry.path);
+                  if (!editor) throw new Error(`No open editor matches ${entry.path}.`);
+                  const changes = [...entry.edits]
+                    .sort((a, b) => b.range.from - a.range.from)
+                    .map((item) => ({ from: item.range.from, to: item.range.to, insert: item.text }));
+                  editor.dispatch({ changes });
+                }
+              },
+              insertSnippet: (snippet, range, path) => {
+                const editor = getEditor(path);
+                if (!editor) throw new Error("No open editor matches that path.");
+                const target = range ?? editor.state.selection.main;
+                const parsed = parseSnippet(snippet);
+                editor.dispatch({ changes: { from: target.from, to: target.to, insert: parsed.text }, selection: { anchor: target.from + parsed.cursor } });
+                editor.focus();
+              },
+              revealRange: (range, path) => {
+                const editor = getEditor(path);
+                if (!editor) throw new Error("No open editor matches that path.");
+                editor.dispatch({ effects: CodeMirrorView.scrollIntoView(range.from, { y: "center" }) });
+                editor.focus();
+              },
+              openAt: async (path, line, column = 1) => {
+                await resolveFilePath(path);
+                await hostActionsRef.current.openFile(path);
+                await new Promise((resolve) => window.setTimeout(resolve, 40));
+                const editor = getEditor(path) ?? getEditor(hostActionsRef.current.getEditorContext(path)?.path);
+                if (!editor) return;
+                const lineInfo = editor.state.doc.line(Math.max(1, Math.min(line, editor.state.doc.lines)));
+                const offset = Math.min(lineInfo.to, lineInfo.from + Math.max(0, column - 1));
+                editor.dispatch({ selection: { anchor: offset }, effects: CodeMirrorView.scrollIntoView(offset, { y: "center" }) });
+                editor.focus();
+              },
+              setLanguage: (languageId, path) => {
+                const snapshot = hostActionsRef.current.getEditorSnapshot(path);
+                if (!snapshot) throw new Error("No open editor matches that path.");
+                hostActionsRef.current.setEditorLanguage(snapshot.path, languageId);
+              },
+              registerDecorationType: (options) => {
+                const typeId = `${plugin.id}:decoration-${++decorationCounter}`;
+                decorationTypes.set(typeId, options);
+                const dispose = () => decorationTypes.delete(typeId);
+                active.disposables.push(dispose);
+                return typeId;
+              },
+              setDecorations: (type, ranges, path) => {
+                if (!decorationTypes.has(type)) throw new Error(`Unknown decoration type: ${type}`);
+                const context = hostActionsRef.current.getEditorContext(path);
+                if (!context) throw new Error("No open editor matches that path.");
+                const editor = getEditor(context.path);
+                if (!editor) throw new Error("No open editor matches that path.");
+                editor.dispatch({ effects: setPluginDecorations.of({ path: context.path, type, ranges }) });
+              },
+              openDiff: (leftUri, rightUri, title) => showDiffOverlay(leftUri, rightUri, title),
+              registerContentProvider: (scheme, provider) => {
+                contentProviders.set(scheme, provider);
+                const dispose = () => contentProviders.delete(scheme);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              registerCustomEditor: (filePattern, provider) => {
+                customEditors.set(filePattern, provider);
+                const dispose = () => customEditors.delete(filePattern);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onWillSave: (handler) => {
+                willSaveHandlers.set(`${plugin.id}:${++willSaveCounter}`, { pluginId: plugin.id, handler });
+                const key = `${plugin.id}:${willSaveCounter}`;
+                const dispose = () => willSaveHandlers.delete(key);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onActiveChanged: (handler) => subscribeContextEvent("editor:active-changed", handler, active),
+              onContextChanged: (handler) => subscribeContextEvent("editor:context-changed", handler, active),
+              onSelectionChanged: (handler) => subscribeContextEvent("editor:selection-changed", handler, active),
+              onDocumentOpened: (handler) => subscribeRawEvent("document:opened", handler as (payload: unknown) => void, active),
+              onDocumentClosed: (handler) => subscribeRawEvent("document:closed", handler as (payload: unknown) => void, active),
+              onDocumentChanged: (handler) => subscribeRawEvent("editor:changed", (payload) => { const event = payload as { path: string; content: string }; handler({ path: event.path, content: event.content, version: 0 }); }, active),
+              onDocumentSaved: (handler) => subscribeRawEvent("file:saved", handler as (payload: unknown) => void, active),
               focus: (path) => getEditor(path)?.focus(),
               open: async (path) => {
                 await resolveFilePath(path);
@@ -538,6 +1470,32 @@ export function usePluginRuntime(
                 if (active) await hostActionsRef.current.formatFile(active.path);
               },
             },
+            languages: {
+              register: registerLanguage,
+              registerCompletionProvider: registerProvider("completion"),
+              registerHoverProvider: registerProvider("hover"),
+              registerDefinitionProvider: registerProvider("definition"),
+              registerReferenceProvider: registerProvider("reference"),
+              registerRenameProvider: registerProvider("rename"),
+              registerFormattingProvider: registerProvider("formatting"),
+              registerCodeActionProvider: registerProvider("codeAction"),
+              registerCodeLensProvider: registerProvider("codeLens"),
+              registerInlayHintsProvider: registerProvider("inlayHints"),
+              registerSignatureHelpProvider: registerProvider("signatureHelp"),
+              registerDocumentSymbolProvider: registerProvider("documentSymbol"),
+              registerWorkspaceSymbolProvider: (provider) => registerProvider("workspaceSymbol")("*", provider),
+              registerSemanticTokensProvider: registerProvider("semanticTokens"),
+              registerFoldingProvider: registerProvider("folding"),
+              registerSelectionRangeProvider: registerProvider("selectionRange"),
+              registerGrammar,
+              startServer: async (options) => {
+                const process = await spawnPluginProcess(invoke, plugin.id, options.command, options.args ?? [], { cwd: options.cwd ?? workspaceRef.current, env: options.env });
+                active.disposables.push(() => { void process.stop().catch(() => undefined); });
+                await process.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { processId: null, rootUri: options.cwd ? pathToUri(options.cwd) : null, capabilities: {}, initializationOptions: options.initializationOptions ?? null } })}\n`);
+                return process;
+              },
+            },
+            diagnostics: { createCollection },
             terminal: {
               open: (command) => hostActionsRef.current.openTerminal(command),
               list: () => hostActionsRef.current.getTerminals(),
@@ -552,6 +1510,11 @@ export function usePluginRuntime(
             themes: {
               list: () => hostActionsRef.current.getThemes(),
               set: (id) => hostActionsRef.current.setTheme(id),
+              getColors: () => ({ ...hostActionsRef.current.getAppState().theme.colors }),
+              onChanged: (handler) => subscribeRawEvent("settings:changed", (payload) => {
+                const event = payload as { theme?: ThemeDefinition } | null;
+                if (event?.theme) handler(event.theme);
+              }, active),
             },
             dialogs: {
               openFile: async (options) => {
@@ -577,16 +1540,107 @@ export function usePluginRuntime(
               setFullscreen: (fullscreen) => getCurrentWindow().setFullscreen(fullscreen),
               setAlwaysOnTop: (alwaysOnTop) => getCurrentWindow().setAlwaysOnTop(alwaysOnTop),
               center: () => getCurrentWindow().center(),
+              isFocused: () => getCurrentWindow().isFocused(),
+              onFocusChanged: (handler) => {
+                const stop = subscribeWindowFocus(handler);
+                active.disposables.push(stop);
+                return stop;
+              },
+              getVisibility: () => currentVisibility(),
+              onVisibilityChanged: (handler) => {
+                const stop = subscribeVisibility(handler);
+                active.disposables.push(stop);
+                return stop;
+              },
+              getIdleTime: () => 0,
             },
             ui: {
               notify,
               confirm: (message) => window.confirm(message),
               prompt: (message, defaultValue) => window.prompt(message, defaultValue),
               registerAction,
+              updateAction: (id, changes) => {
+                const fullId = id.includes(":") ? id : `${plugin.id}:${id}`;
+                setActions((current) => current.map((action) => action.id === fullId ? { ...action, ...changes, id: fullId, pluginId: plugin.id, pluginName: plugin.name } : action));
+              },
               registerContextMenuItem,
+              registerMenuItem: (menu, item) => {
+                const id = `${menu}:${item.id}`;
+                registerContextMenuItem({ ...item, id });
+                const dispose = () => setContextMenuItems((current) => current.filter((entry) => entry.id !== `${plugin.id}:${id}`));
+                active.disposables.push(dispose);
+                return dispose;
+              },
               registerStatusItem,
+              updateStatusItem: (id, changes) => {
+                const fullId = id.includes(":") ? id : `${plugin.id}:${id}`;
+                setStatusItems((current) => current.map((item) => item.id === fullId ? { ...item, ...changes, id: fullId, pluginId: plugin.id, pluginName: plugin.name } : item));
+              },
               registerCommand,
               registerPanel,
+              registerSidebarView: registerView("sidebar"),
+              registerBottomView: registerView("bottom"),
+              registerTreeView: (options) => {
+                const id = `${plugin.id}:${options.id}`;
+                registerPanel({
+                  id: options.id,
+                  title: options.title,
+                  mount: (container) => {
+                    const list = document.createElement("div");
+                    list.className = "arc-plugin-tree";
+                    container.replaceChildren(list);
+                    const render = async (parent: HTMLElement, element?: unknown) => {
+                      parent.replaceChildren();
+                      const children = await options.getChildren(element);
+                      for (const child of children) {
+                        const node = child as { label?: string; name?: string; children?: boolean; element?: unknown };
+                        const button = document.createElement("button");
+                        button.type = "button";
+                        button.className = "arc-plugin-tree-item";
+                        button.textContent = node.label ?? node.name ?? String(node);
+                        button.addEventListener("click", () => options.onSelect?.(node.element ?? child));
+                        if (node.children) button.addEventListener("dblclick", () => void render(parent, node.element ?? child));
+                        parent.append(button);
+                      }
+                    };
+                    void render(list);
+                    return () => container.replaceChildren();
+                  },
+                });
+                active.contexts.set(`tree:${id}`, options);
+                return () => setPanels((current) => current.filter((panel) => panel.id !== id));
+              },
+              registerCustomTab: (options) => registerView("customTab")(options),
+              setViewBadge: (viewId, badge) => {
+                const id = viewId.includes(":") ? viewId : `${plugin.id}:${viewId}`;
+                setStatusItems((current) => {
+                  const existing = current.find((item) => item.id === id);
+                  if (!badge && existing) return current.filter((item) => item.id !== id);
+                  const next = { id, text: String(badge ?? ""), pluginId: plugin.id, pluginName: plugin.name };
+                  return existing ? current.map((item) => item.id === id ? { ...item, ...next } : item) : [...current, next];
+                });
+              },
+              showQuickPick: (items, options) => showQuickPickModal(items, options),
+              showInputBox: (options) => showInputBoxModal(options),
+              showProgress: async (options, task) => {
+                notify(`${options.title}…`);
+                try {
+                  const result = await task((message) => notify(`${options.title}: ${message}`));
+                  notify(`${options.title}: done`);
+                  return result;
+                } catch (error) {
+                  notify(`${options.title}: ${String(error)}`);
+                  throw error;
+                }
+              },
+              showNotification: (message, options) => showNotificationToast(message, options),
+              createOutputChannel: makeOutputChannel,
+              setContext: (key, value) => {
+                active.contexts.set(key, value);
+                emitEvent("context:changed", { key, value });
+              },
+              focusView: (id) => hostActionsRef.current.openPluginPanel(id.includes(":") ? id : `${plugin.id}:${id}`),
+              closeView: (id) => hostActionsRef.current.closePluginPanel(id.includes(":") ? id : `${plugin.id}:${id}`),
               addStyles: (css) => {
                 if (css.length > 100_000) throw new Error("Plugin stylesheet exceeds 100 KB.");
                 const style = document.createElement("style");
@@ -601,6 +1655,25 @@ export function usePluginRuntime(
             commands: {
               list: () => [...commandRef.current.values()].map(({ id, title, description, pluginName }) => ({ id, title, description, pluginName })),
               execute: runCommand,
+              onExecuted: (handler) => subscribeRawEvent("command:executed", handler as (payload: unknown) => void, active),
+            },
+            keybindings: {
+              register: (commandId, shortcut, condition) => {
+                const binding: PluginKeybinding = {
+                  commandId: commandId.includes(":") ? commandId : `${plugin.id}:${commandId}`,
+                  shortcut,
+                  condition,
+                  pluginId: plugin.id,
+                  pluginName: plugin.name,
+                };
+                setKeybindings((current) => [...current.filter((entry) => !(entry.commandId === binding.commandId && entry.shortcut === binding.shortcut)), binding]);
+                const dispose = () => setKeybindings((current) => current.filter((entry) => entry !== binding));
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              unregister: (commandId, shortcut) => {
+                setKeybindings((current) => current.filter((entry) => !(entry.commandId === commandId && entry.shortcut === shortcut)));
+              },
             },
             events: {
               on: (event, listener) => {
@@ -617,23 +1690,463 @@ export function usePluginRuntime(
               emit: (event, payload) => emitEvent(`plugin:${plugin.id}:${event}`, payload),
             },
             storage: {
-              get: <T,>(key: string, fallback?: T) => {
-                try {
-                  const value = localStorage.getItem(scopedStorageKey(key));
-                  return value === null ? fallback as T : JSON.parse(value) as T;
-                } catch {
-                  return fallback as T;
-                }
-              },
+              get: <T,>(key: string, fallback?: T) => readJsonStorage(scopedStorageKey(key), fallback),
               set: (key, value) => localStorage.setItem(scopedStorageKey(key), JSON.stringify(value)),
               remove: (key) => localStorage.removeItem(scopedStorageKey(key)),
-              clear: () => Object.keys(localStorage).filter((key) => key.startsWith(scopedStorageKey(""))).forEach((key) => localStorage.removeItem(key)),
+              clear: () => Object.keys(localStorage).filter((key) => key.startsWith(scopedStorageKey("")) && !key.startsWith(scopedStorageKey("secret."))).forEach((key) => localStorage.removeItem(key)),
+              workspace: {
+                get: <T,>(key: string, fallback?: T) => readJsonStorage(workspaceStorageKey(key), fallback),
+                set: (key, value) => localStorage.setItem(workspaceStorageKey(key), JSON.stringify(value)),
+                remove: (key) => localStorage.removeItem(workspaceStorageKey(key)),
+                clear: () => Object.keys(localStorage).filter((key) => key.startsWith(workspaceStorageKey(""))).forEach((key) => localStorage.removeItem(key)),
+              },
+            },
+            configuration: {
+              register: (schema) => {
+                configurationStore.set(`${plugin.id}:${schema.id}`, { schema: schema as unknown as Record<string, unknown>, properties: schema.properties });
+                const dispose = () => configurationStore.delete(`${plugin.id}:${schema.id}`);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              get: <T,>(key: string, fallback?: T) => {
+                const value = getConfigurationValue(plugin.id, key);
+                return (value === undefined ? fallback : value) as T;
+              },
+              update: (key, value, scope) => {
+                const storageKey = configurationStorageKey(plugin.id, key, scope);
+                localStorage.setItem(storageKey, JSON.stringify(value));
+                configurationListeners.current.forEach((listener) => listener({ key, value }));
+              },
+              onChanged: (handler) => {
+                configurationListeners.current.add(handler);
+                const dispose = () => configurationListeners.current.delete(handler);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            secrets: {
+              get: async (key) => {
+                try {
+                  const value = localStorage.getItem(scopedStorageKey(`secret.${key}`));
+                  return value === null ? null : atob(value);
+                } catch {
+                  return null;
+                }
+              },
+              set: async (key, value) => localStorage.setItem(scopedStorageKey(`secret.${key}`), btoa(value)),
+              delete: async (key) => localStorage.removeItem(scopedStorageKey(`secret.${key}`)),
+            },
+            workspaceFolders: {
+              get: async () => hostActionsRef.current.getWorkspaceFolders(),
+              onChanged: (handler) => subscribeRawEvent("workspace:changed", () => handler(hostActionsRef.current.getWorkspaceFolders()), active),
+            },
+            workspaceTrust: {
+              isTrusted: () => hostActionsRef.current.isWorkspaceTrusted(),
+              onChanged: (handler) => subscribeRawEvent("workspace:trust-changed", (payload) => handler(Boolean(payload)), active),
+            },
+            icons: {
+              register: (name, svg) => {
+                const key = `${plugin.id}:${name}`;
+                const sanitized = sanitizeSvg(svg);
+                icons.set(key, sanitized);
+                setIconRegistry((current) => ({ ...current, [key]: sanitized }));
+                const dispose = () => {
+                  icons.delete(key);
+                  setIconRegistry((current) => {
+                    const next = { ...current };
+                    delete next[key];
+                    return next;
+                  });
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              unregister: (name) => {
+                const key = `${plugin.id}:${name}`;
+                icons.delete(key);
+                setIconRegistry((current) => {
+                  const next = { ...current };
+                  delete next[key];
+                  return next;
+                });
+              },
+              get: (name) => icons.get(`${plugin.id}:${name}`) ?? null,
+            },
+            assets: {
+              url: async (relativePath) => {
+                const resolved = await resolvePluginAsset(relativePath);
+                const bytes = await readFile(resolved);
+                const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mimeForPath(resolved) }));
+                active.disposables.push(() => URL.revokeObjectURL(url));
+                return url;
+              },
+              readText: async (relativePath) => readTextFile(await resolvePluginAsset(relativePath)),
+              readBytes: async (relativePath) => readFile(await resolvePluginAsset(relativePath)),
+              resolvePath: resolvePluginAsset,
+            },
+            plugins: {
+              list: () => pluginsRef.current.map(({ id, name, version, description, enabled, builtin }) => ({ id, name, version, description, enabled, builtin })),
+              get: (id) => {
+                const entry = pluginsRef.current.find((candidate) => candidate.id === id);
+                return entry ? (({ name, version, description, enabled, builtin }) => ({ id, name, version, description, enabled, builtin }))(entry) : null;
+              },
+              whenAvailable: (id) => waitFor(() => Boolean(pluginsRef.current.find((candidate) => candidate.id === id && candidate.enabled)), pluginsChangedListeners.current),
+              onChanged: (handler) => {
+                pluginsChangedListeners.current.add(handler);
+                const dispose = () => pluginsChangedListeners.current.delete(handler);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            services: {
+              register: (name, implementation) => {
+                pluginServices.set(name, { pluginId: plugin.id, implementation });
+                serviceListeners.forEach((listener) => listener());
+                const dispose = () => {
+                  pluginServices.delete(name);
+                  serviceListeners.forEach((listener) => listener());
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              get: (name) => pluginServices.get(name)?.implementation ?? null,
+              whenAvailable: async (name) => {
+                await waitFor(() => pluginServices.has(name), serviceListeners);
+                return pluginServices.get(name)?.implementation ?? null;
+              },
+            },
+            process: {
+              isRunning: (names) => invoke<boolean>("plugin_process_is_running", { names }),
+              spawn: async (executable, args = [], options) => {
+                const handle = await spawnPluginProcess(invoke, plugin.id, executable, args, options);
+                active.disposables.push(() => { void handle.stop().catch(() => undefined); });
+                return handle;
+              },
+              which: (executable) => invoke<string | null>("plugin_process_which", { executable }),
+              exec: (executable, args = [], options) => invoke<{ stdout: string; stderr: string; code: number | null; signal: string | null }>("plugin_process_exec", { executable, args, cwd: options?.cwd ?? null, env: options?.env ?? null, timeoutMs: options?.timeoutMs ?? 30_000 }),
+            },
+            pty: {
+              spawn: async (executable, args = [], options) => {
+                const handle = await spawnPluginPty(invoke, plugin.id, executable, args, options);
+                active.disposables.push(() => { void handle.stop().catch(() => undefined); });
+                return handle;
+              },
+            },
+            ipc: {
+              connectUnix: (path, options) => connectPluginSocket(invoke, plugin.id, "unix", path, options?.timeoutMs),
+              connectPipe: (name, options) => connectPluginSocket(invoke, plugin.id, "pipe", name, options?.timeoutMs),
+            },
+            net: {
+              fetch: async (url, options) => {
+                const { timeoutMs, signal, ...init } = options ?? {};
+                if (!timeoutMs) return fetch(url, { ...init, signal });
+                const controller = new AbortController();
+                const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+                const abort = () => controller.abort();
+                signal?.addEventListener("abort", abort);
+                try {
+                  return await fetch(url, { ...init, signal: controller.signal });
+                } finally {
+                  window.clearTimeout(timer);
+                  signal?.removeEventListener("abort", abort);
+                }
+              },
+              connectTcp: (host, port, options) => connectPluginSocket(invoke, plugin.id, "tcp", `${host}:${port}`, options?.timeoutMs),
+              listenHttp: (handler, options) => listenPluginHttp(invoke, plugin.id, handler, options),
+              connectWebSocket: async (url, options) => {
+                const socket = new WebSocket(url, options?.protocols);
+                await new Promise<void>((resolve, reject) => {
+                  socket.addEventListener("open", () => resolve(), { once: true });
+                  socket.addEventListener("error", () => reject(new Error(`WebSocket connection failed: ${url}`)), { once: true });
+                });
+                const dataListeners = new Set<(data: string | Uint8Array) => void>();
+                const errorListeners = new Set<(error: string) => void>();
+                const closeListeners = new Set<(event: { code: number; reason: string }) => void>();
+                socket.binaryType = "arraybuffer";
+                socket.addEventListener("message", (event) => {
+                  const data = typeof event.data === "string" ? event.data : new Uint8Array(event.data as ArrayBuffer);
+                  dataListeners.forEach((listener) => listener(data));
+                });
+                socket.addEventListener("error", () => errorListeners.forEach((listener) => listener("WebSocket error")));
+                socket.addEventListener("close", (event) => closeListeners.forEach((listener) => listener({ code: event.code, reason: event.reason })));
+                const handle: PluginWebSocketHandle = {
+                  send: (data) => socket.send(data),
+                  close: (code, reason) => socket.close(code, reason),
+                  onMessage: (listener) => { dataListeners.add(listener); return () => dataListeners.delete(listener); },
+                  onError: (listener) => { errorListeners.add(listener); return () => errorListeners.delete(listener); },
+                  onClose: (listener) => { closeListeners.add(listener); return () => closeListeners.delete(listener); },
+                };
+                active.disposables.push(() => socket.close());
+                return handle;
+              },
+              connectEventSource: (url, options) => {
+                let source = new EventSource(url);
+                const messageListeners = new Set<(event: { data: string; event: string; id: string }) => void>();
+                const errorListeners = new Set<(error: string) => void>();
+                const attach = (instance: EventSource) => {
+                  instance.addEventListener("message", (event) => messageListeners.forEach((listener) => listener({ data: event.data, event: event.type, id: event.lastEventId })));
+                  instance.addEventListener("error", () => {
+                    if (options?.reconnect === false) {
+                      errorListeners.forEach((listener) => listener("EventSource error"));
+                    } else {
+                      instance.close();
+                      window.setTimeout(() => { source = new EventSource(url); attach(source); }, 1500);
+                    }
+                  });
+                };
+                attach(source);
+                const close = () => source.close();
+                active.disposables.push(close);
+                return {
+                  onMessage: (listener) => { messageListeners.add(listener); return () => messageListeners.delete(listener); },
+                  onError: (listener) => { errorListeners.add(listener); return () => errorListeners.delete(listener); },
+                  close,
+                };
+              },
+              download: async (url, destination, options) => {
+                const response = await fetch(url, { signal: options?.signal });
+                if (!response.ok) throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+                const total = Number(response.headers.get("content-length") ?? 0) || null;
+                const reader = response.body?.getReader();
+                const chunks: Uint8Array[] = [];
+                let received = 0;
+                if (reader) {
+                  for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value) {
+                      chunks.push(value);
+                      received += value.length;
+                      options?.onProgress?.(received, total);
+                    }
+                  }
+                }
+                const merged = new Uint8Array(received);
+                let offset = 0;
+                for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length; }
+                const path = await resolveFilePath(destination);
+                await mkdir(await parentDirectoryPath(path), { recursive: true });
+                await writeFile(path, merged);
+                await hostActionsRef.current.refreshWorkspace();
+                return { path: destination, bytes: received };
+              },
+              isOnline: () => navigator.onLine,
+              onOnlineChanged: (handler) => {
+                const online = () => handler(true);
+                const offline = () => handler(false);
+                window.addEventListener("online", online);
+                window.addEventListener("offline", offline);
+                const dispose = () => {
+                  window.removeEventListener("online", online);
+                  window.removeEventListener("offline", offline);
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            git: {
+              getRepositories: async () => {
+                try {
+                  const status = await hostActionsRef.current.getGitStatus() as { isRepo?: boolean } | null;
+                  return status?.isRepo ? [workspaceRef.current] : [];
+                } catch {
+                  return [];
+                }
+              },
+              getStatus: async () => hostActionsRef.current.getGitStatus(),
+              getBranch: async () => hostActionsRef.current.getGitBranch(),
+              getDiff: (_repoPath, path, options) => hostActionsRef.current.getGitDiff(path, options?.staged),
+              onChanged: (_repository, handler) => {
+                const timer = window.setInterval(() => handler(), 2500);
+                const dispose = () => window.clearInterval(timer);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+            },
+            tasks: {
+              registerProvider: (type, provider) => {
+                taskProviders.set(`${plugin.id}:${type}`, { pluginId: plugin.id, provider });
+                const dispose = () => taskProviders.delete(`${plugin.id}:${type}`);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              run: async (task) => {
+                const definition = task as { command?: string; executable?: string; args?: string[]; cwd?: string; env?: Record<string, string> };
+                const id = `task-${Date.now()}-${++taskCounter}`;
+                const process = await spawnPluginProcess(invoke, plugin.id, definition.executable ?? definition.command ?? "", definition.args ?? [], { cwd: definition.cwd ?? workspaceRef.current, env: definition.env });
+                active.disposables.push(() => { void process.stop().catch(() => undefined); });
+                emitEvent("task:started", { id, task });
+                const exitListeners = new Set<(event: { code: number | null }) => void>();
+                process.onExit((event) => {
+                  exitListeners.forEach((listener) => listener({ code: event.code }));
+                  emitEvent("task:finished", { id, code: event.code });
+                });
+                return {
+                  id,
+                  stop: () => process.stop(),
+                  onExit: (handler) => { exitListeners.add(handler); return () => exitListeners.delete(handler); },
+                };
+              },
+              onStarted: (handler) => subscribeRawEvent("task:started", handler as (payload: unknown) => void, active),
+              onFinished: (handler) => subscribeRawEvent("task:finished", handler as (payload: unknown) => void, active),
+            },
+            tests: {
+              createController: (id, label) => {
+                const fullId = `${plugin.id}:${id}`;
+                let items: unknown[] = [];
+                const dispose = () => emitEvent("tests:changed", { id: fullId, items: [], label });
+                active.disposables.push(dispose);
+                return {
+                  id: fullId,
+                  label,
+                  setItems: (next) => { items = next; emitEvent("tests:changed", { id: fullId, label, items }); },
+                  reportResult: (item) => emitEvent("test:result", { id: fullId, item }),
+                  dispose,
+                };
+              },
+            },
+            debug: {
+              registerAdapter: (type, factory) => {
+                debugAdapters.set(`${plugin.id}:${type}`, factory);
+                const dispose = () => debugAdapters.delete(`${plugin.id}:${type}`);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              start: async (configuration) => {
+                const id = `debug-${Date.now()}-${++debugCounter}`;
+                activeDebugSession = { id, configuration, pluginId: plugin.id };
+                emitEvent("debug:session-changed", activeDebugSession);
+                return {
+                  id,
+                  stop: async () => {
+                    if (activeDebugSession?.id === id) activeDebugSession = null;
+                    emitEvent("debug:session-changed", null);
+                  },
+                };
+              },
+              stop: async (sessionId) => {
+                if (activeDebugSession?.id === sessionId) activeDebugSession = null;
+                emitEvent("debug:session-changed", null);
+              },
+              getActiveSession: () => activeDebugSession,
+              onSessionChanged: (handler) => subscribeRawEvent("debug:session-changed", handler as (payload: unknown) => void, active),
+            },
+            auth: {
+              registerProvider: (id, provider) => {
+                authProviders.set(`${plugin.id}:${id}`, provider);
+                const dispose = () => authProviders.delete(`${plugin.id}:${id}`);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              getSession: async (providerId, scopes, options) => {
+                const provider = authProviders.get(providerId.includes(":") ? providerId : `${plugin.id}:${providerId}`);
+                if (!provider) throw new Error(`Unknown authentication provider: ${providerId}`);
+                const existing = await provider.getSessions?.(scopes);
+                if (existing) return existing;
+                if (!options?.createIfNone) return null;
+                return provider.createSession?.(scopes) ?? null;
+              },
+            },
+            links: {
+              registerUriHandler: (handler) => {
+                linkHandlers.set(`${plugin.id}:${++linkCounter}`, { pluginId: plugin.id, handler });
+                const key = `${plugin.id}:${linkCounter}`;
+                const dispose = () => linkHandlers.delete(key);
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              createCallbackUrl: (path) => `arc://plugin/${plugin.id}/${path.replace(/^\/+/, "")}`,
+            },
+            mcp: {
+              registerServer: (id, definition) => {
+                const key = id.includes(":") ? id : `${plugin.id}:${id}`;
+                mcpServers.set(key, { pluginId: plugin.id, definition, state: "registered" });
+                const dispose = () => {
+                  void disconnectMcp(key);
+                  mcpServers.delete(key);
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              unregisterServer: (id) => {
+                const key = resolveKey(plugin.id, id);
+                void disconnectMcp(key);
+                mcpServers.delete(key);
+              },
+              listServers: () => [...mcpServers.entries()].filter(([, entry]) => entry.pluginId === plugin.id).map(([id, entry]) => ({ id, state: entry.state, definition: { ...entry.definition, env: undefined } })),
+              getServer: (id) => {
+                const entry = mcpServers.get(resolveKey(plugin.id, id));
+                return entry ? { id: resolveKey(plugin.id, id), state: entry.state, definition: { ...entry.definition, env: undefined } } : null;
+              },
+              connect: async (id, options) => {
+                const key = resolveKey(plugin.id, id);
+                const handle = await connectMcp(key, options?.timeoutMs);
+                active.disposables.push(() => { void disconnectMcp(key).catch(() => undefined); });
+                return handle;
+              },
+              disconnect: (id) => disconnectMcp(resolveKey(plugin.id, id)),
+              restart: async (id) => {
+                const key = resolveKey(plugin.id, id);
+                await disconnectMcp(key);
+                return connectMcp(key);
+              },
+              getCapabilities: (id) => mcpServers.get(resolveKey(plugin.id, id))?.capabilities ?? null,
+              onServerChanged: (handler) => subscribeMcp("server", handler as (payload: unknown) => void, active),
+              onLog: (handler) => subscribeMcp("log", handler as (payload: unknown) => void, active),
+              setLogLevel: async (serverId, level) => { await mcpRequest(resolveKey(plugin.id, serverId), "logging/setLevel", { level }); },
+              ping: async (serverId, options) => {
+                try {
+                  await withTimeout(mcpRequest(resolveKey(plugin.id, serverId), "ping", {}), options?.timeoutMs ?? 5000);
+                  return true;
+                } catch {
+                  return false;
+                }
+              },
+              listTools: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "tools/list", options ?? {}),
+              callTool: (serverId, name, args, options) => withTimeout(mcpRequest(resolveKey(plugin.id, serverId), "tools/call", { name, arguments: args ?? {} }), options?.timeoutMs ?? 60_000),
+              onToolsChanged: (_serverId, handler) => subscribeMcp("tools", handler as (payload: unknown) => void, active),
+              listResources: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "resources/list", options ?? {}),
+              listResourceTemplates: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "resources/templates/list", options ?? {}),
+              readResource: (serverId, uri) => mcpRequest(resolveKey(plugin.id, serverId), "resources/read", { uri }),
+              subscribeResource: (serverId, uri, handler) => {
+                const key = resolveKey(plugin.id, serverId);
+                const listener = () => handler();
+                const set = mcpResourceSubscriptions.get(key) ?? new Map<string, () => void>();
+                set.set(uri, listener);
+                mcpResourceSubscriptions.set(key, set);
+                void mcpRequest(key, "resources/subscribe", { uri }).catch(() => undefined);
+                const dispose = () => {
+                  set.delete(uri);
+                  void mcpRequest(key, "resources/unsubscribe", { uri }).catch(() => undefined);
+                };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onResourcesChanged: (_serverId, handler) => subscribeMcp("resources", handler as (payload: unknown) => void, active),
+              listPrompts: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "prompts/list", options ?? {}),
+              getPrompt: (serverId, name, args) => mcpRequest(resolveKey(plugin.id, serverId), "prompts/get", { name, arguments: args ?? {} }),
+              onPromptsChanged: (_serverId, handler) => subscribeMcp("prompts", handler as (payload: unknown) => void, active),
+              complete: (serverId, reference, argument) => mcpRequest(resolveKey(plugin.id, serverId), "completion/complete", { ref: reference, argument }),
+              setRoots: async (serverId, roots) => {
+                const entry = mcpServers.get(resolveKey(plugin.id, serverId));
+                if (!entry?.client) throw new Error("MCP server is not connected.");
+                await entry.client.notify("notifications/roots/list_changed", { roots });
+              },
+              onSamplingRequest: (handler) => { mcpHostHandlers.sampling.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.sampling.delete(handler as (payload: unknown) => unknown); },
+              onElicitationRequest: (handler) => { mcpHostHandlers.elicitation.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.elicitation.delete(handler as (payload: unknown) => unknown); },
+              onAuthorizationRequired: (handler) => { mcpHostHandlers.authorization.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.authorization.delete(handler as (payload: unknown) => unknown); },
+              exposeTool: (definition, handler) => exposeMcp("tool", definition, handler, plugin.id, active),
+              exposeResource: (definition, handler) => exposeMcp("resource", definition, handler, plugin.id, active),
+              exposeResourceTemplate: (definition, handler) => exposeMcp("resourceTemplate", definition, handler, plugin.id, active),
+              exposePrompt: (definition, handler) => exposeMcp("prompt", definition, handler, plugin.id, active),
+              notifyResourceChanged: (uri) => emitEvent("mcp:resource-changed", { uri }),
+              getExposure: () => ({ tools: [...mcpExposures.values()].filter((entry) => entry.pluginId === plugin.id && entry.kind === "tool").map(({ definition }) => definition) }),
+              onExposureChanged: (handler) => subscribeRawEvent("mcp:exposure-changed", () => handler(), active),
             },
             localServer: {
               start: (root, entry = "") => invoke<{ root: string; url: string }>("plugin_local_server_start", { pluginId: plugin.id, root, entry }),
               stop: () => invoke<boolean>("plugin_local_server_stop", { pluginId: plugin.id }),
             },
-            process: { isRunning: (names) => invoke<boolean>("plugin_process_is_running", { names }) },
             registerAction,
             registerContextMenuItem,
           };
@@ -644,6 +2157,10 @@ export function usePluginRuntime(
           }
         } catch (error) {
           if (active.active) notify(`Could not activate plugin ${plugin.name}: ${String(error)}`);
+          active.active = false;
+          active.timers.forEach((timer) => { window.clearTimeout(timer); window.clearInterval(timer); });
+          active.workers.forEach((worker) => worker.terminate());
+          active.disposables.forEach((dispose) => { try { dispose(); } catch { /* Plugin failure cleanup must not throw. */ } });
           if (activeModules.current.get(plugin.id) === active) activeModules.current.delete(plugin.id);
           URL.revokeObjectURL(url);
         }
@@ -654,12 +2171,58 @@ export function usePluginRuntime(
   useEffect(() => () => {
     for (const active of activeModules.current.values()) {
       active.active = false;
+      active.timers.forEach((timer) => { window.clearTimeout(timer); window.clearInterval(timer); });
+      active.timers.clear();
+      active.workers.forEach((worker) => worker.terminate());
+      active.workers.clear();
+      for (const handler of [...active.shutdownHandlers, ...active.deactivateHandlers]) {
+        try { void handler(); } catch { /* Plugin cleanup must not interrupt app shutdown. */ }
+      }
       active.disposables.forEach((dispose) => { try { dispose(); } catch { /* Plugin cleanup must not interrupt app shutdown. */ } });
       try { active.cleanup?.(); } catch { /* Plugin cleanup must not interrupt app shutdown. */ }
       URL.revokeObjectURL(active.url);
     }
     activeModules.current.clear();
   }, []);
+
+  useEffect(() => {
+    pluginsChangedListeners.current.forEach((listener) => {
+      try { listener(); } catch { /* Plugin listeners must not interrupt plugin state updates. */ }
+    });
+  }, [plugins]);
+
+  const formatWithPlugins = useCallback(async (path: string, name: string, content: string): Promise<string | null> => {
+    const extension = extensionOf(name);
+    const languageContribution = languagesRef.current.find((entry) =>
+      (entry.extensions ?? []).map((value) => value.toLowerCase()).includes(extension) ||
+      (entry.filenames ?? []).some((value) => value.toLowerCase() === name.toLowerCase()),
+    );
+    const language = languageContribution?.id ?? extension;
+    const providers = pluginLanguageProviders.filter((entry) => entry.kind === "formatting" && selectorMatches(entry.selector, language, "file", path));
+    for (const entry of providers) {
+      const provider = entry.provider as PluginFormattingProvider;
+      try {
+        const formatted = await provider.provideFormatting({ path, language, text: content });
+        if (typeof formatted === "string") return formatted;
+      } catch (error) {
+        notify(`Plugin formatter failed: ${String(error)}`);
+      }
+    }
+    return null;
+  }, [notify]);
+
+  const applyWillSave = useCallback(async (path: string, content: string): Promise<string> => {
+    let next = content;
+    for (const { handler } of willSaveHandlers.values()) {
+      try {
+        const result = await handler({ path, content: next });
+        if (typeof result === "string") next = result;
+      } catch (error) {
+        notify(`Plugin will-save handler failed: ${String(error)}`);
+      }
+    }
+    return next;
+  }, [notify]);
 
   const installFromFolder = useCallback(async () => {
     const selected = await open({ directory: true, multiple: false, recursive: true, title: "Install plugin folder" });
@@ -714,7 +2277,27 @@ export function usePluginRuntime(
     localStorage.setItem(disabledStorageKey, JSON.stringify([...disabled]));
   }, []);
 
-  return { plugins, actions, contextMenuItems, commands, statusItems, panels, emitEvent, pluginDirectory, availableBuiltins, installFromFolder, installBuiltin, setEnabled, uninstall };
+  return {
+    plugins,
+    actions,
+    contextMenuItems,
+    commands,
+    statusItems,
+    panels,
+    languages,
+    keybindings,
+    icons: iconRegistry,
+    editorExtensions: pluginEditorExtensions,
+    emitEvent,
+    pluginDirectory,
+    availableBuiltins,
+    installFromFolder,
+    installBuiltin,
+    setEnabled,
+    uninstall,
+    formatWithPlugins,
+    applyWillSave,
+  };
 }
 
 function pluginWorkspacePath(root: string, path: string, allowRoot = false): string {
@@ -738,4 +2321,1070 @@ async function writePluginFiles(folder: string, manifest: PluginManifest, source
   await mkdir(folder, { recursive: true });
   await writeTextFile(await join(folder, "plugin.json"), JSON.stringify(manifest, null, 2));
   await writeTextFile(await join(folder, manifest.main), source);
+}
+
+const SUPPORTED_CAPABILITIES = new Set([
+  "lifecycle", "timers", "workers", "editor.context", "editor.edits", "editor.decorations",
+  "editor.diff", "editor.contentProvider", "editor.customEditor", "editor.willSave",
+  "languages", "languages.providers", "languages.server", "diagnostics", "workspaceFolders",
+  "workspaceTrust", "files", "files.streams", "files.watch", "files.search", "files.trash",
+  "files.providers", "paths", "process", "process.spawn", "pty", "ipc", "net", "net.sockets",
+  "net.http", "net.websocket", "net.eventsource", "net.download", "icons", "assets", "ui",
+  "ui.quickpick", "ui.input", "ui.progress", "ui.notifications", "ui.output", "ui.menus",
+  "ui.views", "configuration", "secrets", "storage.workspace", "commands", "keybindings",
+  "plugins", "services", "themes", "window", "git", "tasks", "tests", "debug", "auth",
+  "links", "mcp", "mcp.client", "mcp.exposure",
+]);
+
+type FileInfoWithTimes = {
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymlink: boolean;
+  size: number;
+  mtime?: string | number | Date | null;
+  atime?: string | number | Date | null;
+  birthtime?: string | number | Date | null;
+};
+
+type PluginFileProvider = {
+  read: (path: string) => Promise<Uint8Array>;
+  write?: (path: string, bytes: Uint8Array) => Promise<void>;
+  list?: (path: string) => Promise<{ name: string; kind: "file" | "directory" }[]>;
+};
+
+const fileProviders = new Map<string, PluginFileProvider>();
+const icons = new Map<string, string>();
+const pluginServices = new Map<string, { pluginId: string; implementation: unknown }>();
+const serviceListeners = new Set<() => void>();
+const willSaveHandlers = new Map<string, { pluginId: string; handler: (event: { path: string; content: string }) => string | void | Promise<string | void> }>();
+const contentProviders = new Map<string, { read: (uri: string) => string | Promise<string>; write?: (uri: string, content: string) => void | Promise<void> }>();
+const customEditors = new Map<string, { mount: (container: HTMLElement, context: { path: string; read: () => Promise<string> }) => void | (() => void) }>();
+const decorationTypes = new Map<string, { className?: string; style?: string; gutter?: boolean }>();
+const pluginLanguageProviders: PluginLanguageProviderEntry[] = [];
+let decorationCounter = 0;
+let willSaveCounter = 0;
+let taskCounter = 0;
+let debugCounter = 0;
+let linkCounter = 0;
+let activeDebugSession: { id: string; configuration: unknown; pluginId: string } | null = null;
+const taskProviders = new Map<string, { pluginId: string; provider: { provideTasks: () => unknown[] | Promise<unknown[]>; resolveTask?: (task: unknown) => unknown } }>();
+const debugAdapters = new Map<string, unknown>();
+const authProviders = new Map<string, { getSessions?: (scopes: string[]) => unknown; createSession?: (scopes: string[]) => unknown; removeSession?: (sessionId: string) => unknown }>();
+const linkHandlers = new Map<string, { pluginId: string; handler: (uri: string) => void }>();
+
+const setPluginDecorations = codeMirrorState.StateEffect.define<{ path: string; type: string; ranges: PluginRange[] }>();
+
+const pluginDecorationField = codeMirrorState.StateField.define<Map<string, DecorationSet>>({
+  create: () => new Map(),
+  update(value, transaction) {
+    let next = value;
+    for (const effect of transaction.effects) {
+      if (!effect.is(setPluginDecorations)) continue;
+      const { path, type, ranges } = effect.value;
+      next = new Map(next);
+      const existing = next.get(`${path}:${type}`);
+      const options = decorationTypes.get(type);
+      if (!options) continue;
+      const marks = ranges.map((range) => Decoration.mark({
+        class: options.className ?? "arc-plugin-decoration",
+        attributes: options.style ? { style: options.style } : undefined,
+      }).range(range.from, range.to));
+      if (existing) next.set(`${path}:${type}`, existing.update({ filter: () => false, add: marks, sort: true }));
+      else next.set(`${path}:${type}`, Decoration.set(marks, true));
+    }
+    return next;
+  },
+  provide: (field) => CodeMirrorView.decorations.from(field, (value) => {
+    if (!value.size) return Decoration.none;
+    const all: ReturnType<Decoration["range"]>[] = [];
+    value.forEach((set) => {
+      const cursor = set.iter();
+      let node = cursor.value;
+      while (node) {
+        all.push(node.range(cursor.from, cursor.to));
+        cursor.next();
+        node = cursor.value;
+      }
+    });
+    return Decoration.set(all, true);
+  }),
+});
+
+const pluginDecorationExtensions = pluginDecorationField.extension;
+
+type PluginLanguageContext = {
+  path: string;
+  language: string;
+  text: string;
+  offset: number;
+  line: string;
+  lineFrom: number;
+  lineTo: number;
+  word: string;
+};
+
+let activeLanguageContext: () => PluginLanguageContext | null = () => null;
+
+function pluginProviders(kind: PluginLanguageProviderKind, context: PluginLanguageContext): unknown[] {
+  return pluginLanguageProviders
+    .filter((entry) => entry.kind === kind && selectorMatches(entry.selector, context.language, "file", context.path))
+    .map((entry) => entry.provider);
+}
+
+const pluginCompletionSource = async (context: CompletionContext): Promise<CompletionResult | null> => {
+  const languageContext = activeLanguageContext();
+  if (!languageContext) return null;
+  const providers = pluginProviders("completion", languageContext) as PluginCompletionProvider[];
+  if (!providers.length) return null;
+  const word = context.matchBefore(/[\w$-]*/);
+  if (!word || (word.from === word.to && !context.explicit)) return null;
+  const options: Completion[] = [];
+  for (const provider of providers) {
+    try {
+      const items = await provider.provideCompletionItems({
+        path: languageContext.path,
+        language: languageContext.language,
+        text: languageContext.text,
+        offset: context.pos,
+        line: languageContext.line,
+        from: word.from,
+        to: word.to,
+      });
+      options.push(...items);
+    } catch { /* A failing provider must not break other completions. */ }
+  }
+  return { from: word.from, options };
+};
+
+const pluginHoverExtension = hoverTooltip((view, position) => {
+  const languageContext = activeLanguageContext();
+  if (!languageContext) return null;
+  const providers = pluginProviders("hover", languageContext) as PluginHoverProvider[];
+  if (!providers.length) return null;
+  const offset = position - languageContext.lineFrom;
+  for (const provider of providers) {
+    try {
+      const value = provider.provideHover({
+        path: languageContext.path,
+        language: languageContext.language,
+        text: languageContext.text,
+        offset: position,
+        line: languageContext.line,
+      });
+      void offset;
+      if (!value || typeof value === "object") {
+        if (typeof (value as Promise<unknown>)?.then === "function") return null;
+        if (value && typeof value === "object") return null;
+      }
+      if (typeof value === "string" && value.trim()) {
+        const end = view.state.doc.lineAt(position).to;
+        return {
+          pos: position,
+          end,
+          create: () => {
+            const dom = document.createElement("div");
+            dom.className = "arc-plugin-hover";
+            dom.textContent = value;
+            return { dom };
+          },
+        };
+      }
+    } catch { /* Ignore failing hover providers. */ }
+  }
+  return null;
+});
+
+const pluginFoldingExtension = foldService.of((state, lineStart, lineEnd) => {
+  const languageContext = activeLanguageContext();
+  if (!languageContext) return null;
+  const providers = pluginProviders("folding", languageContext) as PluginFoldingProvider[];
+  const line = state.doc.lineAt(lineStart);
+  for (const provider of providers) {
+    try {
+      const range = provider.provideFoldingRange({
+        path: languageContext.path,
+        language: languageContext.language,
+        text: languageContext.text,
+        line: line.number,
+      });
+      if (range && range.to > range.from) return range;
+    } catch { /* Ignore failing folding providers. */ }
+  }
+  void lineEnd;
+  return null;
+});
+
+const pluginLanguageExtensions: Extension[] = [
+  autocompletion({ override: [pluginCompletionSource] }),
+  pluginHoverExtension,
+  pluginFoldingExtension,
+];
+
+const pluginEditorExtensions: Extension = [
+  pluginDecorationExtensions,
+  pluginLanguageExtensions,
+];
+
+function sanitizeSvg(svg: string): string {
+  if (svg.length > 100_000) throw new Error("Plugin icon exceeds 100 KB.");
+  const documentValue = new DOMParser().parseFromString(svg, "image/svg+xml");
+  if (documentValue.querySelector("parsererror")) throw new Error("Plugin icon is not valid SVG.");
+  documentValue.querySelectorAll("script, foreignObject").forEach((node) => node.remove());
+  documentValue.querySelectorAll("*").forEach((node) => {
+    for (const attribute of [...node.attributes]) {
+      if (/^on/i.test(attribute.name) || /javascript:/i.test(attribute.value)) node.removeAttribute(attribute.name);
+    }
+  });
+  const root = documentValue.documentElement;
+  if (!root || root.nodeName.toLowerCase() !== "svg") throw new Error("Plugin icon must have an <svg> root.");
+  return new XMLSerializer().serializeToString(root);
+}
+
+function toDisposer(resource: unknown): (() => void) | null {
+  if (typeof resource === "function") return resource as () => void;
+  if (!resource || typeof resource !== "object") return null;
+  const candidate = resource as { dispose?: () => void; unsubscribe?: () => void; close?: () => void; stop?: () => void };
+  const method = candidate.dispose ?? candidate.unsubscribe ?? candidate.close ?? candidate.stop;
+  return method ? () => method.call(resource) : null;
+}
+
+function readJsonStorage<T>(key: string, fallback?: T): T {
+  try {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback as T : JSON.parse(value) as T;
+  } catch {
+    return fallback as T;
+  }
+}
+
+let activeWorkspace = "";
+
+function configurationStorageKey(pluginId: string, key: string, scope?: "global" | "workspace"): string {
+  return `arc.plugin.${pluginId}.config.${scope === "workspace" ? `workspace.${encodeURIComponent(activeWorkspace)}.` : ""}${key}`;
+}
+
+function getConfigurationValue(pluginId: string, key: string): unknown {
+  const workspaceValue = readJsonStorage<unknown>(configurationStorageKey(pluginId, key, "workspace"), undefined);
+  if (workspaceValue !== undefined) return workspaceValue;
+  const stored = readJsonStorage<unknown>(configurationStorageKey(pluginId, key), undefined);
+  if (stored !== undefined) return stored;
+  for (const [id, configuration] of configurationEntries(pluginId)) {
+    void id;
+    const property = configuration.properties[key];
+    if (property && "default" in property) return property.default;
+  }
+  return undefined;
+}
+
+function configurationEntries(pluginId: string): [string, { properties: Record<string, { default?: unknown }> }][] {
+  return [...configurationStore.entries()].filter(([id]) => id.startsWith(`${pluginId}:`));
+}
+
+const configurationStore = new Map<string, { schema: Record<string, unknown>; properties: Record<string, { default?: unknown }> }>();
+
+function extensionOf(name: string): string {
+  const index = name.lastIndexOf(".");
+  return index < 0 ? "" : name.slice(index + 1).toLowerCase();
+}
+
+function slugify(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "output";
+}
+
+function pluginAssetPath(root: string, relativePath: string): string {
+  const normalized = relativePath.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  if (normalized.startsWith("/") || /^[a-z]:/i.test(normalized) || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("Plugin asset paths must stay inside the plugin folder.");
+  }
+  const separator = root.includes("\\") ? "\\" : "/";
+  return `${root.replace(/[\\/]$/, "")}${separator}${parts.join(separator)}`;
+}
+
+function mimeForPath(path: string): string {
+  const extension = extensionOf(path);
+  if (["html", "htm"].includes(extension)) return "text/html";
+  if (extension === "css") return "text/css";
+  if (["js", "mjs"].includes(extension)) return "text/javascript";
+  if (extension === "json") return "application/json";
+  if (extension === "svg") return "image/svg+xml";
+  if (["png", "jpg", "jpeg", "gif", "webp"].includes(extension)) return `image/${extension === "jpg" ? "jpeg" : extension}`;
+  return "application/octet-stream";
+}
+
+function parseSnippet(snippet: string): { text: string; cursor: number } {
+  let cursor = -1;
+  let stripped = snippet.replace(/\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g, (_match, first, placeholder, second) => {
+    const index = Number(first ?? second);
+    const text = placeholder ?? "";
+    if (cursor < 0 && index !== 0) cursor = -1;
+    return text;
+  });
+  const firstMatch = /\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/.exec(snippet);
+  cursor = 0;
+  if (firstMatch) {
+    const offset = firstMatch.index;
+    const before = snippet.slice(0, offset).replace(/\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g, (_m, _a, b) => b ?? "").length;
+    const index = Number(firstMatch[1] ?? firstMatch[3]);
+    cursor = index === 0 ? stripped.length : before + (firstMatch[2] ?? "").length;
+  }
+  stripped = stripped.replace(/\$\{(\d+)(?::([^}]*))?\}|\$(\d+)/g, (_m, _a, b) => b ?? "");
+  return { text: stripped, cursor: Math.max(0, Math.min(cursor, stripped.length)) };
+}
+
+function normalizePosix(path: string): string {
+  const absolute = path.startsWith("/");
+  const stack: string[] = [];
+  for (const part of path.replace(/\\/g, "/").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") stack.pop();
+    else stack.push(part);
+  }
+  return `${absolute ? "/" : ""}${stack.join("/")}` || (absolute ? "/" : ".");
+}
+
+const isWindowsHost = /win/i.test(navigator.platform);
+const hostSeparator = isWindowsHost ? "\\" : "/";
+
+function joinNativePath(...parts: string[]): string {
+  return parts.filter(Boolean).join(hostSeparator).replace(/[\\/]+/g, hostSeparator);
+}
+
+function resolveNativePath(...parts: string[]): string {
+  const combined = parts.filter(Boolean).join(hostSeparator);
+  if (isWindowsHost) {
+    const match = /^([a-zA-Z]:)[\\/]?/.exec(combined);
+    const drive = match?.[1] ?? "";
+    const rest = drive ? combined.slice(match![0].length) : combined;
+    const normalized = normalizePosix(rest);
+    return drive ? `${drive}\\${normalized.replace(/\//g, "\\")}` : normalized.replace(/\//g, "\\");
+  }
+  return normalizePosix(combined);
+}
+
+function relativeNativePath(from: string, to: string): string {
+  const normalizedFrom = from.replace(/\\/g, "/").replace(/\/$/, "").split("/").filter(Boolean);
+  const normalizedTo = to.replace(/\\/g, "/").replace(/\/$/, "").split("/").filter(Boolean);
+  let index = 0;
+  while (index < normalizedFrom.length && index < normalizedTo.length && normalizedFrom[index] === normalizedTo[index]) index += 1;
+  const up = new Array(normalizedFrom.length - index).fill("..");
+  const down = normalizedTo.slice(index);
+  return [...up, ...down].join("/") || ".";
+}
+
+function pathToUri(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const prefixed = normalized.startsWith("/") ? normalized : `/${normalized}`;
+  return `file://${prefixed.split("/").map((part) => encodeURIComponent(part)).join("/")}`;
+}
+
+function uriToPath(uri: string): string {
+  if (!uri.startsWith("file://")) return decodeURIComponent(uri);
+  const raw = decodeURIComponent(uri.slice("file://".length));
+  return isWindowsHost ? raw.replace(/^\//, "").replace(/\//g, "\\") : raw;
+}
+
+function matchGlob(path: string, pattern: string): boolean {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "\u0000")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/\u0000/g, ".*");
+  try {
+    return new RegExp(`^${escaped}$`).test(path.replace(/\\/g, "/"));
+  } catch {
+    return path.includes(pattern);
+  }
+}
+
+async function listWorkspaceFiles(
+  root: string,
+  path = "",
+  options?: { exclude?: string[]; maxDepth?: number; maxResults?: number },
+): Promise<{ path: string; name: string; kind: "file" | "directory" }[]> {
+  if (!root) throw new Error("Open a workspace first.");
+  const maxDepth = options?.maxDepth ?? 32;
+  const maxResults = options?.maxResults ?? 10_000;
+  const exclude = options?.exclude ?? ["node_modules", ".git", "dist", "build", "target", ".next", ".cache"];
+  const results: { path: string; name: string; kind: "file" | "directory" }[] = [];
+  const queue: { directory: string; prefix: string; depth: number }[] = [{ directory: joinNativePath(root, path), prefix: path, depth: 0 }];
+  while (queue.length && results.length < maxResults) {
+    const current = queue.shift()!;
+    let entries: Awaited<ReturnType<typeof readDir>>;
+    try {
+      entries = await readDir(current.directory);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (results.length >= maxResults) break;
+      if (exclude.some((name) => entry.name === name || matchGlob(entry.name, name))) continue;
+      const relative = current.prefix ? `${current.prefix}/${entry.name}` : entry.name;
+      results.push({ path: relative, name: entry.name, kind: entry.isDirectory ? "directory" : "file" });
+      if (entry.isDirectory && current.depth + 1 < maxDepth) queue.push({ directory: joinNativePath(current.directory, entry.name), prefix: relative, depth: current.depth + 1 });
+    }
+  }
+  return results;
+}
+
+async function searchWorkspaceText(
+  root: string,
+  query: string | RegExp,
+  options?: { exclude?: string[]; maxResults?: number; include?: string },
+): Promise<{ path: string; line: number; column: number; preview: string }[]> {
+  const results: { path: string; line: number; column: number; preview: string }[] = [];
+  const maxResults = options?.maxResults ?? 500;
+  const files = await listWorkspaceFiles(root, "", { exclude: options?.exclude, maxResults: 5000 });
+  const regex = typeof query === "string" ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : query;
+  for (const file of files) {
+    if (results.length >= maxResults) break;
+    if (file.kind !== "file") continue;
+    if (options?.include && !matchGlob(file.path, options.include)) continue;
+    let text: string;
+    try {
+      text = await readTextFile(joinNativePath(root, file.path));
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length && results.length < maxResults; index += 1) {
+      const line = lines[index];
+      const match = line.match(regex);
+      if (!match) continue;
+      results.push({ path: file.path, line: index + 1, column: (match.index ?? 0) + 1, preview: line.slice(0, 300) });
+    }
+  }
+  return results;
+}
+
+function selectorMatches(selector: PluginLanguageSelector, language: string, scheme: string, path: string): boolean {
+  const selectors = Array.isArray(selector) ? selector : [selector];
+  return selectors.some((entry) => {
+    if (entry === "*") return true;
+    if (typeof entry === "string") return entry === language || entry === extensionOf(path);
+    if (entry.language && entry.language !== language) return false;
+    if (entry.scheme && entry.scheme !== scheme) return false;
+    if (entry.pattern && !matchGlob(path, entry.pattern)) return false;
+    return Boolean(entry.language || entry.scheme || entry.pattern);
+  });
+}
+
+function subscribeRawEvent(event: string, handler: (payload: unknown) => void, active: ActivePlugin): () => void {
+  const callbacks = pluginEventListeners.get(event) ?? new Set<(payload: unknown) => void>();
+  callbacks.add(handler);
+  pluginEventListeners.set(event, callbacks);
+  const dispose = () => {
+    callbacks.delete(handler);
+    if (!callbacks.size) pluginEventListeners.delete(event);
+  };
+  active.disposables.push(dispose);
+  return dispose;
+}
+
+const pluginEventListeners = new Map<string, Set<(payload: unknown) => void>>();
+
+function subscribeContextEvent(event: string, handler: (context: PluginEditorContext | null) => void, active: ActivePlugin): () => void {
+  return subscribeRawEvent(event, handler as (payload: unknown) => void, active);
+}
+
+function currentVisibility() {
+  return { visible: document.visibilityState === "visible", minimized: document.visibilityState === "hidden", hidden: document.visibilityState === "hidden" };
+}
+
+function subscribeVisibility(handler: (visibility: { visible: boolean; minimized: boolean; hidden: boolean }) => void): () => void {
+  const listener = () => handler(currentVisibility());
+  document.addEventListener("visibilitychange", listener);
+  return () => document.removeEventListener("visibilitychange", listener);
+}
+
+function subscribeWindowFocus(handler: (focused: boolean) => void): () => void {
+  const focus = () => handler(true);
+  const blur = () => handler(false);
+  window.addEventListener("focus", focus);
+  window.addEventListener("blur", blur);
+  return () => {
+    window.removeEventListener("focus", focus);
+    window.removeEventListener("blur", blur);
+  };
+}
+
+function showQuickPickModal(
+  items: { label: string; description?: string; detail?: string; value?: unknown }[],
+  options?: { placeHolder?: string; canPickMany?: boolean },
+): Promise<unknown | unknown[] | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "arc-plugin-overlay";
+    const panel = document.createElement("div");
+    panel.className = "arc-plugin-modal";
+    const input = document.createElement("input");
+    input.placeholder = options?.placeHolder ?? "Select an item";
+    const list = document.createElement("div");
+    list.className = "arc-plugin-pick-list";
+    const close = (value: unknown | unknown[] | null) => { overlay.remove(); resolve(value); };
+    const selected = new Set<unknown>();
+    const render = (filter: string) => {
+      list.replaceChildren();
+      for (const item of items.filter((entry) => entry.label.toLowerCase().includes(filter.toLowerCase()))) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "arc-plugin-pick-item";
+        button.innerHTML = `<strong></strong><span></span>`;
+        button.querySelector("strong")!.textContent = item.label;
+        button.querySelector("span")!.textContent = item.description ?? item.detail ?? "";
+        button.addEventListener("click", () => {
+          const value = item.value ?? item.label;
+          if (options?.canPickMany) {
+            if (selected.has(value)) selected.delete(value); else selected.add(value);
+            button.classList.toggle("selected", selected.has(value));
+          } else {
+            close(value);
+          }
+        });
+        list.append(button);
+      }
+    };
+    input.addEventListener("input", () => render(input.value));
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") close(null);
+      if (event.key === "Enter" && options?.canPickMany) close([...selected]);
+    });
+    panel.append(input, list);
+    overlay.append(panel);
+    overlay.addEventListener("click", (event) => { if (event.target === overlay) close(null); });
+    document.body.append(overlay);
+    render("");
+    input.focus();
+  });
+}
+
+function showInputBoxModal(options?: { prompt?: string; value?: string; password?: boolean; placeHolder?: string; validate?: (value: string) => string | null | undefined }): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "arc-plugin-overlay";
+    const panel = document.createElement("div");
+    panel.className = "arc-plugin-modal";
+    const label = document.createElement("label");
+    label.textContent = options?.prompt ?? "Enter a value";
+    const input = document.createElement("input");
+    input.type = options?.password ? "password" : "text";
+    input.value = options?.value ?? "";
+    input.placeholder = options?.placeHolder ?? "";
+    const error = document.createElement("div");
+    error.className = "arc-plugin-error";
+    const close = (value: string | null) => { overlay.remove(); resolve(value); };
+    const submit = () => {
+      const message = options?.validate?.(input.value);
+      if (message) { error.textContent = message; return; }
+      close(input.value);
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") submit();
+      if (event.key === "Escape") close(null);
+    });
+    const confirm = document.createElement("button");
+    confirm.textContent = "OK";
+    confirm.addEventListener("click", submit);
+    panel.append(label, input, error, confirm);
+    overlay.append(panel);
+    overlay.addEventListener("click", (event) => { if (event.target === overlay) close(null); });
+    document.body.append(overlay);
+    input.focus();
+    input.select();
+  });
+}
+
+function showNotificationToast(message: string, options?: { severity?: "info" | "warning" | "error"; actions?: { label: string; run: () => void }[]; progress?: boolean }): string {
+  const id = `notification-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const toast = document.createElement("div");
+  toast.className = `arc-plugin-toast ${options?.severity ?? "info"}`;
+  const text = document.createElement("span");
+  text.textContent = message;
+  toast.append(text);
+  for (const action of options?.actions ?? []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.addEventListener("click", () => { action.run(); toast.remove(); });
+    toast.append(button);
+  }
+  document.body.append(toast);
+  window.setTimeout(() => toast.remove(), 6000);
+  return id;
+}
+
+function showDiffOverlay(leftUri: string, rightUri: string, title?: string): Promise<void> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "arc-plugin-overlay";
+    const panel = document.createElement("div");
+    panel.className = "arc-plugin-diff";
+    const heading = document.createElement("h3");
+    heading.textContent = title ?? "Diff";
+    const columns = document.createElement("div");
+    columns.className = "arc-plugin-diff-columns";
+    const make = (uri: string) => {
+      const pre = document.createElement("pre");
+      pre.textContent = uri;
+      if (uri.startsWith("file://")) {
+        void readTextFile(uriToPath(uri)).then((text) => { pre.textContent = text; }).catch(() => undefined);
+      }
+      return pre;
+    };
+    columns.append(make(leftUri), make(rightUri));
+    const close = document.createElement("button");
+    close.textContent = "Close";
+    close.addEventListener("click", () => { overlay.remove(); resolve(); });
+    panel.append(heading, columns, close);
+    overlay.append(panel);
+    overlay.addEventListener("click", (event) => { if (event.target === overlay) { overlay.remove(); resolve(); } });
+    document.body.append(overlay);
+  });
+}
+
+async function waitFor(condition: () => boolean, listeners: Set<() => void>): Promise<void> {
+  if (condition()) return;
+  await new Promise<void>((resolve) => {
+    const listener = () => {
+      if (!condition()) return;
+      listeners.delete(listener);
+      resolve();
+    };
+    listeners.add(listener);
+  });
+}
+
+function resolveKey(pluginId: string, id: string): string {
+  return id.includes(":") ? id : `${pluginId}:${id}`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("Operation timed out.")), timeoutMs);
+    promise.then((value) => { window.clearTimeout(timer); resolve(value); }, (error) => { window.clearTimeout(timer); reject(error); });
+  });
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function spawnPluginProcess(
+  invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  pluginId: string,
+  executable: string,
+  args: string[],
+  options?: { cwd?: string; env?: Record<string, string> },
+): Promise<PluginProcessHandle> {
+  if (!executable) throw new Error("An executable is required.");
+  const id = await invokeCommand("plugin_process_spawn", {
+    pluginId,
+    executable,
+    args,
+    cwd: options?.cwd ?? null,
+    env: options?.env ?? null,
+  }) as string;
+  const stdoutListeners = new Set<(chunk: string) => void>();
+  const stderrListeners = new Set<(chunk: string) => void>();
+  const exitListeners = new Set<(event: { code: number | null; signal: string | null }) => void>();
+  const errorListeners = new Set<(error: string) => void>();
+  let stopped = false;
+  const unlisteners: (() => void)[] = [];
+  void listen<{ id: string; stream: string; data: string }>("plugin-process-output", (event) => {
+    if (event.payload.id !== id) return;
+    const set = event.payload.stream === "stderr" ? stderrListeners : stdoutListeners;
+    set.forEach((listener) => listener(event.payload.data));
+  }).then((stop) => unlisteners.push(stop));
+  void listen<{ id: string; code: number | null; signal: string | null }>("plugin-process-exit", (event) => {
+    if (event.payload.id !== id) return;
+    exitListeners.forEach((listener) => listener({ code: event.payload.code, signal: event.payload.signal }));
+  }).then((stop) => unlisteners.push(stop));
+  void listen<{ id: string; error: string }>("plugin-process-error", (event) => {
+    if (event.payload.id !== id) return;
+    errorListeners.forEach((listener) => listener(event.payload.error));
+  }).then((stop) => unlisteners.push(stop));
+  return {
+    id,
+    write: async (data) => {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+      await invokeCommand("plugin_process_write", { id, data: text });
+    },
+    closeStdin: async () => { await invokeCommand("plugin_process_close_stdin", { id }); },
+    onStdout: (handler) => { stdoutListeners.add(handler); return () => stdoutListeners.delete(handler); },
+    onStderr: (handler) => { stderrListeners.add(handler); return () => stderrListeners.delete(handler); },
+    onExit: (handler) => { exitListeners.add(handler); return () => exitListeners.delete(handler); },
+    onError: (handler) => { errorListeners.add(handler); return () => errorListeners.delete(handler); },
+    stop: async (stopOptions) => {
+      if (stopped) return;
+      stopped = true;
+      try {
+        await invokeCommand("plugin_process_stop", { id, timeoutMs: stopOptions?.timeoutMs ?? 2000 });
+      } finally {
+        unlisteners.forEach((stop) => stop());
+      }
+    },
+  };
+}
+
+async function spawnPluginPty(
+  invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  _pluginId: string,
+  executable: string,
+  args: string[],
+  options?: { cwd?: string; env?: Record<string, string> },
+): Promise<PluginProcessHandle> {
+  const id = `plugin-pty-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const command = [executable, ...args].map(shellQuote).join(" ");
+  const envPrefix = Object.entries(options?.env ?? {}).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
+  await invokeCommand("terminal_spawn", { id, cwd: options?.cwd ?? null, command: envPrefix ? `${envPrefix} ${command}` : command });
+  const stdoutListeners = new Set<(chunk: string) => void>();
+  const exitListeners = new Set<(event: { code: number | null; signal: string | null }) => void>();
+  const unlisteners: (() => void)[] = [];
+  void listen<{ id: string; data: string }>("terminal-output", (event) => {
+    if (event.payload.id !== id) return;
+    stdoutListeners.forEach((listener) => listener(event.payload.data));
+  }).then((stop) => unlisteners.push(stop));
+  void listen<{ id: string; code: number | null }>("terminal-exit", (event) => {
+    if (event.payload.id !== id) return;
+    exitListeners.forEach((listener) => listener({ code: event.payload.code, signal: null }));
+  }).then((stop) => unlisteners.push(stop));
+  return {
+    id,
+    write: async (data) => {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+      await invokeCommand("terminal_write", { id, data: text });
+    },
+    closeStdin: async () => { await invokeCommand("terminal_write", { id, data: "\u0004" }); },
+    onStdout: (handler) => { stdoutListeners.add(handler); return () => stdoutListeners.delete(handler); },
+    onStderr: () => () => undefined,
+    onExit: (handler) => { exitListeners.add(handler); return () => exitListeners.delete(handler); },
+    onError: () => () => undefined,
+    stop: async () => {
+      try { await invokeCommand("terminal_close", { id }); } finally { unlisteners.forEach((stop) => stop()); }
+    },
+  };
+}
+
+async function connectPluginSocket(
+  invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  pluginId: string,
+  transport: "unix" | "pipe" | "tcp",
+  target: string,
+  timeoutMs = 10_000,
+): Promise<PluginSocketHandle> {
+  const id = await invokeCommand("plugin_socket_connect", { pluginId, transport, target, timeoutMs }) as string;
+  const dataListeners = new Set<(bytes: Uint8Array) => void>();
+  const errorListeners = new Set<(error: string) => void>();
+  const closeListeners = new Set<() => void>();
+  const unlisteners: (() => void)[] = [];
+  void listen<{ id: string; data: number[] }>("plugin-socket-data", (event) => {
+    if (event.payload.id !== id) return;
+    const bytes = new Uint8Array(event.payload.data);
+    dataListeners.forEach((listener) => listener(bytes));
+  }).then((stop) => unlisteners.push(stop));
+  void listen<{ id: string; error: string }>("plugin-socket-error", (event) => {
+    if (event.payload.id !== id) return;
+    errorListeners.forEach((listener) => listener(event.payload.error));
+  }).then((stop) => unlisteners.push(stop));
+  void listen<{ id: string }>("plugin-socket-close", (event) => {
+    if (event.payload.id !== id) return;
+    closeListeners.forEach((listener) => listener());
+  }).then((stop) => unlisteners.push(stop));
+  return {
+    write: async (bytes) => { await invokeCommand("plugin_socket_write", { id, data: [...bytes] }); },
+    onData: (handler) => { dataListeners.add(handler); return () => dataListeners.delete(handler); },
+    onError: (handler) => { errorListeners.add(handler); return () => errorListeners.delete(handler); },
+    onClose: (handler) => { closeListeners.add(handler); return () => closeListeners.delete(handler); },
+    close: async () => {
+      try { await invokeCommand("plugin_socket_close", { id }); } finally { unlisteners.forEach((stop) => stop()); }
+    },
+  };
+}
+
+async function listenPluginHttp(
+  invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  pluginId: string,
+  handler: (request: { method: string; url: string; headers: Record<string, string>; body: Uint8Array }) => Promise<{ status?: number; headers?: Record<string, string>; body?: string | Uint8Array }>,
+  options?: { port?: number; host?: string },
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const info = await invokeCommand("plugin_http_server_start", { pluginId, host: options?.host ?? "127.0.0.1", port: options?.port ?? 0 }) as { id: string; url: string };
+  const stop = await listen<{ id: string; requestId: string; method: string; url: string; headers: Record<string, string>; body: number[] }>("plugin-http-request", (event) => {
+    if (event.payload.id !== info.id) return;
+    void (async () => {
+      try {
+        const response = await handler({
+          method: event.payload.method,
+          url: event.payload.url,
+          headers: event.payload.headers,
+          body: new Uint8Array(event.payload.body),
+        });
+        const body = typeof response.body === "string" ? [...new TextEncoder().encode(response.body)] : [...(response.body ?? [])];
+        await invokeCommand("plugin_http_respond", {
+          id: info.id,
+          requestId: event.payload.requestId,
+          status: response.status ?? 200,
+          headers: response.headers ?? {},
+          body,
+        });
+      } catch (error) {
+        await invokeCommand("plugin_http_respond", {
+          id: info.id,
+          requestId: event.payload.requestId,
+          status: 500,
+          headers: { "content-type": "text/plain" },
+          body: [...new TextEncoder().encode(String(error))],
+        }).catch(() => undefined);
+      }
+    })();
+  });
+  return {
+    url: info.url,
+    close: async () => {
+      stop();
+      await invokeCommand("plugin_http_server_stop", { id: info.id });
+    },
+  };
+}
+
+type McpServerEntry = {
+  pluginId: string;
+  definition: PluginMcpServerDefinition;
+  state: string;
+  capabilities?: Record<string, unknown>;
+  serverInfo?: unknown;
+  client?: McpClient;
+};
+
+type McpClient = {
+  request: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+  notify: (method: string, params?: unknown) => Promise<void>;
+  close: () => Promise<void>;
+};
+
+const mcpServers = new Map<string, McpServerEntry>();
+const mcpResourceSubscriptions = new Map<string, Map<string, () => void>>();
+const mcpHostHandlers = {
+  sampling: new Set<(request: unknown) => unknown>(),
+  elicitation: new Set<(request: unknown) => unknown>(),
+  authorization: new Set<(request: unknown) => unknown>(),
+};
+const mcpExposures = new Map<string, { pluginId: string; kind: string; definition: unknown; handler: unknown }>();
+
+function emitMcpEvent(event: string, payload: unknown) {
+  window.dispatchEvent(new CustomEvent(`arc:mcp:${event}`, { detail: payload }));
+}
+
+function subscribeMcp(channel: string, handler: (payload: unknown) => void, active: ActivePlugin): () => void {
+  const listener = (event: Event) => handler((event as CustomEvent).detail);
+  window.addEventListener(`arc:mcp:${channel}`, listener);
+  const dispose = () => window.removeEventListener(`arc:mcp:${channel}`, listener);
+  active.disposables.push(dispose);
+  return dispose;
+}
+
+async function connectMcp(key: string, timeoutMs = 20_000): Promise<PluginMcpServerHandle> {
+  const entry = mcpServers.get(key);
+  if (!entry) throw new Error(`Unknown MCP server: ${key}`);
+  if (entry.client) {
+    return mcpHandle(key, entry);
+  }
+  entry.state = "connecting";
+  emitMcpEvent("server", { id: key, state: entry.state });
+  try {
+    const definition = entry.definition;
+    const isHttp = (definition.type ?? (definition.url ? "http" : "stdio")) === "http";
+    const client = isHttp ? await createMcpHttpClient(definition, key, timeoutMs) : await createMcpStdioClient(definition, key, timeoutMs);
+    const initialized = await client.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: { roots: { listChanged: true }, sampling: {}, elicitation: {} },
+      clientInfo: { name: "Arc", version: "0.1.2" },
+    }, timeoutMs) as { capabilities?: Record<string, unknown>; serverInfo?: unknown };
+    entry.client = client;
+    entry.capabilities = initialized.capabilities ?? {};
+    entry.serverInfo = initialized.serverInfo;
+    entry.state = "connected";
+    await client.notify("notifications/initialized");
+    emitMcpEvent("server", { id: key, state: entry.state, capabilities: entry.capabilities });
+    return mcpHandle(key, entry);
+  } catch (error) {
+    entry.state = "error";
+    emitMcpEvent("server", { id: key, state: entry.state, error: String(error) });
+    throw error;
+  }
+}
+
+function mcpHandle(key: string, entry: McpServerEntry): PluginMcpServerHandle {
+  return {
+    id: key,
+    serverInfo: entry.serverInfo,
+    capabilities: entry.capabilities ?? {},
+    call: (method, params) => mcpRequest(key, method, params),
+    dispose: () => { void disconnectMcp(key); },
+  };
+}
+
+async function disconnectMcp(key: string): Promise<void> {
+  const entry = mcpServers.get(key);
+  if (!entry?.client) return;
+  await entry.client.close().catch(() => undefined);
+  entry.client = undefined;
+  entry.state = "registered";
+  emitMcpEvent("server", { id: key, state: entry.state });
+}
+
+async function mcpRequest(key: string, method: string, params?: unknown): Promise<unknown> {
+  const entry = mcpServers.get(key);
+  if (!entry?.client) throw new Error(`MCP server is not connected: ${key}`);
+  return entry.client.request(method, params);
+}
+
+async function createMcpStdioClient(definition: PluginMcpServerDefinition, key: string, timeoutMs: number): Promise<McpClient> {
+  const process = await spawnPluginProcess(invoke, "mcp", definition.executable ?? definition.command ?? "", definition.args ?? [], { cwd: definition.cwd, env: definition.env });
+  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  let nextId = 0;
+  let buffer = "";
+  const handleMessage = (message: Record<string, unknown>) => {
+    if (typeof message.id === "number" && ("result" in message || "error" in message)) {
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);
+      if (message.error) request.reject(new Error(String((message.error as { message?: string }).message ?? "MCP request failed")));
+      else request.resolve(message.result);
+      return;
+    }
+    const method = String(message.method ?? "");
+    if (!method) return;
+    if (method === "notifications/tools/list_changed") emitMcpEvent("tools", { id: key });
+    else if (method === "notifications/resources/list_changed") emitMcpEvent("resources", { id: key });
+    else if (method === "notifications/resources/updated") {
+      const uri = (message.params as { uri?: string })?.uri;
+      emitMcpEvent("resources", { id: key, uri });
+      if (uri) mcpResourceSubscriptions.get(key)?.get(uri)?.();
+    }
+    else if (method === "notifications/prompts/list_changed") emitMcpEvent("prompts", { id: key });
+    else if (method === "notifications/message") emitMcpEvent("log", { serverId: key, ...(message.params as Record<string, unknown>) });
+    else if (method === "roots/list") {
+      const roots = (message.params as { roots?: unknown })?.roots ?? [];
+      void client.notify("notifications/roots/list_changed", { roots }).catch(() => undefined);
+    } else if (method === "sampling/createMessage" || method === "elicitation/create" || method === "notifications/authorization_required") {
+      const handler = method === "sampling/createMessage" ? mcpHostHandlers.sampling.values().next().value : method === "elicitation/create" ? mcpHostHandlers.elicitation.values().next().value : mcpHostHandlers.authorization.values().next().value;
+      if (typeof message.id === "number") {
+        void Promise.resolve(handler ? handler(message.params) : null).then((result) => send({ jsonrpc: "2.0", id: message.id, result }), (error) => send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: String(error) } }));
+      }
+    }
+  };
+  const send = async (message: unknown) => {
+    await process.write(`${JSON.stringify(message)}\n`);
+  };
+  process.onStdout((chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const index = buffer.indexOf("\n");
+      if (index < 0) break;
+      const line = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      if (!line) continue;
+      try { handleMessage(JSON.parse(line) as Record<string, unknown>); } catch { /* Ignore non-JSON protocol noise. */ }
+    }
+  });
+  const client: McpClient = {
+    request: (method, params, requestTimeout = timeoutMs) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`MCP request timed out: ${method}`)); }, requestTimeout);
+      pending.set(id, {
+        resolve: (value) => { window.clearTimeout(timer); resolve(value); },
+        reject: (error) => { window.clearTimeout(timer); reject(error); },
+      });
+      void send({ jsonrpc: "2.0", id, method, params: params ?? {} }).catch((error) => { window.clearTimeout(timer); pending.delete(id); reject(error); });
+    }),
+    notify: (method, params) => send({ jsonrpc: "2.0", method, params: params ?? {} }),
+    close: () => process.stop(),
+  };
+  return client;
+}
+
+async function createMcpHttpClient(definition: PluginMcpServerDefinition, key: string, timeoutMs: number): Promise<McpClient> {
+  if (!definition.url) throw new Error("MCP HTTP server requires a url.");
+  let nextId = 0;
+  let sessionId: string | null = null;
+  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+  const handleMessage = (message: Record<string, unknown>) => {
+    if (typeof message.id === "number" && ("result" in message || "error" in message)) {
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);
+      if (message.error) request.reject(new Error(String((message.error as { message?: string }).message ?? "MCP request failed")));
+      else request.resolve(message.result);
+      return;
+    }
+    const method = String(message.method ?? "");
+    if (method === "notifications/tools/list_changed") emitMcpEvent("tools", { id: key });
+    else if (method === "notifications/resources/list_changed") emitMcpEvent("resources", { id: key });
+    else if (method === "notifications/resources/updated") {
+      const uri = (message.params as { uri?: string })?.uri;
+      emitMcpEvent("resources", { id: key, uri });
+      if (uri) mcpResourceSubscriptions.get(key)?.get(uri)?.();
+    }
+    else if (method === "notifications/prompts/list_changed") emitMcpEvent("prompts", { id: key });
+    else if (method === "notifications/message") emitMcpEvent("log", { serverId: key, ...(message.params as Record<string, unknown>) });
+  };
+  const post = async (message: unknown): Promise<Response> => fetch(definition.url!, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+    },
+    body: JSON.stringify(message),
+  });
+  const client: McpClient = {
+    request: (method, params, requestTimeout = timeoutMs) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = window.setTimeout(() => { pending.delete(id); reject(new Error(`MCP request timed out: ${method}`)); }, requestTimeout);
+      pending.set(id, {
+        resolve: (value) => { window.clearTimeout(timer); resolve(value); },
+        reject: (error) => { window.clearTimeout(timer); reject(error); },
+      });
+      void (async () => {
+        try {
+          const response = await post({ jsonrpc: "2.0", id, method, params: params ?? {} });
+          sessionId = response.headers.get("mcp-session-id") ?? sessionId;
+          if (!response.ok) throw new Error(`MCP HTTP ${response.status}`);
+          const text = await response.text();
+          for (const line of text.split(/\r?\n/)) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data) continue;
+            try { handleMessage(JSON.parse(data) as Record<string, unknown>); } catch { /* Ignore malformed stream data. */ }
+          }
+          if (text.trim().startsWith("{")) {
+            try { handleMessage(JSON.parse(text) as Record<string, unknown>); } catch { /* Ignore malformed body. */ }
+          }
+        } catch (error) {
+          window.clearTimeout(timer);
+          pending.delete(id);
+          reject(error);
+        }
+      })();
+    }),
+    notify: async (method, params) => {
+      const response = await post({ jsonrpc: "2.0", method, params: params ?? {} });
+      sessionId = response.headers.get("mcp-session-id") ?? sessionId;
+    },
+    close: async () => { pending.clear(); },
+  };
+  return client;
+}
+
+function exposeMcp(kind: string, definition: unknown, handler: unknown, pluginId: string, active: ActivePlugin): () => void {
+  const id = `${pluginId}:${kind}:${Math.random().toString(36).slice(2)}`;
+  mcpExposures.set(id, { pluginId, kind, definition, handler });
+  emitMcpEvent("exposure-changed", { pluginId });
+  const dispose = () => {
+    mcpExposures.delete(id);
+    emitMcpEvent("exposure-changed", { pluginId });
+  };
+  active.disposables.push(dispose);
+  return dispose;
 }

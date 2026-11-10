@@ -51,6 +51,16 @@ Install the folder from **Plugins → Install from folder**. `activate(api)` run
 | `api.storage` | Persistent key/value storage scoped to this plugin |
 | `api.localServer` | Start and stop plugin-owned local HTTP server |
 | `api.process` | Check executable names on Linux |
+| `api.codemirror` | Shared CodeMirror/Lezer modules for language plugins |
+| `api.languages`, `api.diagnostics` | Register languages, providers, grammars, and diagnostic collections |
+| `api.paths`, `api.workspaceFolders`, `api.workspaceTrust` | Path helpers and workspace metadata |
+| `api.process`, `api.pty`, `api.ipc`, `api.net` | Owned processes, terminals, sockets, HTTP servers, fetch, WebSockets, downloads |
+| `api.icons`, `api.assets` | Register SVG icons and read bundled plugin assets |
+| `api.configuration`, `api.secrets` | Declarative settings and plugin-scoped secrets |
+| `api.keybindings`, `api.plugins`, `api.services` | Shortcuts, installed-plugin metadata, and cross-plugin services |
+| `api.git`, `api.tasks`, `api.tests`, `api.debug`, `api.auth`, `api.links` | Git, tasks, test controllers, debugging, authentication, and URI links |
+| `api.mcp` | MCP stdio/HTTP client, tools, resources, prompts, and exposure |
+| `api.lifecycle`, `api.timers`, `api.disposables` | Automatic plugin cleanup lifecycle |
 | `api.invoke` | Invoke a Tauri command directly |
 | `api.openUrl`, `api.openTerminal`, `api.notify` | Convenience aliases for common UI actions |
 
@@ -305,3 +315,309 @@ The local HTTP server is scoped to your plugin ID and stops when plugin deactiva
 - Plugin JavaScript runs with broad access to Arc and Tauri APIs. Install plugins only from trusted sources.
 - Prefer public `api.*` methods over direct `api.invoke` calls. Native command names may change.
 - Plugin IDs and contribution IDs use lowercase letters, numbers, dots, underscores, and hyphens.
+
+## Extended API
+
+The following namespaces extend the plugin API. They follow the same lifecycle rules: registrations, subscriptions, timers, workers, processes, sockets, servers, and MCP sessions created by a plugin are released when the plugin is disabled or uninstalled. Functions that register a contribution return a disposable function.
+
+### Lifecycle and capabilities
+
+```js
+if (api.supports("process.spawn")) { /* feature available */ }
+
+const unsubscribe = api.ui.registerStatusItem({ /* ... */ });
+api.disposables.add(unsubscribe);
+
+api.lifecycle.onDeactivate(async () => {
+  // Async cleanup before disable/uninstall.
+});
+api.lifecycle.onShutdown(() => {
+  // Best-effort cleanup before Arc exits.
+});
+
+const timer = api.timers.setInterval(() => api.ui.notify("tick"), 10_000);
+api.timers.clearInterval(timer); // Optional; unload cancels it automatically.
+
+const worker = api.workers.create(await api.assets.url("worker.js"));
+```
+
+### Editor context and events
+
+```js
+const context = api.editor.getContext();
+// { path, uri, name, language, version, cursor, selection, selections,
+//   dirty, focused, visibleRanges }
+
+api.editor.onActiveChanged((context) => console.log("active", context?.path));
+api.editor.onSelectionChanged((context) => console.log(context?.cursor));
+api.editor.onDocumentOpened(({ path, name }) => console.log(path, name));
+api.editor.onDocumentClosed(({ path }) => console.log(path));
+api.editor.onDocumentChanged(({ path, content }) => console.log(path));
+api.editor.onDocumentSaved(({ path }) => console.log(path));
+```
+
+Editor navigation and edits:
+
+```js
+api.editor.replaceRange({ from: 0, to: 4 }, "const", "src/main.js");
+api.editor.applyEdits([{ range: { from: 0, to: 0 }, text: "// Arc\n" }], "src/main.js");
+await api.editor.applyWorkspaceEdit({
+  changes: { "src/main.js": [{ range: { from: 0, to: 0 }, text: "// hi\n" }] },
+});
+api.editor.insertSnippet("console.log(${1:value});$0", undefined, "src/main.js");
+api.editor.revealRange({ from: 0, to: 20 }, "src/main.js");
+await api.editor.openAt("src/main.js", 12, 3);
+api.editor.setLanguage("markdown", "src/main.js");
+await api.editor.openDiff("file:///a.txt", "file:///b.txt", "Compare");
+```
+
+Decorations, custom editors, virtual content, and pre-save hooks:
+
+```js
+const type = api.editor.registerDecorationType({ className: "my-highlight" });
+api.editor.setDecorations(type, [{ from: 0, to: 8 }], "src/main.js");
+
+api.editor.registerContentProvider("my-plugin", {
+  read: async (uri) => "virtual content",
+});
+api.editor.registerCustomEditor("**/*.cell", {
+  mount(container, context) { /* custom viewer */ },
+});
+api.editor.onWillSave(async ({ path, content }) => content.trimEnd() + "\n");
+```
+
+### Languages and diagnostics
+
+```js
+api.languages.register({
+  id: "csharp",
+  name: "C#",
+  extensions: ["cs"],
+  filenames: ["*.csproj"],
+  load: () => importExtension,
+});
+
+api.languages.registerCompletionProvider({ language: "csharp" }, {
+  provideCompletionItems: async ({ text, offset }) => [
+    { label: "Console", type: "class" },
+  ],
+});
+api.languages.registerFormattingProvider({ language: "csharp" }, {
+  provideFormatting: async ({ text }) => text.trim(),
+});
+
+const collection = api.diagnostics.createCollection("csharp");
+collection.set("file:///src/Program.cs", [
+  { severity: "error", message: "Missing semicolon", from: 10, to: 20 },
+]);
+```
+
+All language provider registrations return disposables. `api.codemirror` exposes Arc's own `language`, `view`, `state`, `autocomplete`, and `highlight` modules so plugins do not bundle duplicate CodeMirror or Lezer instances.
+
+### Files, workspace, and paths
+
+```js
+const entries = await api.files.listRecursive("src", { maxDepth: 4 });
+const all = await api.files.find("**/*.ts", { exclude: ["dist"] });
+const hits = await api.files.searchText("TODO", { include: "src/**" });
+const bytes = await api.files.readBytes("logo.png");
+await api.files.writeBytes("copy.png", bytes);
+await api.files.writeAtomic("settings.json", "{}");
+await api.files.move("a.txt", "archive/a.txt", { overwrite: true });
+await api.files.trash("old.txt");
+const info = await api.files.stat("a.txt");
+const stopWatching = api.files.watch("src/**", (event) => console.log(event));
+
+const stream = await api.files.openReadStream("large.bin");
+const chunk = await stream.read(64 * 1024);
+await stream.close();
+
+const folder = await api.paths.resolve(api.workspace, "src");
+const uri = api.paths.toUri(folder);
+const relative = api.paths.relative(api.workspace, folder);
+```
+
+`api.workspaceFolders.get()` lists workspace folders. `api.workspaceTrust.isTrusted()` reports whether the active workspace is trusted. Both namespaces provide `onChanged` subscriptions.
+
+### Processes, PTYs, sockets, and HTTP
+
+```js
+const proc = await api.process.spawn("npm", ["run", "dev"], { cwd: api.workspace });
+proc.onStdout((chunk) => console.log(chunk));
+await proc.write("q");
+await proc.stop();
+
+const result = await api.process.exec("git", ["status"], { cwd: api.workspace });
+const gitPath = await api.process.which("git");
+
+const pty = await api.pty.spawn("bash", [], { cwd: api.workspace });
+pty.onStdout((chunk) => console.log(chunk));
+
+const socket = await api.ipc.connectUnix("/tmp/my.sock");
+socket.onData((bytes) => console.log(bytes));
+await socket.write(new TextEncoder().encode("ping\n"));
+
+const tcp = await api.net.connectTcp("127.0.0.1", 9000);
+const server = await api.net.listenHttp(async (request) => ({
+  status: 200,
+  headers: { "content-type": "text/plain" },
+  body: "ok",
+}));
+console.log(server.url);
+await server.close();
+```
+
+### Networking
+
+```js
+const response = await api.net.fetch("https://example.com", { timeoutMs: 10_000 });
+const ws = await api.net.connectWebSocket("wss://example.com/socket");
+ws.onMessage((data) => console.log(data));
+
+const events = api.net.connectEventSource("https://example.com/events");
+events.onMessage((event) => console.log(event.data));
+
+await api.net.download("https://example.com/file.zip", "downloads/file.zip", {
+  onProgress: (received, total) => console.log(received, total),
+});
+
+api.net.onOnlineChanged((online) => console.log("online", online));
+```
+
+### Icons, assets, and UI
+
+```js
+api.icons.register("logo", "<svg viewBox='0 0 16 16'>...</svg>");
+const logo = api.icons.get("logo");
+
+const url = await api.assets.url("logo.svg");
+const text = await api.assets.readText("templates/page.html");
+
+api.ui.updateAction("build", { label: "Build again", enabled: false });
+api.ui.updateStatusItem("mode", { text: "Ready" });
+api.ui.registerMenuItem("explorer/context", {
+  id: "inspect",
+  label: "Inspect",
+  onClick: () => api.ui.notify("Inspected"),
+});
+
+api.ui.registerSidebarView({ id: "outline", title: "Outline", mount(container) {} });
+api.ui.registerBottomView({ id: "problems", title: "Problems", mount(container) {} });
+api.ui.registerCustomTab({ id: "preview", title: "Preview", mount(container) {} });
+api.ui.setViewBadge("outline", 3);
+
+const picked = await api.ui.showQuickPick([
+  { label: "Development", value: "dev" },
+  { label: "Production", value: "prod" },
+]);
+const name = await api.ui.showInputBox({
+  prompt: "Project name",
+  validate: (value) => (value ? null : "Required"),
+});
+await api.ui.showProgress({ title: "Indexing" }, async (report) => {
+  report("Scanning files");
+});
+api.ui.showNotification("Deploy complete", {
+  severity: "info",
+  actions: [{ label: "Open log", run: () => console.log("log") }],
+});
+
+const output = api.ui.createOutputChannel("My Plugin");
+output.appendLine("Started");
+output.show();
+```
+
+### Configuration, storage, secrets, and services
+
+```js
+api.configuration.register({
+  id: "settings",
+  title: "My Plugin",
+  properties: {
+    endpoint: { type: "string", default: "https://example.com" },
+    trace: { type: "boolean", default: false },
+  },
+});
+const endpoint = api.configuration.get("endpoint", "https://example.com");
+api.configuration.update("trace", true);
+api.configuration.onChanged(({ key, value }) => console.log(key, value));
+
+api.storage.workspace.set("lastFile", "src/main.js");
+const lastWorkspaceFile = api.storage.workspace.get("lastFile", null);
+
+await api.secrets.set("token", "secret-value");
+const token = await api.secrets.get("token");
+await api.secrets.delete("token");
+
+api.services.register("my-plugin:api", { hello: () => "hi" });
+const service = await api.services.whenAvailable("my-plugin:api");
+```
+
+### Commands, keybindings, plugins, themes, and window
+
+```js
+api.commands.onExecuted(({ id, pluginId, success }) => console.log(id, success));
+api.keybindings.register("build", "Ctrl+Alt+B");
+
+const installed = api.plugins.list();
+await api.plugins.whenAvailable("other-plugin");
+
+const colors = api.themes.getColors();
+api.themes.onChanged((theme) => console.log(theme.name));
+
+const focused = await api.window.isFocused();
+api.window.onFocusChanged((isFocused) => console.log(isFocused));
+console.log(api.window.getVisibility());
+```
+
+### Git, tasks, tests, debugging, auth, and links
+
+```js
+const repositories = await api.git.getRepositories();
+const status = await api.git.getStatus(repositories[0]);
+const branch = await api.git.getBranch();
+const diff = await api.git.getDiff(repositories[0], "src/main.js");
+const stopPolling = api.git.onChanged(repositories[0], () => console.log("git changed"));
+
+api.tasks.registerProvider("npm", {
+  provideTasks: async () => [{ label: "dev", executable: "npm", args: ["run", "dev"] }],
+});
+const run = await api.tasks.run({ executable: "npm", args: ["test"] });
+run.onExit(({ code }) => console.log(code));
+
+const tests = api.tests.createController("unit", "Unit Tests");
+tests.setItems([{ label: "parses input", status: "passed" }]);
+
+const session = await api.debug.start({ type: "my-debugger", program: "app.js" });
+await session.stop();
+
+api.auth.registerProvider("github", {
+  getSessions: async () => null,
+  createSession: async (scopes) => ({ token: "..." }),
+});
+const auth = await api.auth.getSession("github", ["repo"], { createIfNone: true });
+
+api.links.registerUriHandler((uri) => console.log(uri));
+const callback = api.links.createCallbackUrl("oauth");
+```
+
+### MCP (Model Context Protocol)
+
+```js
+api.mcp.registerServer("local", {
+  type: "stdio",
+  command: "my-mcp-server",
+  args: ["--stdio"],
+});
+const server = await api.mcp.connect("local");
+const tools = await api.mcp.listTools("local");
+const result = await api.mcp.callTool("local", "read_file", { path: "README.md" });
+const resources = await api.mcp.listResources("local");
+
+api.mcp.onToolsChanged("local", () => console.log("tools changed"));
+api.mcp.onLog(({ serverId, level, message }) => console.log(serverId, level, message));
+
+api.mcp.exposeTool({ name: "hello" }, async () => ({ content: "hello" }));
+```
+
+Remote MCP servers use Streamable HTTP when `type: "http"` and a `url` are supplied. Local servers use stdio with the configured executable, arguments, working directory, and environment. Connections, notifications, cancellation, timeouts, tools, resources, prompts, completion, roots, sampling/elicitation handlers, and exposure registration are routed through Arc's plugin lifecycle.

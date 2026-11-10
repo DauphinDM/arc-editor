@@ -113,6 +113,8 @@ import {
   type PluginAppSnapshot,
   type PluginCommandDefinition,
   type PluginContextMenuItem,
+  type PluginEditorContext,
+  type PluginLanguageContribution,
   type PluginPanelContribution,
   type PluginStatusItem,
   type PluginToolbarAction,
@@ -757,13 +759,32 @@ function FileIcon({ name }: { name: string }) {
   return <File size={14} className="file-icon" />;
 }
 
-function PluginToolbarIcon({ name }: { name?: string }) {
+function PluginToolbarIcon({ name, svg }: { name?: string; svg?: string }) {
+  if (svg)
+    return (
+      <span
+        className="plugin-svg-icon"
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+    );
   if (name === 'server') return <Server size={15} />;
   if (name === 'globe') return <Globe size={15} />;
   return <Puzzle size={15} />;
 }
 
 async function loadCodeLanguage(extension: string): Promise<Extension> {
+  const aliases: Record<string, string> = {
+    html: 'html',
+    css: 'css',
+    scss: 'scss',
+    javascript: 'js',
+    typescript: 'ts',
+    json: 'json',
+    jsonc: 'jsonc',
+    markdown: 'md',
+    php: 'php',
+  };
+  extension = aliases[extension] ?? extension;
   if (['html', 'htm', 'svg'].includes(extension))
     return (await import('@codemirror/lang-html')).html();
   if (extension === 'php') return (await import('@codemirror/lang-php')).php();
@@ -803,6 +824,10 @@ function EditorPane({
   pluginPanel,
   pluginViews,
   editorViews,
+  pluginLanguages,
+  pluginLanguageOverrides,
+  pluginEditorExtensions,
+  onSelectionChange,
   settings,
   theme,
 }: {
@@ -826,11 +851,17 @@ function EditorPane({
   pluginPanel: ReactNode;
   pluginViews: PluginPanelContribution[];
   editorViews: { current: Map<string, EditorView> };
+  pluginLanguages: PluginLanguageContribution[];
+  pluginLanguageOverrides: Record<string, string>;
+  pluginEditorExtensions: Extension;
+  onSelectionChange?: (path: string) => void;
   settings: AppSettings;
   theme: ThemeDefinition;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  onSelectionChangeRef.current = onSelectionChange;
   const snapshot = useRef<{
     path: string;
     selection: EditorSelection;
@@ -862,6 +893,7 @@ function EditorPane({
           compartments.settings.of([]),
           compartments.theme.of([]),
           compartments.language.of([]),
+          pluginEditorExtensions,
           EditorView.updateListener.of((update) => {
             if (
               update.docChanged &&
@@ -871,6 +903,8 @@ function EditorPane({
             ) {
               onChange(file.path, update.state.doc.toString());
             }
+            if (update.selectionSet || update.docChanged || update.focusChanged)
+              onSelectionChangeRef.current?.(file.path);
           }),
           EditorView.domEventHandlers({
             focus: () => {
@@ -908,13 +942,29 @@ function EditorPane({
         editorViews.current.delete(file.path);
       if (view.current === editor) view.current = null;
     };
-  }, [editorViews, file?.path, group.id, onActivate, onChange]);
+  }, [editorViews, file?.path, group.id, onActivate, onChange, pluginEditorExtensions]);
 
   useEffect(() => {
     const editor = view.current;
     if (!file || !editor) return;
     let cancelled = false;
-    void loadCodeLanguage(extensionOf(file.name))
+    const extension = extensionOf(file.name);
+    const override = pluginLanguageOverrides[file.path];
+    const contribution =
+      pluginLanguages.find((entry) => entry.id === override) ??
+      pluginLanguages.find(
+        (entry) =>
+          (entry.extensions ?? []).some(
+            (value) => value.toLowerCase() === extension,
+          ) ||
+          (entry.filenames ?? []).some(
+            (value) => value.toLowerCase() === file.name.toLowerCase(),
+          ),
+      );
+    void (contribution
+      ? Promise.resolve(contribution.load())
+      : loadCodeLanguage(override ?? extension)
+    )
       .then((language) => {
         if (!cancelled && view.current === editor)
           editor.dispatch({
@@ -925,7 +975,7 @@ function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [compartments.language, file?.path]);
+  }, [compartments.language, file?.path, file?.name, pluginLanguageOverrides, pluginLanguages]);
 
   useEffect(() => {
     const editor = view.current;
@@ -1434,6 +1484,10 @@ function App() {
   );
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const editorViews = useRef(new Map<string, EditorView>());
+  const lastActiveEditorPath = useRef('');
+  const [pluginLanguageOverrides, setPluginLanguageOverrides] = useState<
+    Record<string, string>
+  >({});
   const [layout, setLayout] = useState<LayoutNode>({
     type: 'group',
     groupId: 'group-1',
@@ -2738,10 +2792,14 @@ function App() {
       const currentContent = fileContents.current.get(path) ?? '';
       let content: string;
       try {
+        const willSaveContent = await pluginRuntime.applyWillSave(
+          path,
+          currentContent,
+        );
         content = settings.prettierOnSave
-          ? ((await prettierFormat(file.name, currentContent)) ??
-            currentContent)
-          : currentContent;
+          ? ((await prettierFormat(file.name, willSaveContent)) ??
+            willSaveContent)
+          : willSaveContent;
       } catch (error) {
         setMessage(`Prettier failed; file not saved: ${String(error)}`);
         return false;
@@ -2811,7 +2869,13 @@ function App() {
       if (!file) return;
       const content = fileContents.current.get(path) ?? '';
       try {
-        const formatted = await prettierFormat(file.name, content);
+        const pluginFormatted = await pluginRuntime.formatWithPlugins(
+          path,
+          file.name,
+          content,
+        );
+        const formatted =
+          pluginFormatted ?? (await prettierFormat(file.name, content));
         if (formatted === null) {
           setMessage(
             `Prettier does not support .${extensionOf(file.name) || 'txt'} files.`,
@@ -3415,6 +3479,20 @@ function App() {
       setCommandQuery('');
       return;
     }
+    const pluginBinding = pluginRuntime.keybindings.find(
+      (binding) =>
+        !binding.condition && matchesPluginShortcut(event, binding.shortcut),
+    );
+    if (pluginBinding) {
+      const command = pluginRuntime.commands.find(
+        (candidate) => candidate.id === pluginBinding.commandId,
+      );
+      if (command) {
+        event.preventDefault();
+        void runPaletteCommand(command);
+        return;
+      }
+    }
     const pluginCommand = pluginRuntime.commands.find(
       (command) =>
         command.shortcut && matchesPluginShortcut(event, command.shortcut),
@@ -3921,6 +3999,57 @@ function App() {
     };
   };
 
+  const getPluginEditorContext = (path?: string): PluginEditorContext | null => {
+    const snapshot = getPluginEditorSnapshot(path);
+    if (!snapshot) return null;
+    const editor = editorViews.current.get(snapshot.path);
+    const line = editor
+      ? editor.state.doc.lineAt(editor.state.selection.main.head)
+      : null;
+    const visibleRanges = editor
+      ? editor.visibleRanges.map((range) => ({
+          from: range.from,
+          to: range.to,
+        }))
+      : [];
+    const languageId =
+      pluginLanguageOverrides[snapshot.path] ??
+      pluginRuntime.languages.find(
+        (language) =>
+          (language.extensions ?? []).some(
+            (value) => value.toLowerCase() === extensionOf(snapshot.name),
+          ) ||
+          (language.filenames ?? []).some(
+            (value) => value.toLowerCase() === snapshot.name.toLowerCase(),
+          ),
+      )?.id ??
+      extensionOf(snapshot.name);
+    return {
+      path: snapshot.path,
+      uri: `file://${snapshot.path.split('/').map(encodeURIComponent).join('/')}`,
+      name: snapshot.name,
+      language: languageId,
+      version: editor?.state.doc.length ?? snapshot.text.length,
+      cursor: {
+        line: line?.number ?? 1,
+        column: line
+          ? (editor?.state.selection.main.head ?? line.from) - line.from + 1
+          : 1,
+        offset: editor?.state.selection.main.head ?? snapshot.selection.from,
+      },
+      selection: snapshot.selection,
+      selections: editor
+        ? editor.state.selection.ranges.map((range) => ({
+            from: range.from,
+            to: range.to,
+          }))
+        : [snapshot.selection],
+      dirty: snapshot.dirty,
+      focused: editor?.hasFocus ?? false,
+      visibleRanges,
+    };
+  };
+
   const normalizePluginPath = (path: string) =>
     path.startsWith(workspace)
       ? path.slice(workspace.length).replace(/^[\\/]+/, '')
@@ -3987,6 +4116,51 @@ function App() {
       getPluginEditor(path ? normalizePluginPath(path) : undefined),
     getEditorSnapshot: (path) =>
       getPluginEditorSnapshot(path ? normalizePluginPath(path) : undefined),
+    getEditorContext: (path) =>
+      getPluginEditorContext(path ? normalizePluginPath(path) : undefined),
+    getLastActiveContext: () =>
+      getPluginEditorContext(lastActiveEditorPath.current || undefined),
+    setEditorLanguage: (path, languageId) => {
+      const relativePath = normalizePluginPath(path);
+      setPluginLanguageOverrides((current) => ({
+        ...current,
+        [relativePath]: languageId,
+      }));
+    },
+    closePluginPanel: (id) => {
+      const key = `${PLUGIN_VIEW_PREFIX}${id}`;
+      const group = groups.find((entry) => entry.tabs.includes(key));
+      if (group) void closeTab(group.id, key);
+    },
+    getWorkspaceFolders: () =>
+      workspace
+        ? [
+            {
+              path: workspace,
+              name: workspace.split(/[\\/]/).filter(Boolean).at(-1) ?? workspace,
+              index: 0,
+            },
+          ]
+        : [],
+    isWorkspaceTrusted: () => Boolean(workspace),
+    getGitStatus: () =>
+      workspace
+        ? invoke('github_status', { root: workspace })
+        : Promise.resolve(null),
+    getGitBranch: async () => {
+      const status = (await (workspace
+        ? invoke('github_status', { root: workspace })
+        : Promise.resolve(null))) as { branch?: string | null } | null;
+      return status?.branch ? { name: status.branch } : null;
+    },
+    getGitDiff: (path, staged) =>
+      workspace
+        ? invoke<string>('github_diff', {
+            root: workspace,
+            path: path ?? null,
+            staged: staged ?? false,
+          })
+        : Promise.resolve(''),
     setEditorText: (path, text) => {
       const relativePath = normalizePluginPath(path);
       const editor = editorViews.current.get(relativePath);
@@ -4015,9 +4189,39 @@ function App() {
   useEffect(() => {
     pluginRuntime.emitEvent('workspace:changed', { path: workspace });
   }, [pluginRuntime.emitEvent, workspace]);
+  const previousOpenPaths = useRef(new Set<string>());
   useEffect(() => {
+    const next = new Set(openFiles.map((file) => file.path));
+    for (const path of next) {
+      if (previousOpenPaths.current.has(path)) continue;
+      const file = openFiles.find((entry) => entry.path === path);
+      pluginRuntime.emitEvent('document:opened', {
+        path,
+        name: file?.name ?? path,
+      });
+    }
+    for (const path of previousOpenPaths.current) {
+      if (next.has(path)) continue;
+      pluginRuntime.emitEvent('document:closed', { path });
+    }
+    previousOpenPaths.current = next;
+  }, [openFiles, pluginRuntime.emitEvent]);
+  useEffect(() => {
+    const path = activeEditorPath();
+    if (path) lastActiveEditorPath.current = path;
+    const context = getPluginEditorContext();
     pluginRuntime.emitEvent('editor:active', getPluginEditorSnapshot());
+    pluginRuntime.emitEvent('editor:active-changed', context);
   }, [pluginRuntime.emitEvent, activeGroupId, groups, openFiles]);
+  useEffect(() => {
+    pluginRuntime.emitEvent('editor:context-changed', getPluginEditorContext());
+  }, [
+    pluginRuntime.emitEvent,
+    activeGroupId,
+    groups,
+    openFiles,
+    pluginLanguageOverrides,
+  ]);
   useEffect(() => {
     pluginRuntime.emitEvent('settings:changed', {
       settings,
@@ -4148,6 +4352,15 @@ function App() {
         onConflictKeep={keepBuffer}
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
+        pluginLanguages={pluginRuntime.languages}
+        pluginLanguageOverrides={pluginLanguageOverrides}
+        pluginEditorExtensions={pluginRuntime.editorExtensions}
+        onSelectionChange={(path) =>
+          pluginRuntime.emitEvent(
+            'editor:selection-changed',
+            getPluginEditorContext(path),
+          )
+        }
         pluginPanel={
           <Suspense fallback={<div className="editor-empty" />}>
             <PluginPanel
@@ -4519,7 +4732,16 @@ function App() {
                     title={action.title ?? action.label}
                     onClick={() => void runPluginAction(action)}
                   >
-                    <PluginToolbarIcon name={action.icon} />
+                    <PluginToolbarIcon
+                      name={action.icon}
+                      svg={
+                        action.icon
+                          ? pluginRuntime.icons[
+                              `${action.pluginId}:${action.icon}`
+                            ]
+                          : undefined
+                      }
+                    />
                   </button>
                 ))}
                 <span

@@ -10,9 +10,9 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,129 @@ struct TerminalState(Mutex<TerminalSessions>);
 
 #[derive(Default)]
 struct LocalHttpServerState(Mutex<HashMap<String, LocalHttpServer>>);
+
+#[derive(Default)]
+struct PluginProcessState(Mutex<HashMap<String, Arc<PluginProcess>>>);
+
+struct PluginProcess {
+    stdin: Mutex<Option<ChildStdin>>,
+    child: Mutex<Child>,
+}
+
+#[derive(Default)]
+struct PluginSocketState(Mutex<HashMap<String, PluginSocketConnection>>);
+
+enum PluginSocketConnection {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(windows)]
+    Pipe(std::fs::File),
+}
+
+#[derive(Default)]
+struct PluginHttpServerState(Mutex<HashMap<String, PluginHttpServer>>);
+
+struct PluginHttpServer {
+    stop: Arc<AtomicBool>,
+    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<HttpReply>>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct HttpReply {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginProcessOutput {
+    id: String,
+    stream: String,
+    data: String,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginProcessExit {
+    id: String,
+    code: Option<i32>,
+    signal: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginProcessErrorEvent {
+    id: String,
+    error: String,
+}
+
+#[derive(Serialize, Clone)]
+struct TerminalExit {
+    id: String,
+    code: Option<u32>,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginSocketData {
+    id: String,
+    data: Vec<u8>,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginSocketClose {
+    id: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PluginHttpRequestEvent {
+    id: String,
+    request_id: String,
+    method: String,
+    url: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Serialize, Clone)]
+struct PluginHttpServerInfo {
+    id: String,
+    url: String,
+}
+
+static PLUGIN_PROCESS_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PLUGIN_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PLUGIN_HTTP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PLUGIN_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+impl Drop for PluginProcessState {
+    fn drop(&mut self) {
+        let Ok(processes) = self.0.get_mut() else {
+            return;
+        };
+        for process in processes.values() {
+            if let Ok(mut child) = process.child.lock() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for PluginHttpServerState {
+    fn drop(&mut self) {
+        let Ok(servers) = self.0.get_mut() else {
+            return;
+        };
+        for (_, mut server) in servers.drain() {
+            server.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = server.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
 
 struct LocalHttpServer {
     root: PathBuf,
@@ -242,7 +365,14 @@ fn read_terminal_output(app: tauri::AppHandle, id: String, mut reader: Box<dyn R
                 if child.try_wait().ok().flatten().is_none() {
                     let _ = child.kill();
                 }
-                let _ = child.wait();
+                let status = child.wait().ok();
+                let _ = app.emit(
+                    "terminal-exit",
+                    TerminalExit {
+                        id: id.clone(),
+                        code: status.map(|status| status.exit_code()),
+                    },
+                );
             }
         }
     }
@@ -444,6 +574,724 @@ fn plugin_process_is_running(names: Vec<String>) -> Result<bool, String> {
     {
         Ok(false)
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessExecResult {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    signal: Option<String>,
+}
+
+fn process_exit_signal(status: &std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|signal| signal.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn stream_process_output(
+    app: tauri::AppHandle,
+    id: String,
+    stream: &'static str,
+    mut reader: Box<dyn Read + Send>,
+) {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(length) => {
+                let _ = app.emit(
+                    "plugin-process-output",
+                    PluginProcessOutput {
+                        id: id.clone(),
+                        stream: stream.to_string(),
+                        data: String::from_utf8_lossy(&buffer[..length]).into_owned(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn plugin_process_spawn(
+    app: tauri::AppHandle,
+    state: State<'_, PluginProcessState>,
+    plugin_id: String,
+    executable: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+) -> Result<String, String> {
+    if executable.trim().is_empty() {
+        return Err("An executable is required.".to_string());
+    }
+    let id = format!(
+        "{plugin_id}-{}-{}",
+        now_millis(),
+        PLUGIN_PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut command = external_command(&executable);
+    command
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(directory) = cwd.filter(|path| !path.is_empty()) {
+        command.current_dir(directory);
+    }
+    for (key, value) in env.unwrap_or_default() {
+        command.env(key, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not spawn {executable}: {error}"))?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let process = Arc::new(PluginProcess {
+        stdin: Mutex::new(stdin),
+        child: Mutex::new(child),
+    });
+    state
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(id.clone(), process.clone());
+    if let Some(stdout) = stdout {
+        let app = app.clone();
+        let output_id = id.clone();
+        std::thread::spawn(move || {
+            stream_process_output(app, output_id, "stdout", Box::new(stdout))
+        });
+    }
+    if let Some(stderr) = stderr {
+        let app = app.clone();
+        let output_id = id.clone();
+        std::thread::spawn(move || {
+            stream_process_output(app, output_id, "stderr", Box::new(stderr))
+        });
+    }
+    let app_exit = app.clone();
+    let exit_id = id.clone();
+    std::thread::spawn(move || loop {
+        let status = {
+            let Ok(mut child) = process.child.lock() else {
+                break;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                Ok(None) => None,
+                Err(ref error) => {
+                    let _ = app_exit.emit(
+                        "plugin-process-error",
+                        PluginProcessErrorEvent {
+                            id: exit_id.clone(),
+                            error: error.to_string(),
+                        },
+                    );
+                    break;
+                }
+            }
+        };
+        if let Some(status) = status {
+            let _ = app_exit.emit(
+                "plugin-process-exit",
+                PluginProcessExit {
+                    id: exit_id.clone(),
+                    code: status.code(),
+                    signal: process_exit_signal(&status),
+                },
+            );
+            if let Some(state) = app_exit.try_state::<PluginProcessState>() {
+                if let Ok(mut processes) = state.0.lock() {
+                    processes.remove(&exit_id);
+                }
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+fn plugin_process_write(
+    state: State<'_, PluginProcessState>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    let process = {
+        let processes = state.0.lock().map_err(|error| error.to_string())?;
+        processes.get(&id).cloned()
+    };
+    let process = process.ok_or_else(|| "Process is not running.".to_string())?;
+    let mut stdin = process.stdin.lock().map_err(|error| error.to_string())?;
+    let stdin = stdin
+        .as_mut()
+        .ok_or_else(|| "Process stdin is closed.".to_string())?;
+    stdin
+        .write_all(data.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn plugin_process_close_stdin(
+    state: State<'_, PluginProcessState>,
+    id: String,
+) -> Result<(), String> {
+    let process = {
+        let processes = state.0.lock().map_err(|error| error.to_string())?;
+        processes.get(&id).cloned()
+    };
+    let process = process.ok_or_else(|| "Process is not running.".to_string())?;
+    process
+        .stdin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .take();
+    Ok(())
+}
+
+#[tauri::command]
+fn plugin_process_stop(
+    state: State<'_, PluginProcessState>,
+    id: String,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    let process = {
+        let processes = state.0.lock().map_err(|error| error.to_string())?;
+        processes.get(&id).cloned()
+    };
+    let Some(process) = process else {
+        return Ok(());
+    };
+    let mut child = process.child.lock().map_err(|error| error.to_string())?;
+    if child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.unwrap_or(2000));
+    while Instant::now() < deadline {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn plugin_process_exec(
+    executable: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    timeout_ms: Option<u64>,
+) -> Result<ProcessExecResult, String> {
+    if executable.trim().is_empty() {
+        return Err("An executable is required.".to_string());
+    }
+    let _ = timeout_ms;
+    let mut command = external_command(&executable);
+    command.args(&args);
+    if let Some(directory) = cwd.filter(|path| !path.is_empty()) {
+        command.current_dir(directory);
+    }
+    for (key, value) in env.unwrap_or_default() {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not run {executable}: {error}"))?;
+    Ok(ProcessExecResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+        signal: process_exit_signal(&output.status),
+    })
+}
+
+fn find_executable(executable: &str) -> Option<PathBuf> {
+    let candidate = Path::new(executable);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let path = env::var_os("PATH")?;
+    for directory in env::split_paths(&path) {
+        let full = directory.join(executable);
+        if full.is_file() {
+            return Some(full);
+        }
+        #[cfg(windows)]
+        {
+            for extension in env::var_os("PATHEXT")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".to_string())
+                .split(';')
+            {
+                let full = directory.join(format!("{executable}{extension}"));
+                if full.is_file() {
+                    return Some(full);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn plugin_process_which(executable: String) -> Result<Option<String>, String> {
+    Ok(find_executable(&executable).map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn plugin_socket_connect(
+    app: tauri::AppHandle,
+    state: State<'_, PluginSocketState>,
+    plugin_id: String,
+    transport: String,
+    target: String,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    let id = format!(
+        "{plugin_id}-{}-{}",
+        now_millis(),
+        PLUGIN_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000));
+    let (connection, reader): (PluginSocketConnection, Box<dyn Read + Send>) = match transport
+        .as_str()
+    {
+        "tcp" => {
+            let address = target
+                .to_socket_addrs()
+                .map_err(|error| error.to_string())?
+                .next()
+                .ok_or_else(|| "Could not resolve address.".to_string())?;
+            let stream =
+                TcpStream::connect_timeout(&address, timeout).map_err(|error| error.to_string())?;
+            let reader = stream.try_clone().map_err(|error| error.to_string())?;
+            (PluginSocketConnection::Tcp(stream), Box::new(reader))
+        }
+        "unix" => {
+            #[cfg(unix)]
+            {
+                let stream = std::os::unix::net::UnixStream::connect(&target)
+                    .map_err(|error| error.to_string())?;
+                let reader = stream.try_clone().map_err(|error| error.to_string())?;
+                (PluginSocketConnection::Unix(stream), Box::new(reader))
+            }
+            #[cfg(not(unix))]
+            {
+                return Err("Unix-domain sockets are not supported on this platform.".to_string());
+            }
+        }
+        "pipe" => {
+            #[cfg(windows)]
+            {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(format!(r"\\.\pipe\{target}"))
+                    .map_err(|error| error.to_string())?;
+                let reader = file.try_clone().map_err(|error| error.to_string())?;
+                (PluginSocketConnection::Pipe(file), Box::new(reader))
+            }
+            #[cfg(not(windows))]
+            {
+                return Err("Named pipes are only supported on Windows.".to_string());
+            }
+        }
+        _ => return Err(format!("Unsupported socket transport: {transport}")),
+    };
+    state
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(id.clone(), connection);
+    let read_id = id.clone();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    if app
+                        .emit(
+                            "plugin-socket-data",
+                            PluginSocketData {
+                                id: read_id.clone(),
+                                data: buffer[..length].to_vec(),
+                            },
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = app.emit(
+            "plugin-socket-close",
+            PluginSocketClose {
+                id: read_id.clone(),
+            },
+        );
+        if let Some(state) = app.try_state::<PluginSocketState>() {
+            if let Ok(mut sockets) = state.0.lock() {
+                sockets.remove(&read_id);
+            }
+        }
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+fn plugin_socket_write(
+    state: State<'_, PluginSocketState>,
+    id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let mut sockets = state.0.lock().map_err(|error| error.to_string())?;
+    let socket = sockets
+        .get_mut(&id)
+        .ok_or_else(|| "Socket is not connected.".to_string())?;
+    match socket {
+        PluginSocketConnection::Tcp(stream) => {
+            stream.write_all(&data).map_err(|error| error.to_string())
+        }
+        #[cfg(unix)]
+        PluginSocketConnection::Unix(stream) => {
+            stream.write_all(&data).map_err(|error| error.to_string())
+        }
+        #[cfg(windows)]
+        PluginSocketConnection::Pipe(file) => {
+            file.write_all(&data).map_err(|error| error.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+fn plugin_socket_close(state: State<'_, PluginSocketState>, id: String) -> Result<(), String> {
+    let socket = state
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&id);
+    if let Some(socket) = socket {
+        match socket {
+            PluginSocketConnection::Tcp(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            #[cfg(unix)]
+            PluginSocketConnection::Unix(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            #[cfg(windows)]
+            PluginSocketConnection::Pipe(file) => {
+                let _ = file;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_http_request(
+    stream: &mut TcpStream,
+) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|error| error.to_string())?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        let length = stream.read(&mut chunk).map_err(|error| error.to_string())?;
+        if length == 0 {
+            return Err("Connection closed before request headers.".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..length]);
+        if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err("Request headers are too large.".to_string());
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let url = parts.next().unwrap_or("/").to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        let length = stream.read(&mut chunk).map_err(|error| error.to_string())?;
+        if length == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..length]);
+    }
+    body.truncate(content_length);
+    Ok((method, url, headers, body))
+}
+
+fn write_http_response(stream: &mut TcpStream, reply: HttpReply) -> Result<(), String> {
+    let mut headers = reply.headers;
+    headers
+        .entry("content-length".to_string())
+        .or_insert_with(|| reply.body.len().to_string());
+    let mut response = format!("HTTP/1.1 {} OK\r\n", reply.status);
+    for (key, value) in &headers {
+        response.push_str(&format!("{key}: {value}\r\n"));
+    }
+    response.push_str("connection: close\r\n\r\n");
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(&reply.body)
+        .map_err(|error| error.to_string())
+}
+
+fn handle_plugin_http_connection(
+    app: tauri::AppHandle,
+    server_id: String,
+    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<HttpReply>>>>,
+    mut stream: TcpStream,
+) {
+    let Ok((method, url, headers, body)) = read_http_request(&mut stream) else {
+        return;
+    };
+    let request_id = format!(
+        "request-{}",
+        PLUGIN_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let (sender, receiver) = channel();
+    if let Ok(mut waiting) = pending.lock() {
+        waiting.insert(request_id.clone(), sender);
+    }
+    let _ = app.emit(
+        "plugin-http-request",
+        PluginHttpRequestEvent {
+            id: server_id.clone(),
+            request_id: request_id.clone(),
+            method,
+            url,
+            headers,
+            body,
+        },
+    );
+    let reply = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| HttpReply {
+            status: 504,
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            body: b"Plugin HTTP handler timed out.".to_vec(),
+        });
+    if let Ok(mut waiting) = pending.lock() {
+        waiting.remove(&request_id);
+    }
+    let _ = write_http_response(&mut stream, reply);
+}
+
+#[tauri::command]
+fn plugin_http_server_start(
+    app: tauri::AppHandle,
+    state: State<'_, PluginHttpServerState>,
+    plugin_id: String,
+    host: String,
+    port: u16,
+) -> Result<PluginHttpServerInfo, String> {
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| error.to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
+    let id = format!(
+        "{plugin_id}-{}-{}",
+        now_millis(),
+        PLUGIN_HTTP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<HttpReply>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let thread_stop = stop.clone();
+    let thread_pending = pending.clone();
+    let thread_id = id.clone();
+    let thread = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let app = app.clone();
+                    let server_id = thread_id.clone();
+                    let pending = thread_pending.clone();
+                    std::thread::spawn(move || {
+                        handle_plugin_http_connection(app, server_id, pending, stream)
+                    });
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    state.0.lock().map_err(|error| error.to_string())?.insert(
+        id.clone(),
+        PluginHttpServer {
+            stop,
+            pending,
+            thread: Some(thread),
+        },
+    );
+    Ok(PluginHttpServerInfo {
+        url: format!("http://{host}:{port}"),
+        id,
+    })
+}
+
+#[tauri::command]
+fn plugin_http_respond(
+    state: State<'_, PluginHttpServerState>,
+    id: String,
+    request_id: String,
+    status: u16,
+    headers: Option<HashMap<String, String>>,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    let reply = HttpReply {
+        status,
+        headers: headers.unwrap_or_default(),
+        body,
+    };
+    let servers = state.0.lock().map_err(|error| error.to_string())?;
+    let server = servers
+        .get(&id)
+        .ok_or_else(|| "HTTP server is not running.".to_string())?;
+    let sender = server
+        .pending
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&request_id)
+        .ok_or_else(|| "HTTP request is no longer pending.".to_string())?;
+    sender.send(reply).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn plugin_http_server_stop(
+    state: State<'_, PluginHttpServerState>,
+    id: String,
+) -> Result<(), String> {
+    let server = state
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&id);
+    if let Some(mut server) = server {
+        server.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = server.thread.take() {
+            let _ = thread.join();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn plugin_trash_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let source = PathBuf::from(&path);
+    if !source.exists() {
+        return Err(format!("Path does not exist: {path}"));
+    }
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    let trash = cache.join("plugin-trash");
+    fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+    let name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "item".to_string());
+    let destination = trash.join(format!("{}-{name}", now_millis()));
+    if fs::rename(&source, &destination).is_err() {
+        if source.is_dir() {
+            copy_directory(&source, &destination)?;
+            fs::remove_dir_all(&source).map_err(|error| error.to_string())?;
+        } else {
+            fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+            fs::remove_file(&source).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| error.to_string())?
+        .flatten()
+    {
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        if path.is_dir() {
+            copy_directory(&path, &target)?;
+        } else {
+            fs::copy(&path, &target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn github_diff(root: String, path: Option<String>, staged: bool) -> Result<String, String> {
+    let root_path = PathBuf::from(&root);
+    let mut args: Vec<&str> = vec!["diff"];
+    if staged {
+        args.push("--cached");
+    }
+    if let Some(path) = path.as_deref().filter(|path| !path.is_empty()) {
+        args.push("--");
+        args.push(path);
+    }
+    let output = git_output(&root_path, &args)?;
+    if !output.status.success() {
+        return Err(output_message(&output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[tauri::command]
@@ -2003,6 +2851,9 @@ pub fn run() {
     tauri::Builder::default()
         .manage(TerminalState::default())
         .manage(LocalHttpServerState::default())
+        .manage(PluginProcessState::default())
+        .manage(PluginSocketState::default())
+        .manage(PluginHttpServerState::default())
         .manage(WatcherState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -2016,6 +2867,20 @@ pub fn run() {
             watch_project,
             unwatch_project,
             plugin_process_is_running,
+            plugin_process_spawn,
+            plugin_process_write,
+            plugin_process_close_stdin,
+            plugin_process_stop,
+            plugin_process_exec,
+            plugin_process_which,
+            plugin_socket_connect,
+            plugin_socket_write,
+            plugin_socket_close,
+            plugin_http_server_start,
+            plugin_http_respond,
+            plugin_http_server_stop,
+            plugin_trash_path,
+            github_diff,
             set_native_background_blur,
             terminal_spawn,
             terminal_write,
