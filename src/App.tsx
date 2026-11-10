@@ -32,6 +32,7 @@ import {
 import {
   defaultKeymap,
   history,
+  historyField,
   historyKeymap,
   indentWithTab,
 } from '@codemirror/commands';
@@ -803,6 +804,12 @@ async function loadCodeLanguage(extension: string): Promise<Extension> {
   return [];
 }
 
+type EditorSnapshot = {
+  state: EditorState;
+  scrollTop: number;
+  scrollLeft: number;
+};
+
 function EditorPane({
   group,
   file,
@@ -824,6 +831,7 @@ function EditorPane({
   pluginPanel,
   pluginViews,
   editorViews,
+  editorSnapshots,
   pluginLanguages,
   pluginLanguageOverrides,
   pluginEditorExtensions,
@@ -853,6 +861,7 @@ function EditorPane({
   pluginPanel: ReactNode;
   pluginViews: PluginPanelContribution[];
   editorViews: { current: Map<string, EditorView> };
+  editorSnapshots: { current: Map<string, EditorSnapshot> };
   pluginLanguages: PluginLanguageContribution[];
   pluginLanguageOverrides: Record<string, string>;
   pluginEditorExtensions: Extension;
@@ -866,12 +875,6 @@ function EditorPane({
   const view = useRef<EditorView | null>(null);
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
-  const snapshot = useRef<{
-    path: string;
-    selection: EditorSelection;
-    scrollTop: number;
-    scrollLeft: number;
-  } | null>(null);
   const [compartments] = useState(() => ({
     settings: new Compartment(),
     theme: new Compartment(),
@@ -887,46 +890,52 @@ function EditorPane({
     }
 
     view.current?.destroy();
+    const snapshotKey = `${workspace}/${file.path}`;
+    const previous = editorSnapshots.current.get(snapshotKey);
+    // Rebuild extensions for this pane so restored history never retains old
+    // plugin extensions, compartments or callbacks from another split.
+    const extensions = [
+      history(),
+      highlightSelectionMatches(),
+      compartments.settings.of([]),
+      compartments.theme.of([]),
+      compartments.language.of([]),
+      pluginEditorExtensions,
+      EditorView.updateListener.of((update) => {
+        if (
+          update.docChanged &&
+          !update.transactions.some((transaction) =>
+            transaction.annotation(externalContentUpdate),
+          )
+        ) {
+          onChange(file.path, update.state.doc.toString());
+        }
+        if (update.selectionSet || update.docChanged || update.focusChanged)
+          onSelectionChangeRef.current?.(file.path);
+      }),
+      EditorView.domEventHandlers({
+        focus: () => {
+          onActivate(group.id);
+          return false;
+        },
+      }),
+    ];
+    let state = previous
+      ? EditorState.fromJSON(previous.state.toJSON({ history: historyField }), { extensions }, { history: historyField })
+      : EditorState.create({ doc: file.content, extensions });
+    if (state.doc.toString() !== file.content) {
+      state = state.update({
+        changes: { from: 0, to: state.doc.length, insert: file.content },
+        annotations: [externalContentUpdate.of(true), Transaction.addToHistory.of(false)],
+      }).state;
+    }
     const editor = new EditorView({
       parent: host.current,
-      state: EditorState.create({
-        doc: file.content,
-        extensions: [
-          history(),
-          highlightSelectionMatches(),
-          compartments.settings.of([]),
-          compartments.theme.of([]),
-          compartments.language.of([]),
-          pluginEditorExtensions,
-          EditorView.updateListener.of((update) => {
-            if (
-              update.docChanged &&
-              !update.transactions.some((transaction) =>
-                transaction.annotation(externalContentUpdate),
-              )
-            ) {
-              onChange(file.path, update.state.doc.toString());
-            }
-            if (update.selectionSet || update.docChanged || update.focusChanged)
-              onSelectionChangeRef.current?.(file.path);
-          }),
-          EditorView.domEventHandlers({
-            focus: () => {
-              onActivate(group.id);
-              return false;
-            },
-          }),
-        ],
-        selection:
-          snapshot.current?.path === file.path
-            ? snapshot.current.selection
-            : undefined,
-      }),
+      state,
     });
     view.current = editor;
     editorViews.current.set(file.path, editor);
-    if (snapshot.current?.path === file.path) {
-      const previous = snapshot.current;
+    if (previous) {
       requestAnimationFrame(() => {
         if (view.current === editor) {
           editor.scrollDOM.scrollTop = previous.scrollTop;
@@ -935,18 +944,17 @@ function EditorPane({
       });
     }
     return () => {
-      snapshot.current = {
-        path: file.path,
-        selection: editor.state.selection,
+      editorSnapshots.current.set(snapshotKey, {
+        state: editor.state,
         scrollTop: editor.scrollDOM.scrollTop,
         scrollLeft: editor.scrollDOM.scrollLeft,
-      };
+      });
       editor.destroy();
       if (editorViews.current.get(file.path) === editor)
         editorViews.current.delete(file.path);
       if (view.current === editor) view.current = null;
     };
-  }, [editorViews, file?.path, group.id, onActivate, onChange, pluginEditorExtensions]);
+  }, [editorViews, editorSnapshots, workspace, file?.path, group.id, onActivate, onChange, pluginEditorExtensions]);
 
   useEffect(() => {
     const editor = view.current;
@@ -984,7 +992,7 @@ function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [compartments.language, file?.path, file?.name, pluginLanguageOverrides, pluginLanguages, pluginGrammarFor, pluginGrammarVersion]);
+  }, [compartments.language, workspace, file?.path, file?.name, pluginEditorExtensions, pluginLanguageOverrides, pluginLanguages, pluginGrammarFor, pluginGrammarVersion]);
 
   useEffect(() => {
     const editor = view.current;
@@ -1053,6 +1061,8 @@ function EditorPane({
     });
   }, [
     compartments.settings,
+    workspace,
+    pluginEditorExtensions,
     file?.path,
     file?.name,
     settings.tabSize,
@@ -1125,7 +1135,7 @@ function EditorPane({
         }),
       ]),
     });
-  }, [compartments.theme, file?.path, theme]);
+  }, [compartments.theme, workspace, pluginEditorExtensions, file?.path, theme]);
 
   useEffect(() => {
     if (!file || !view.current) return;
@@ -1473,6 +1483,18 @@ function App() {
   const [files, setFiles] = useState<DiskFile[]>([]);
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
   const fileContents = useRef(new Map<string, string>());
+  const fileContentVersions = useRef(new Map<string, number>());
+  const fileContentVersion = useRef(0);
+  const dirtyBuffers = useRef(new Set<string>());
+  const workspaceGeneration = useRef(0);
+  const savesInProgress = useRef(new Set<string>());
+  const diskReadRequests = useRef(new Map<string, object>());
+  const cacheFileContent = useCallback((path: string, content: string, dirty = false) => {
+    fileContents.current.set(path, content);
+    fileContentVersions.current.set(path, ++fileContentVersion.current);
+    if (dirty) dirtyBuffers.current.add(path);
+    else dirtyBuffers.current.delete(path);
+  }, []);
   const [groups, setGroups] = useState<EditorGroup[]>([
     { id: 'group-1', activePath: '', tabs: [] },
   ]);
@@ -1493,6 +1515,17 @@ function App() {
   );
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
   const editorViews = useRef(new Map<string, EditorView>());
+  const editorSnapshots = useRef(new Map<string, EditorSnapshot>());
+  useEffect(() => {
+    const retained = new Set(openFiles.map((file) => `${workspace}/${file.path}`));
+    for (const key of editorSnapshots.current.keys())
+      if (!retained.has(key)) editorSnapshots.current.delete(key);
+    const paths = new Set(openFiles.map((file) => file.path));
+    for (const path of fileContentVersions.current.keys())
+      if (!paths.has(path)) fileContentVersions.current.delete(path);
+    for (const path of dirtyBuffers.current)
+      if (!paths.has(path)) dirtyBuffers.current.delete(path);
+  }, [openFiles, workspace]);
   const lastActiveEditorPath = useRef('');
   const [pluginLanguageOverrides, setPluginLanguageOverrides] = useState<
     Record<string, string>
@@ -2045,6 +2078,10 @@ function App() {
             content,
           ]),
         );
+        fileContentVersions.current = new Map(
+          [...fileContentVersions.current].map(([path, version]) => [remap(path), version]),
+        );
+        dirtyBuffers.current = new Set([...dirtyBuffers.current].map(remap));
         lastDiskWrite.current = new Map(
           [...lastDiskWrite.current].map(([path, content]) => [
             remap(path),
@@ -2113,15 +2150,25 @@ function App() {
         (file) => file.path === relativePath,
       );
       if (!open) continue;
+      const generation = workspaceGeneration.current;
+      const version = fileContentVersions.current.get(relativePath);
+      const before = fileContents.current.get(relativePath);
+      const request = {};
+      diskReadRequests.current.set(relativePath, request);
       try {
         const content = await readTextFile(`${root}/${relativePath}`);
+        if (generation !== workspaceGeneration.current || root !== watcherRoot.current ||
+            diskReadRequests.current.get(relativePath) !== request) continue;
+        const currentOpen = openFilesRef.current.find((file) => file.path === relativePath);
+        if (!currentOpen || !fileContents.current.has(relativePath)) continue;
         const lastWritten = lastDiskWrite.current.get(relativePath);
         if (
           lastWritten !== undefined &&
           lastWritten === contentFingerprint(content)
         )
           continue;
-        if (open.dirty) {
+        if (currentOpen.dirty || dirtyBuffers.current.has(relativePath) || fileContentVersions.current.get(relativePath) !== version ||
+            fileContents.current.get(relativePath) !== before || savesInProgress.current.has(relativePath)) {
           setDiskConflicts((current) =>
             current.has(relativePath)
               ? current
@@ -2129,16 +2176,20 @@ function App() {
           );
           continue;
         }
-        fileContents.current.set(relativePath, content);
+        cacheFileContent(relativePath, content);
+        const loadedVersion = fileContentVersions.current.get(relativePath);
         setOpenFiles((current) =>
           current.map((file) =>
             file.path === relativePath
-              ? { ...file, revision: file.revision + 1, dirty: false }
+              ? { ...file, revision: file.revision + 1, dirty: fileContentVersions.current.get(relativePath) !== loadedVersion }
               : file,
           ),
         );
       } catch {
         // The file vanished; the follow-up remove event closes the tab.
+      } finally {
+        if (diskReadRequests.current.get(relativePath) === request)
+          diskReadRequests.current.delete(relativePath);
       }
     }
   };
@@ -2318,7 +2369,7 @@ function App() {
   };
 
   const refreshWorkspace = useCallback(
-    async (rootPath: string) => {
+    async (rootPath: string, apply = true) => {
       const generation = ++scanGeneration.current;
       const collected: DiskFile[] = [];
       const ignored = new Set([
@@ -2398,7 +2449,9 @@ function App() {
           }
         }
       }
-      if (generation === scanGeneration.current) setFiles(collected);
+      if (generation !== scanGeneration.current) return;
+      if (apply) setFiles(collected);
+      return collected;
     },
     [settings.showHiddenFiles],
   );
@@ -2689,12 +2742,24 @@ function App() {
     folderDialogOpen.current = true;
     try {
       const selected = await invoke<string | null>('workspace_pick');
-      if (!selected) return;
+      if (!selected || selected === workspace) return;
       if (!(await requestWorkspaceAccess(selected))) {
         setMessage('Folder access declined.');
         return;
       }
-      await refreshWorkspace(selected);
+      const nextFiles = await refreshWorkspace(selected, false);
+      if (!nextFiles) return;
+      // Decide only after asynchronous permission/scan work has finished, so
+      // edits made while the folder picker was open are included.
+      if (savesInProgress.current.size) {
+        setMessage('Wait for the current save to finish before switching folders.');
+        return;
+      }
+      if (openFilesRef.current.some((file) => file.dirty || dirtyBuffers.current.has(file.path)) &&
+          !window.confirm('Discard unsaved changes and switch folders? Cancel to keep editing or save your files first.')) return;
+      workspaceGeneration.current += 1;
+      watcherRoot.current = '';
+      setFiles(nextFiles);
       localStorage.setItem('arc.lastWorkspace', selected);
       terminals.forEach((terminal) => {
         forgetTerminalOutput(terminal.id);
@@ -2704,6 +2769,8 @@ function App() {
       setWorkspace(selected);
       setOpenFiles([]);
       fileContents.current.clear();
+      fileContentVersions.current.clear();
+      dirtyBuffers.current.clear();
       lastDiskWrite.current.clear();
       allowedHiddenPaths.current.clear();
       setDiskConflicts(new Set());
@@ -2782,7 +2849,7 @@ function App() {
       )
         return;
       const content = await readTextFile(absolutePath);
-      fileContents.current.set(file.path, content);
+      cacheFileContent(file.path, content);
       setOpenFiles((current) => [
         ...current,
         { path: file.path, name: file.name, revision: 0, dirty: false },
@@ -2796,64 +2863,85 @@ function App() {
 
   const saveFile = useCallback(
     async (path: string): Promise<boolean> => {
-      const file = openFiles.find((entry) => entry.path === path);
+      const file = openFilesRef.current.find((entry) => entry.path === path);
       if (!file || !workspace) return false;
-      const currentContent = fileContents.current.get(path) ?? '';
-      let content: string;
-      try {
-        const willSaveContent = await pluginRuntime.applyWillSave(
-          path,
-          currentContent,
-        );
-        content = settings.prettierOnSave
-          ? ((await prettierFormat(file.name, willSaveContent)) ??
-            willSaveContent)
-          : willSaveContent;
-      } catch (error) {
-        setMessage(`Prettier failed; file not saved: ${String(error)}`);
+      if (savesInProgress.current.has(path)) {
+        setMessage('A save is already in progress for this file.');
         return false;
       }
+      savesInProgress.current.add(path);
       try {
-        await writeTextFile(`${workspace}/${file.path}`, content);
-        fileContents.current.set(path, content);
-        lastDiskWrite.current.set(path, contentFingerprint(content));
-        setDiskConflicts((current) => {
-          if (!current.has(path)) return current;
-          const next = new Set(current);
-          next.delete(path);
-          return next;
-        });
-        setOpenFiles((current) =>
-          current.map((entry) =>
-            entry.path === path
-              ? {
-                  ...entry,
-                  revision:
-                    entry.revision + (content === currentContent ? 0 : 1),
-                  dirty: false,
-                }
-              : entry,
-          ),
-        );
-        setMessage('Saved');
-        pluginRuntime.emitEvent('file:saved', { path, content });
-        window.setTimeout(
-          () => setMessage((current) => (current === 'Saved' ? '' : current)),
-          1400,
-        );
-        return true;
-      } catch (error) {
-        setMessage(`Could not save ${file.name}: ${String(error)}`);
-        return false;
+        const generation = workspaceGeneration.current;
+        const version = fileContentVersions.current.get(path);
+        const currentContent = fileContents.current.get(path) ?? '';
+        const bufferUnchanged = () =>
+          generation === workspaceGeneration.current &&
+          fileContents.current.has(path) &&
+          fileContentVersions.current.get(path) === version &&
+          fileContents.current.get(path) === currentContent;
+        let content: string;
+        try {
+          const willSaveContent = await pluginRuntime.applyWillSave(
+            path,
+            currentContent,
+          );
+          content = settings.prettierOnSave
+            ? ((await prettierFormat(file.name, willSaveContent)) ?? willSaveContent)
+            : willSaveContent;
+        } catch (error) {
+          setMessage(`Prettier failed; file not saved: ${String(error)}`);
+          return false;
+        }
+        if (!bufferUnchanged()) {
+          setMessage('File changed while preparing the save. Save again to include your latest edits.');
+          return false;
+        }
+        try {
+          await writeTextFile(`${workspace}/${file.path}`, content);
+          if (generation !== workspaceGeneration.current || !fileContents.current.has(path)) return false;
+          const unchanged = bufferUnchanged();
+          if (unchanged) cacheFileContent(path, content);
+          const savedVersion = fileContentVersions.current.get(path);
+          lastDiskWrite.current.set(path, contentFingerprint(content));
+          setDiskConflicts((current) => {
+            if (!current.has(path)) return current;
+            const next = new Set(current);
+            next.delete(path);
+            return next;
+          });
+          setOpenFiles((current) =>
+            current.map((entry) =>
+              entry.path === path
+                ? {
+                    ...entry,
+                    revision: entry.revision + (unchanged && content !== currentContent ? 1 : 0),
+                    dirty: !unchanged || fileContentVersions.current.get(path) !== savedVersion,
+                  }
+                : entry,
+            ),
+          );
+          setMessage(unchanged ? 'Saved' : 'Saved an earlier version; newer edits remain unsaved.');
+          pluginRuntime.emitEvent('file:saved', { path, content });
+          window.setTimeout(
+            () => setMessage((current) => (current === 'Saved' ? '' : current)),
+            1400,
+          );
+          return unchanged;
+        } catch (error) {
+          setMessage(`Could not save ${file.name}: ${String(error)}`);
+          return false;
+        }
+      } finally {
+        savesInProgress.current.delete(path);
       }
     },
-    [openFiles, settings.prettierOnSave, workspace],
+    [cacheFileContent, settings.prettierOnSave, workspace],
   );
 
   const updateFile = useCallback(
     (path: string, content: string, replace = false) => {
       if (fileContents.current.get(path) === content) return;
-      fileContents.current.set(path, content);
+      cacheFileContent(path, content, true);
       pluginRuntime.emitEvent('editor:changed', { path, content });
       setOpenFiles((current) => {
         const file = current.find((entry) => entry.path === path);
@@ -2869,7 +2957,7 @@ function App() {
         );
       });
     },
-    [],
+    [cacheFileContent],
   );
 
   const formatFile = useCallback(
@@ -2918,7 +3006,7 @@ function App() {
       if (!file) return;
       try {
         const content = await readTextFile(`${workspace}/${path}`);
-        fileContents.current.set(path, content);
+        cacheFileContent(path, content);
         setOpenFiles((current) =>
           current.map((entry) =>
             entry.path === path
@@ -3010,7 +3098,7 @@ function App() {
       });
       await handle.close();
       await refreshWorkspace(workspace);
-      fileContents.current.set(path, '');
+      cacheFileContent(path, '');
       const newFile = { path, name, revision: 0, dirty: false };
       setOpenFiles((current) => [...current, newFile]);
       setSelectedPath(path);
@@ -3260,27 +3348,41 @@ function App() {
     try {
       const trashRoot = await join(await appDataDir(), 'undo-trash');
       await mkdir(trashRoot, { recursive: true });
+      // Unlike undo-trash, recovery backups survive startup cleanup. A failed
+      // recursive delete may have removed part of the original directory.
+      const recoveryRoot = await join(await appDataDir(), 'delete-recovery');
+      await mkdir(recoveryRoot, { recursive: true });
       for (const entry of entries) {
-        const trashedPath = await join(
-          trashRoot,
+        let trashedPath = await join(
+          recoveryRoot,
           `${Date.now()}-${++trashCounter.current}-${entry.name}`,
         );
+        let backupComplete = false;
         try {
           await copyTreeEntry(
             `${workspace}/${entry.path}`,
             trashedPath,
             entry.kind,
           );
+          backupComplete = true;
           await remove(`${workspace}/${entry.path}`, {
             recursive: entry.kind === 'directory',
           });
+          const undoPath = await join(trashRoot, trashedPath.split(/[\\/]/).at(-1)!);
+          try {
+            await rename(trashedPath, undoPath);
+            trashedPath = undoPath;
+          } catch {
+            // The deletion succeeded; keep a usable undo backup even if the
+            // move into the ephemeral trash folder fails.
+          }
           batch.push({ originalPath: entry.path, trashedPath, entry });
         } catch (error) {
-          if (await exists(trashedPath).catch(() => false))
+          if (!backupComplete && await exists(trashedPath).catch(() => false))
             await remove(trashedPath, {
               recursive: entry.kind === 'directory',
             }).catch(() => undefined);
-          failure = `${entry.name}: ${String(error)}`;
+          failure = `${entry.name}: ${String(error)}${backupComplete ? ` Full backup kept at ${trashedPath}` : ''}`;
         }
       }
     } catch (error) {
@@ -4397,6 +4499,7 @@ function App() {
         onConflictKeep={keepBuffer}
         pluginViews={pluginRuntime.panels}
         editorViews={editorViews}
+        editorSnapshots={editorSnapshots}
         pluginLanguages={pluginRuntime.languages}
         pluginLanguageOverrides={pluginLanguageOverrides}
         pluginEditorExtensions={pluginRuntime.editorExtensions}

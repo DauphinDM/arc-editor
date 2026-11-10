@@ -33,6 +33,8 @@ export function activate(api) {
 
 Install the folder from **Plugins → Install from folder**. `activate(api)` runs when plugin enables. Return cleanup function to release plugin resources on disable or uninstall.
 
+The entire folder is installed, including nested text and binary assets. Symbolic links and special files are rejected. Replacements are staged before swapping the installed package, with the previous package retained if rollback fails.
+
 ## Plugin API overview
 
 | API | Purpose |

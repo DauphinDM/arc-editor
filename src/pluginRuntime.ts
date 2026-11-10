@@ -2437,11 +2437,8 @@ export function usePluginRuntime(
     const destination = await join(root, manifest.id);
     if (await exists(destination)) {
       if (!window.confirm(`Replace installed plugin “${manifest.name}”?`)) return;
-      await remove(destination, { recursive: true });
     }
-    await mkdir(destination, { recursive: true });
-    await writeTextFile(await join(destination, "plugin.json"), JSON.stringify(manifest, null, 2));
-    await writeTextFile(await join(destination, manifest.main), source);
+    await installPluginPackage(selected, destination, manifest, source);
     const disabled = readDisabledIds();
     disabled.delete(manifest.id);
     localStorage.setItem(disabledStorageKey, JSON.stringify([...disabled]));
@@ -2543,6 +2540,60 @@ function pluginWorkspacePath(root: string, path: string, allowRoot = false): str
 function parentDirectoryPath(path: string): string {
   const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return index < 0 ? path : path.slice(0, index);
+}
+
+async function copyPluginFolder(source: string, destination: string) {
+  await mkdir(destination, { recursive: true });
+  for (const entry of await readDir(source)) {
+    if (entry.isSymlink) throw new Error(`Plugin symlinks are not supported: ${entry.name}`);
+    const from = await join(source, entry.name);
+    const to = await join(destination, entry.name);
+    if (entry.isDirectory) await copyPluginFolder(from, to);
+    else if (entry.isFile) await copyFile(from, to);
+    else throw new Error(`Unsupported plugin asset: ${entry.name}`);
+  }
+}
+
+async function installPluginPackage(selected: string, destination: string, manifest: PluginManifest, source: string) {
+  const temporary = await join(await appDataDir(), "plugin-installs", crypto.randomUUID());
+  const staged = await join(temporary, "package");
+  const backup = await join(temporary, "previous");
+  // Avoid recursively copying a package into itself when a parent of the
+  // staging directory was selected. join normalizes platform path separators.
+  const sourcePath = (await join(selected)).replace(/\\/g, "/").replace(/\/$/, "");
+  const stagingPath = temporary.replace(/\\/g, "/");
+  const comparable = (path: string) => /^[A-Za-z]:/.test(path) ? path.toLowerCase() : path;
+  if (comparable(stagingPath).startsWith(`${comparable(sourcePath)}/`))
+    throw new Error("Select a plugin folder, not a parent of Arc's staging directory.");
+  let previousMoved = false;
+  let installed = false;
+  try {
+    await copyPluginFolder(selected, staged);
+    await writeTextFile(await join(staged, "plugin.json"), JSON.stringify(manifest, null, 2));
+    await writeTextFile(await join(staged, manifest.main), source);
+    if (await exists(destination)) {
+      await renameFile(destination, backup);
+      previousMoved = true;
+    }
+    try {
+      await renameFile(staged, destination);
+      installed = true;
+    } catch (error) {
+      if (previousMoved) {
+        try {
+          await renameFile(backup, destination);
+          previousMoved = false;
+        } catch {
+          throw new Error(`Plugin installation failed. Previous plugin preserved at ${backup}. ${String(error)}`);
+        }
+      }
+      throw error;
+    }
+  } finally {
+    // Never remove the only remaining copy if rollback itself failed.
+    if (!previousMoved || installed)
+      await remove(temporary, { recursive: true }).catch(() => undefined);
+  }
 }
 
 async function writePluginFiles(folder: string, manifest: PluginManifest, source: string) {
