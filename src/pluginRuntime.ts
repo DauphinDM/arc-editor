@@ -907,10 +907,11 @@ export function usePluginRuntime(
             setPanels((current) => [...current.filter((entry) => entry.id !== panel.id), panel]);
           };
           const registerView = (method: "sidebar" | "bottom" | "customTab") => (definition: PluginPanelDefinition & { icon?: string; order?: number }) => {
-            const panel = { ...definition, id: `${plugin.id}:${definition.id}`, pluginId: plugin.id, pluginName: plugin.name };
-            registerPanel(panel);
-            active.contexts.set(`view:${method}:${panel.id}`, definition);
-            const dispose = () => setPanels((current) => current.filter((entry) => entry.id !== panel.id));
+            const fullId = `${plugin.id}:${definition.id}`;
+            const panelDefinition: PluginPanelDefinition = { id: definition.id, title: definition.title, mount: definition.mount };
+            registerPanel(panelDefinition);
+            active.contexts.set(`view:${method}:${fullId}`, definition);
+            const dispose = () => setPanels((current) => current.filter((entry) => entry.id !== fullId));
             active.disposables.push(dispose);
             return dispose;
           };
@@ -1600,9 +1601,10 @@ export function usePluginRuntime(
               },
               registerContextMenuItem,
               registerMenuItem: (menu, item) => {
-                const id = `${menu}:${item.id}`;
+                const id = `${slugify(menu)}-${item.id}`;
                 registerContextMenuItem({ ...item, id });
-                const dispose = () => setContextMenuItems((current) => current.filter((entry) => entry.id !== `${plugin.id}:${id}`));
+                const fullId = `${plugin.id}:${id}`;
+                const dispose = () => setContextMenuItems((current) => current.filter((entry) => entry.id !== fullId));
                 active.disposables.push(dispose);
                 return dispose;
               },
@@ -3746,6 +3748,63 @@ async function startPluginLanguageServer(
   return server;
 }
 
+type PluginProcessExit = { code: number | null; signal: string | null };
+type PluginProcessSink = {
+  stdout: Set<(chunk: string) => void>;
+  stderr: Set<(chunk: string) => void>;
+  exit: Set<(event: PluginProcessExit) => void>;
+  error: Set<(error: string) => void>;
+  pendingStdout: string[];
+  pendingStderr: string[];
+  pendingExit: PluginProcessExit[];
+  pendingError: string[];
+};
+const pluginProcessSinks = new Map<string, PluginProcessSink>();
+let pluginProcessBusStarted = false;
+
+function pluginProcessSink(id: string): PluginProcessSink {
+  const existing = pluginProcessSinks.get(id);
+  if (existing) return existing;
+  const sink: PluginProcessSink = {
+    stdout: new Set(),
+    stderr: new Set(),
+    exit: new Set(),
+    error: new Set(),
+    pendingStdout: [],
+    pendingStderr: [],
+    pendingExit: [],
+    pendingError: [],
+  };
+  pluginProcessSinks.set(id, sink);
+  return sink;
+}
+
+function ensurePluginProcessBus() {
+  if (pluginProcessBusStarted) return;
+  pluginProcessBusStarted = true;
+  const fail = () => { pluginProcessBusStarted = false; };
+  void listen<{ id: string; stream: string; data: string }>("plugin-process-output", (event) => {
+    const sink = pluginProcessSink(event.payload.id);
+    const listeners = event.payload.stream === "stderr" ? sink.stderr : sink.stdout;
+    if (listeners.size) listeners.forEach((listener) => listener(event.payload.data));
+    else if (event.payload.stream === "stderr") sink.pendingStderr.push(event.payload.data);
+    else sink.pendingStdout.push(event.payload.data);
+  }).catch(fail);
+  void listen<{ id: string; code: number | null; signal: string | null }>("plugin-process-exit", (event) => {
+    const sink = pluginProcessSink(event.payload.id);
+    const exit = { code: event.payload.code, signal: event.payload.signal };
+    if (sink.exit.size) sink.exit.forEach((listener) => listener(exit));
+    else sink.pendingExit.push(exit);
+  }).catch(fail);
+  void listen<{ id: string; error: string }>("plugin-process-error", (event) => {
+    const sink = pluginProcessSink(event.payload.id);
+    if (sink.error.size) sink.error.forEach((listener) => listener(event.payload.error));
+    else sink.pendingError.push(event.payload.error);
+  }).catch(fail);
+}
+
+void ensurePluginProcessBus();
+
 async function spawnPluginProcess(
   invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
   pluginId: string,
@@ -3754,6 +3813,7 @@ async function spawnPluginProcess(
   options?: { cwd?: string; env?: Record<string, string> },
 ): Promise<PluginProcessHandle> {
   if (!executable) throw new Error("An executable is required.");
+  ensurePluginProcessBus();
   const id = await invokeCommand("plugin_process_spawn", {
     pluginId,
     executable,
@@ -3761,25 +3821,28 @@ async function spawnPluginProcess(
     cwd: options?.cwd ?? null,
     env: options?.env ?? null,
   }) as string;
-  const stdoutListeners = new Set<(chunk: string) => void>();
-  const stderrListeners = new Set<(chunk: string) => void>();
-  const exitListeners = new Set<(event: { code: number | null; signal: string | null }) => void>();
-  const errorListeners = new Set<(error: string) => void>();
+  const sink = pluginProcessSink(id);
   let stopped = false;
-  const unlisteners: (() => void)[] = [];
-  void listen<{ id: string; stream: string; data: string }>("plugin-process-output", (event) => {
-    if (event.payload.id !== id) return;
-    const set = event.payload.stream === "stderr" ? stderrListeners : stdoutListeners;
-    set.forEach((listener) => listener(event.payload.data));
-  }).then((stop) => unlisteners.push(stop));
-  void listen<{ id: string; code: number | null; signal: string | null }>("plugin-process-exit", (event) => {
-    if (event.payload.id !== id) return;
-    exitListeners.forEach((listener) => listener({ code: event.payload.code, signal: event.payload.signal }));
-  }).then((stop) => unlisteners.push(stop));
-  void listen<{ id: string; error: string }>("plugin-process-error", (event) => {
-    if (event.payload.id !== id) return;
-    errorListeners.forEach((listener) => listener(event.payload.error));
-  }).then((stop) => unlisteners.push(stop));
+  const replayStdout = (handler: (chunk: string) => void) => {
+    if (!sink.pendingStdout.length) return;
+    const pending = sink.pendingStdout.splice(0);
+    pending.forEach(handler);
+  };
+  const replayStderr = (handler: (chunk: string) => void) => {
+    if (!sink.pendingStderr.length) return;
+    const pending = sink.pendingStderr.splice(0);
+    pending.forEach(handler);
+  };
+  const replayExit = (handler: (event: PluginProcessExit) => void) => {
+    if (!sink.pendingExit.length) return;
+    const pending = sink.pendingExit.splice(0);
+    pending.forEach(handler);
+  };
+  const replayError = (handler: (error: string) => void) => {
+    if (!sink.pendingError.length) return;
+    const pending = sink.pendingError.splice(0);
+    pending.forEach(handler);
+  };
   return {
     id,
     write: async (data) => {
@@ -3787,17 +3850,17 @@ async function spawnPluginProcess(
       await invokeCommand("plugin_process_write", { id, data: text });
     },
     closeStdin: async () => { await invokeCommand("plugin_process_close_stdin", { id }); },
-    onStdout: (handler) => { stdoutListeners.add(handler); return () => stdoutListeners.delete(handler); },
-    onStderr: (handler) => { stderrListeners.add(handler); return () => stderrListeners.delete(handler); },
-    onExit: (handler) => { exitListeners.add(handler); return () => exitListeners.delete(handler); },
-    onError: (handler) => { errorListeners.add(handler); return () => errorListeners.delete(handler); },
+    onStdout: (handler) => { sink.stdout.add(handler); replayStdout(handler); return () => sink.stdout.delete(handler); },
+    onStderr: (handler) => { sink.stderr.add(handler); replayStderr(handler); return () => sink.stderr.delete(handler); },
+    onExit: (handler) => { sink.exit.add(handler); replayExit(handler); return () => sink.exit.delete(handler); },
+    onError: (handler) => { sink.error.add(handler); replayError(handler); return () => sink.error.delete(handler); },
     stop: async (stopOptions) => {
       if (stopped) return;
       stopped = true;
       try {
         await invokeCommand("plugin_process_stop", { id, timeoutMs: stopOptions?.timeoutMs ?? 2000 });
       } finally {
-        unlisteners.forEach((stop) => stop());
+        pluginProcessSinks.delete(id);
       }
     },
   };
@@ -3854,19 +3917,19 @@ async function connectPluginSocket(
   const errorListeners = new Set<(error: string) => void>();
   const closeListeners = new Set<() => void>();
   const unlisteners: (() => void)[] = [];
-  void listen<{ id: string; data: number[] }>("plugin-socket-data", (event) => {
+  unlisteners.push(await listen<{ id: string; data: number[] }>("plugin-socket-data", (event) => {
     if (event.payload.id !== id) return;
     const bytes = new Uint8Array(event.payload.data);
     dataListeners.forEach((listener) => listener(bytes));
-  }).then((stop) => unlisteners.push(stop));
-  void listen<{ id: string; error: string }>("plugin-socket-error", (event) => {
+  }));
+  unlisteners.push(await listen<{ id: string; error: string }>("plugin-socket-error", (event) => {
     if (event.payload.id !== id) return;
     errorListeners.forEach((listener) => listener(event.payload.error));
-  }).then((stop) => unlisteners.push(stop));
-  void listen<{ id: string }>("plugin-socket-close", (event) => {
+  }));
+  unlisteners.push(await listen<{ id: string }>("plugin-socket-close", (event) => {
     if (event.payload.id !== id) return;
     closeListeners.forEach((listener) => listener());
-  }).then((stop) => unlisteners.push(stop));
+  }));
   return {
     write: async (bytes) => { await invokeCommand("plugin_socket_write", { id, data: [...bytes] }); },
     onData: (handler) => { dataListeners.add(handler); return () => dataListeners.delete(handler); },

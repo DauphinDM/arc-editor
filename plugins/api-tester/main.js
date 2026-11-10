@@ -424,12 +424,23 @@ cat`;
     await test("api.terminal open/list/write/resize/close", async () => {
       const id = api.terminal.open();
       expect(id, "terminal did not open");
-      await wait(150);
-      const session = api.terminal.list().find((entry) => entry.id === id);
+      const session = await waitFor(() => api.terminal.list().find((entry) => entry.id === id), 3000, "terminal in list");
       expect(session, "terminal missing from list");
-      await api.terminal.write(id, "printf api-terminal\\n");
-      await api.terminal.resize(id, 80, 24);
-      await api.terminal.close(id);
+      const retry = async (action) => {
+        let lastError = null;
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          try { return await action(); }
+          catch (error) {
+            lastError = error;
+            if (!/not found/i.test(String(error))) throw error;
+            await wait(100);
+          }
+        }
+        throw lastError;
+      };
+      await retry(() => api.terminal.write(id, "printf api-terminal\\n"));
+      await retry(() => api.terminal.resize(id, 80, 24));
+      await retry(() => api.terminal.close(id));
       return `terminal ${id}`;
     });
     await test("api.openTerminal convenience", () => {
@@ -703,6 +714,7 @@ cat`;
     await test("api.editor openAt/setLanguage/save", async () => {
       await api.editor.openAt(file, 1, 1);
       api.editor.setLanguage("markdown", file);
+      await wait(80);
       expect(api.editor.getLanguage(file) === "markdown", "setLanguage failed");
       const saved = await api.editor.save(file);
       expect(saved, "save failed");
@@ -744,9 +756,10 @@ cat`;
     await test("api.editor selection events", async () => {
       events.selection = null;
       events.changed = null;
+      api.editor.insertText("!");
       api.editor.setSelection(0, 1);
       await waitFor(() => events.selection, 2000, "selection event");
-      expect(events.changed, "document changed event missing");
+      await waitFor(() => events.changed, 2000, "document changed event");
       return "selection/context events delivered";
     });
   }
@@ -864,7 +877,7 @@ cat`;
         const tcp = await api.net.connectTcp(address[1], Number(address[2]), { timeoutMs: 3000 });
         let socketData = "";
         tcp.onData((bytes) => { socketData += new TextDecoder().decode(bytes); });
-        await tcp.write(new TextEncoder().encode("GET /tcp HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n"));
+        await tcp.write(new TextEncoder().encode("GET /tcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
         await waitFor(() => socketData.includes("reply:GET:/tcp"), 3000, "tcp data");
         await tcp.close();
         let sse = "";
@@ -1087,7 +1100,7 @@ cat`;
     await test("api.ui action/status update", () => {
       api.ui.updateAction("open", { label: "API Tester (updated)" });
       api.ui.updateAction("open", { label: "API Tester" });
-      api.updateStatusItem("status", { text: "API Tester: testing" });
+      api.ui.updateStatusItem("status", { text: "API Tester: testing" });
       updateStatus();
       return "action and status updates accepted";
     });
