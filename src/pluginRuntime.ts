@@ -7,9 +7,9 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { readText as readClipboardText, writeHtml as writeClipboardHtml, writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
-import { copyFile, exists, mkdir, readDir, readFile, readTextFile, remove, rename as renameFile, stat as statFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import type { Extension } from "@codemirror/state";
-import { Decoration, EditorView as CodeMirrorView, type EditorView, type DecorationSet } from "@codemirror/view";
+import { copyFile, exists, mkdir, open as openFsFile, readDir, readFile, readTextFile, remove, rename as renameFile, stat as statFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import type { Extension, Range } from "@codemirror/state";
+import { Decoration, EditorView as CodeMirrorView, ViewPlugin, WidgetType, keymap, type EditorView, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import { autocompletion, type Completion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { foldService } from "@codemirror/language";
 import { hoverTooltip } from "@codemirror/view";
@@ -166,6 +166,28 @@ export type PluginWorkspaceEdit = {
   documentChanges?: { uri: string; edits: PluginEdit[]; version?: number }[];
 };
 export type PluginLanguageSelector = string | { language?: string; scheme?: string; pattern?: string } | (string | { language?: string; scheme?: string; pattern?: string })[];
+export type PluginConfigurationProperty = {
+  type: string;
+  default?: unknown;
+  description?: string;
+  scope?: "global" | "workspace";
+  enum?: unknown[];
+  minimum?: number;
+  maximum?: number;
+};
+export type PluginConfigurationSchema = {
+  id: string;
+  title?: string;
+  properties: Record<string, PluginConfigurationProperty>;
+};
+export type PluginConfigurationContribution = {
+  id: string;
+  schemaId: string;
+  title: string;
+  properties: Record<string, PluginConfigurationProperty>;
+  pluginId: string;
+  pluginName: string;
+};
 export type PluginLanguageDefinition = {
   id: string;
   name: string;
@@ -184,7 +206,8 @@ export type PluginHoverProvider = {
   provideHover: (context: { path: string; language: string; text: string; offset: number; line: string }) => unknown;
 };
 export type PluginLocationProvider = {
-  provideLocations: (context: { path: string; language: string; text: string; offset: number; word: string }) => unknown;
+  provideLocations: (context: { path: string; language: string; text: string; offset: number; word: string; newName?: string }) => unknown;
+  provideRename?: (context: { path: string; language: string; text: string; offset: number; word: string; newName: string }) => unknown;
 };
 export type PluginRangeProvider = {
   provideRanges: (context: { path: string; language: string; text: string; offset: number }) => unknown;
@@ -219,6 +242,13 @@ export type PluginProcessHandle = {
   onExit: (handler: (event: { code: number | null; signal: string | null }) => void) => () => void;
   onError: (handler: (error: string) => void) => () => void;
   stop: (options?: { timeoutMs?: number }) => Promise<void>;
+};
+export type PluginLanguageServerHandle = PluginProcessHandle & {
+  request: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+  notify: (method: string, params?: unknown) => Promise<void>;
+  onNotification: (handler: (method: string, params: unknown) => void) => () => void;
+  onRequest: (handler: (method: string, params: unknown) => unknown) => () => void;
+  shutdown: () => Promise<void>;
 };
 export type PluginSocketHandle = {
   write: (bytes: Uint8Array) => Promise<void>;
@@ -380,7 +410,7 @@ export type PluginApi = {
     registerFoldingProvider: (selector: PluginLanguageSelector, provider: PluginFoldingProvider) => () => void;
     registerSelectionRangeProvider: (selector: PluginLanguageSelector, provider: PluginRangeProvider) => () => void;
     registerGrammar: (languageId: string, grammar: PluginGrammar) => () => void;
-    startServer: (options: { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; language?: string; initializationOptions?: unknown }) => Promise<PluginProcessHandle>;
+    startServer: (options: { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; language?: string; initializationOptions?: unknown }) => Promise<PluginLanguageServerHandle>;
   };
   diagnostics: { createCollection: (name: string) => PluginDiagnosticsCollection };
   terminal: {
@@ -470,7 +500,7 @@ export type PluginApi = {
     };
   };
   configuration: {
-    register: (schema: { id: string; title?: string; properties: Record<string, { type: string; default?: unknown; description?: string; scope?: "global" | "workspace" }> }) => () => void;
+    register: (schema: PluginConfigurationSchema) => () => void;
     get: <T = unknown>(key: string, fallback?: T) => T;
     update: (key: string, value: unknown, scope?: "global" | "workspace") => void;
     onChanged: (handler: (event: { key: string; value: unknown }) => void) => () => void;
@@ -710,11 +740,15 @@ export function usePluginRuntime(
   const [statusItems, setStatusItems] = useState<PluginStatusItem[]>([]);
   const [panels, setPanels] = useState<PluginPanelContribution[]>([]);
   const [languages, setLanguages] = useState<PluginLanguageContribution[]>([]);
+  const [configurations, setConfigurations] = useState<PluginConfigurationContribution[]>([]);
+  const [grammarVersion, setGrammarVersion] = useState(0);
   const [keybindings, setKeybindings] = useState<PluginKeybinding[]>([]);
   const [iconRegistry, setIconRegistry] = useState<Record<string, string>>({});
   const [pluginDirectory, setPluginDirectory] = useState("");
   const hostActionsRef = useRef(hostActions);
   hostActionsRef.current = hostActions;
+  pluginHostActions = hostActions;
+  pluginNotifier = notify;
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
   activeWorkspace = workspace;
@@ -728,7 +762,7 @@ export function usePluginRuntime(
   const commandRef = useRef(new Map<string, PluginCommand>());
   commandRef.current = new Map(commands.map((command) => [command.id, command]));
   const pluginsChangedListeners = useRef(new Set<() => void>());
-  const configurationListeners = useRef(new Set<(event: { key: string; value: unknown }) => void>());
+  const configurationListeners = useRef(new Map<string, Set<(event: { key: string; value: unknown }) => void>>());
 
   const emitEvent = useCallback((event: string, payload?: unknown) => {
     listeners.current.get(event)?.forEach((listener) => {
@@ -807,6 +841,8 @@ export function usePluginRuntime(
       setStatusItems((current) => current.filter((item) => item.pluginId !== id));
       setPanels((current) => current.filter((panel) => panel.pluginId !== id));
       setLanguages((current) => current.filter((language) => language.pluginId !== id));
+      setConfigurations((current) => current.filter((configuration) => configuration.pluginId !== id));
+      pluginContextValues.delete(id);
       setKeybindings((current) => current.filter((binding) => binding.pluginId !== id));
       pluginLanguageProviders.splice(0, pluginLanguageProviders.length, ...pluginLanguageProviders.filter((provider) => provider.pluginId !== id));
     }
@@ -907,8 +943,14 @@ export function usePluginRuntime(
           const registerGrammar = (languageId: string, grammar: PluginGrammar) => {
             if (!active.active || activeModules.current.get(plugin.id) !== active) return () => undefined;
             if (!languageId.trim() || typeof grammar.load !== "function") throw new Error(`Plugin ${plugin.name} registered an invalid grammar.`);
-            grammars.current.set(languageId, grammar.load());
-            const dispose = () => grammars.current.delete(languageId);
+            const loaded = grammar.load();
+            grammars.current.set(languageId, loaded);
+            setGrammarVersion((version) => version + 1);
+            const dispose = () => {
+              if (grammars.current.get(languageId) !== loaded) return;
+              grammars.current.delete(languageId);
+              setGrammarVersion((version) => version + 1);
+            };
             active.disposables.push(dispose);
             return dispose;
           };
@@ -962,6 +1004,7 @@ export function usePluginRuntime(
               throw error;
             }
           };
+          pluginCommandRunner = runCommand;
           activeLanguageContext = () => {
             const context = hostActionsRef.current.getEditorContext();
             if (!context) return null;
@@ -1200,25 +1243,18 @@ export function usePluginRuntime(
               },
               openWriteStream: async (path) => {
                 const destination = await resolveFilePath(path);
-                const chunks: Uint8Array[] = [];
+                await mkdir(await parentDirectoryPath(destination), { recursive: true });
+                const file = await openFsFile(destination, { write: true, create: true, truncate: true });
                 let closed = false;
                 return {
                   write: async (bytes) => {
                     if (closed) throw new Error("Write stream is closed.");
-                    chunks.push(bytes);
+                    await file.write(bytes);
                   },
                   close: async () => {
                     if (closed) return;
                     closed = true;
-                    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-                    const merged = new Uint8Array(total);
-                    let offset = 0;
-                    for (const chunk of chunks) {
-                      merged.set(chunk, offset);
-                      offset += chunk.length;
-                    }
-                    await mkdir(await parentDirectoryPath(destination), { recursive: true });
-                    await writeFile(destination, merged);
+                    await file.close();
                     await hostActionsRef.current.refreshWorkspace();
                   },
                 };
@@ -1489,10 +1525,9 @@ export function usePluginRuntime(
               registerSelectionRangeProvider: registerProvider("selectionRange"),
               registerGrammar,
               startServer: async (options) => {
-                const process = await spawnPluginProcess(invoke, plugin.id, options.command, options.args ?? [], { cwd: options.cwd ?? workspaceRef.current, env: options.env });
-                active.disposables.push(() => { void process.stop().catch(() => undefined); });
-                await process.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { processId: null, rootUri: options.cwd ? pathToUri(options.cwd) : null, capabilities: {}, initializationOptions: options.initializationOptions ?? null } })}\n`);
-                return process;
+                const server = await startPluginLanguageServer(invoke, plugin.id, options);
+                active.disposables.push(() => { void server.shutdown().catch(() => undefined); });
+                return server;
               },
             },
             diagnostics: { createCollection },
@@ -1552,7 +1587,7 @@ export function usePluginRuntime(
                 active.disposables.push(stop);
                 return stop;
               },
-              getIdleTime: () => 0,
+              getIdleTime: () => pluginIdleTime(),
             },
             ui: {
               notify,
@@ -1589,26 +1624,62 @@ export function usePluginRuntime(
                     const list = document.createElement("div");
                     list.className = "arc-plugin-tree";
                     container.replaceChildren(list);
-                    const render = async (parent: HTMLElement, element?: unknown) => {
-                      parent.replaceChildren();
+                    const renderChildren = async (parent: HTMLElement, element: unknown, depth: number) => {
                       const children = await options.getChildren(element);
                       for (const child of children) {
-                        const node = child as { label?: string; name?: string; children?: boolean; element?: unknown };
+                        const node = child as { label?: string; name?: string; description?: string; children?: boolean; collapsible?: boolean; expanded?: boolean; element?: unknown; icon?: string; actions?: { label: string; run: () => unknown }[] };
+                        const row = document.createElement("div");
+                        row.className = "arc-plugin-tree-row";
+                        row.style.paddingLeft = `${depth * 12}px`;
                         const button = document.createElement("button");
                         button.type = "button";
                         button.className = "arc-plugin-tree-item";
-                        button.textContent = node.label ?? node.name ?? String(node);
-                        button.addEventListener("click", () => options.onSelect?.(node.element ?? child));
-                        if (node.children) button.addEventListener("dblclick", () => void render(parent, node.element ?? child));
-                        parent.append(button);
+                        const expandable = Boolean(node.children || node.collapsible);
+                        const marker = document.createElement("span");
+                        marker.className = "arc-plugin-tree-marker";
+                        marker.textContent = expandable ? "▸" : "";
+                        const icon = document.createElement("span");
+                        icon.className = "arc-plugin-tree-icon";
+                        icon.textContent = node.icon ?? "";
+                        const label = document.createElement("span");
+                        label.textContent = node.label ?? node.name ?? String(node);
+                        const description = document.createElement("small");
+                        description.textContent = node.description ?? "";
+                        button.append(marker, icon, label, description);
+                        const childHost = document.createElement("div");
+                        childHost.className = "arc-plugin-tree-children";
+                        let expanded = false;
+                        const toggle = async () => {
+                          expanded = !expanded;
+                          marker.textContent = expanded ? "▾" : "▸";
+                          if (expanded) await renderChildren(childHost, node.element ?? child, depth + 1);
+                          else childHost.replaceChildren();
+                        };
+                        button.addEventListener("click", () => {
+                          options.onSelect?.(node.element ?? child);
+                          if (expandable) void toggle();
+                        });
+                        row.append(button);
+                        for (const action of node.actions ?? []) {
+                          const actionButton = document.createElement("button");
+                          actionButton.type = "button";
+                          actionButton.className = "arc-plugin-tree-action";
+                          actionButton.textContent = action.label;
+                          actionButton.addEventListener("click", (event) => { event.stopPropagation(); void action.run(); });
+                          row.append(actionButton);
+                        }
+                        parent.append(row, childHost);
+                        if (node.expanded && expandable) void toggle();
                       }
                     };
-                    void render(list);
+                    void renderChildren(list, undefined, 0);
                     return () => container.replaceChildren();
                   },
                 });
                 active.contexts.set(`tree:${id}`, options);
-                return () => setPanels((current) => current.filter((panel) => panel.id !== id));
+                const dispose = () => setPanels((current) => current.filter((panel) => panel.id !== id));
+                active.disposables.push(dispose);
+                return dispose;
               },
               registerCustomTab: (options) => registerView("customTab")(options),
               setViewBadge: (viewId, badge) => {
@@ -1637,6 +1708,7 @@ export function usePluginRuntime(
               createOutputChannel: makeOutputChannel,
               setContext: (key, value) => {
                 active.contexts.set(key, value);
+                setPluginContextValue(plugin.id, key, value);
                 emitEvent("context:changed", { key, value });
               },
               focusView: (id) => hostActionsRef.current.openPluginPanel(id.includes(":") ? id : `${plugin.id}:${id}`),
@@ -1672,7 +1744,8 @@ export function usePluginRuntime(
                 return dispose;
               },
               unregister: (commandId, shortcut) => {
-                setKeybindings((current) => current.filter((entry) => !(entry.commandId === commandId && entry.shortcut === shortcut)));
+                const fullId = commandId.includes(":") ? commandId : `${plugin.id}:${commandId}`;
+                setKeybindings((current) => current.filter((entry) => !(entry.pluginId === plugin.id && entry.commandId === fullId && entry.shortcut === shortcut)));
               },
             },
             events: {
@@ -1703,8 +1776,23 @@ export function usePluginRuntime(
             },
             configuration: {
               register: (schema) => {
-                configurationStore.set(`${plugin.id}:${schema.id}`, { schema: schema as unknown as Record<string, unknown>, properties: schema.properties });
-                const dispose = () => configurationStore.delete(`${plugin.id}:${schema.id}`);
+                if (!active.active || activeModules.current.get(plugin.id) !== active) return () => undefined;
+                validateId(schema.id);
+                if (!schema.properties || typeof schema.properties !== "object") throw new Error(`Plugin ${plugin.name} registered an invalid configuration schema.`);
+                const contribution: PluginConfigurationContribution = {
+                  id: `${plugin.id}:${schema.id}`,
+                  schemaId: schema.id,
+                  title: schema.title?.trim() || schema.id,
+                  properties: schema.properties,
+                  pluginId: plugin.id,
+                  pluginName: plugin.name,
+                };
+                configurationStore.set(contribution.id, { schema: schema as unknown as Record<string, unknown>, properties: schema.properties });
+                setConfigurations((current) => [...current.filter((entry) => entry.id !== contribution.id), contribution]);
+                const dispose = () => {
+                  configurationStore.delete(contribution.id);
+                  setConfigurations((current) => current.filter((entry) => entry.id !== contribution.id));
+                };
                 active.disposables.push(dispose);
                 return dispose;
               },
@@ -1715,26 +1803,57 @@ export function usePluginRuntime(
               update: (key, value, scope) => {
                 const storageKey = configurationStorageKey(plugin.id, key, scope);
                 localStorage.setItem(storageKey, JSON.stringify(value));
-                configurationListeners.current.forEach((listener) => listener({ key, value }));
+                configurationListeners.current.get(plugin.id)?.forEach((listener) => listener({ key, value }));
               },
               onChanged: (handler) => {
-                configurationListeners.current.add(handler);
-                const dispose = () => configurationListeners.current.delete(handler);
+                const pluginListeners = configurationListeners.current.get(plugin.id) ?? new Set();
+                pluginListeners.add(handler);
+                configurationListeners.current.set(plugin.id, pluginListeners);
+                const dispose = () => {
+                  pluginListeners.delete(handler);
+                  if (!pluginListeners.size) configurationListeners.current.delete(plugin.id);
+                };
                 active.disposables.push(dispose);
                 return dispose;
               },
             },
             secrets: {
               get: async (key) => {
+                const legacyKey = scopedStorageKey(`secret.${key}`);
+                const legacy = (() => {
+                  try {
+                    const value = localStorage.getItem(legacyKey);
+                    return value === null ? null : atob(value);
+                  } catch {
+                    return null;
+                  }
+                })();
+                let stored: string | null;
                 try {
-                  const value = localStorage.getItem(scopedStorageKey(`secret.${key}`));
-                  return value === null ? null : atob(value);
-                } catch {
-                  return null;
+                  stored = await invoke<string | null>("plugin_secret_get", { pluginId: plugin.id, key });
+                } catch (error) {
+                  if (legacy !== null) return legacy;
+                  throw error;
                 }
+                if (stored !== null) {
+                  if (legacy !== null) localStorage.removeItem(legacyKey);
+                  return stored;
+                }
+                if (legacy === null) return null;
+                try {
+                  await invoke("plugin_secret_set", { pluginId: plugin.id, key, value: legacy });
+                  localStorage.removeItem(legacyKey);
+                } catch { /* Keep the legacy value readable if the OS store is unavailable. */ }
+                return legacy;
               },
-              set: async (key, value) => localStorage.setItem(scopedStorageKey(`secret.${key}`), btoa(value)),
-              delete: async (key) => localStorage.removeItem(scopedStorageKey(`secret.${key}`)),
+              set: async (key, value) => {
+                await invoke("plugin_secret_set", { pluginId: plugin.id, key, value });
+                localStorage.removeItem(scopedStorageKey(`secret.${key}`));
+              },
+              delete: async (key) => {
+                await invoke("plugin_secret_delete", { pluginId: plugin.id, key });
+                localStorage.removeItem(scopedStorageKey(`secret.${key}`));
+              },
             },
             workspaceFolders: {
               get: async () => hostActionsRef.current.getWorkspaceFolders(),
@@ -2007,28 +2126,63 @@ export function usePluginRuntime(
             },
             debug: {
               registerAdapter: (type, factory) => {
+                if (!type.trim()) throw new Error("A debug adapter type is required.");
                 debugAdapters.set(`${plugin.id}:${type}`, factory);
                 const dispose = () => debugAdapters.delete(`${plugin.id}:${type}`);
                 active.disposables.push(dispose);
                 return dispose;
               },
               start: async (configuration) => {
+                const config = (configuration ?? {}) as { type?: string };
+                if (!config.type) throw new Error("Debug configuration requires a type.");
+                const factory = debugAdapters.get(`${plugin.id}:${config.type}`);
+                if (!factory) throw new Error(`No debug adapter registered for type: ${config.type}`);
                 const id = `debug-${Date.now()}-${++debugCounter}`;
-                activeDebugSession = { id, configuration, pluginId: plugin.id };
-                emitEvent("debug:session-changed", activeDebugSession);
+                const adapter = typeof factory === "function" ? await factory(configuration) : factory;
+                const candidate = (adapter ?? {}) as { start?: (configuration: unknown) => unknown; stop?: () => unknown; command?: string; executable?: string; args?: string[]; cwd?: string; env?: Record<string, string> };
+                let stop: () => Promise<void> = async () => undefined;
+                if (typeof candidate.start === "function") {
+                  await candidate.start(configuration);
+                  if (typeof candidate.stop === "function") stop = async () => { await candidate.stop?.(); };
+                } else if (candidate.command || candidate.executable) {
+                  const process = await spawnPluginProcess(invoke, plugin.id, candidate.executable ?? candidate.command ?? "", candidate.args ?? [], { cwd: candidate.cwd ?? workspaceRef.current, env: candidate.env });
+                  const sendDap = async (message: unknown) => {
+                    const body = JSON.stringify(message);
+                    await process.write(`Content-Length: ${new TextEncoder().encode(body).length}\r\n\r\n${body}`);
+                  };
+                  await sendDap({ seq: 1, type: "request", command: "initialize", arguments: { adapterID: config.type, clientID: "arc", linesStartAt1: true, columnsStartAt1: true, pathFormat: "path" } });
+                  await sendDap({ seq: 2, type: "request", command: (configuration as { request?: string }).request === "attach" ? "attach" : "launch", arguments: configuration });
+                  process.onExit(() => {
+                    if (activeDebugSession?.id === id) {
+                      activeDebugSession = null;
+                      emitEvent("debug:session-changed", null);
+                    }
+                  });
+                  process.onStderr((chunk) => emitEvent("debug:output", { id, output: chunk, category: "stderr" }));
+                  stop = () => process.stop();
+                }
+                activeDebugSession = { id, configuration, pluginId: plugin.id, stop };
+                emitEvent("debug:session-changed", { id, configuration, pluginId: plugin.id });
                 return {
                   id,
                   stop: async () => {
-                    if (activeDebugSession?.id === id) activeDebugSession = null;
-                    emitEvent("debug:session-changed", null);
+                    await stop();
+                    if (activeDebugSession?.id === id) {
+                      activeDebugSession = null;
+                      emitEvent("debug:session-changed", null);
+                    }
                   },
                 };
               },
               stop: async (sessionId) => {
-                if (activeDebugSession?.id === sessionId) activeDebugSession = null;
-                emitEvent("debug:session-changed", null);
+                const session = activeDebugSession?.id === sessionId ? activeDebugSession : null;
+                await session?.stop?.();
+                if (activeDebugSession?.id === sessionId) {
+                  activeDebugSession = null;
+                  emitEvent("debug:session-changed", null);
+                }
               },
-              getActiveSession: () => activeDebugSession,
+              getActiveSession: () => activeDebugSession ? { id: activeDebugSession.id, configuration: activeDebugSession.configuration, pluginId: activeDebugSession.pluginId } : null,
               onSessionChanged: (handler) => subscribeRawEvent("debug:session-changed", handler as (payload: unknown) => void, active),
             },
             auth: {
@@ -2104,7 +2258,10 @@ export function usePluginRuntime(
               },
               listTools: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "tools/list", options ?? {}),
               callTool: (serverId, name, args, options) => withTimeout(mcpRequest(resolveKey(plugin.id, serverId), "tools/call", { name, arguments: args ?? {} }), options?.timeoutMs ?? 60_000),
-              onToolsChanged: (_serverId, handler) => subscribeMcp("tools", handler as (payload: unknown) => void, active),
+              onToolsChanged: (serverId, handler) => {
+                const key = resolveKey(plugin.id, serverId);
+                return subscribeMcp("tools", (payload) => { if ((payload as { id?: string })?.id === key) handler(); }, active);
+              },
               listResources: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "resources/list", options ?? {}),
               listResourceTemplates: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "resources/templates/list", options ?? {}),
               readResource: (serverId, uri) => mcpRequest(resolveKey(plugin.id, serverId), "resources/read", { uri }),
@@ -2122,26 +2279,68 @@ export function usePluginRuntime(
                 active.disposables.push(dispose);
                 return dispose;
               },
-              onResourcesChanged: (_serverId, handler) => subscribeMcp("resources", handler as (payload: unknown) => void, active),
+              onResourcesChanged: (serverId, handler) => {
+                const key = resolveKey(plugin.id, serverId);
+                return subscribeMcp("resources", (payload) => { if ((payload as { id?: string })?.id === key) handler(); }, active);
+              },
               listPrompts: (serverId, options) => mcpRequest(resolveKey(plugin.id, serverId), "prompts/list", options ?? {}),
               getPrompt: (serverId, name, args) => mcpRequest(resolveKey(plugin.id, serverId), "prompts/get", { name, arguments: args ?? {} }),
-              onPromptsChanged: (_serverId, handler) => subscribeMcp("prompts", handler as (payload: unknown) => void, active),
+              onPromptsChanged: (serverId, handler) => {
+                const key = resolveKey(plugin.id, serverId);
+                return subscribeMcp("prompts", (payload) => { if ((payload as { id?: string })?.id === key) handler(); }, active);
+              },
               complete: (serverId, reference, argument) => mcpRequest(resolveKey(plugin.id, serverId), "completion/complete", { ref: reference, argument }),
               setRoots: async (serverId, roots) => {
-                const entry = mcpServers.get(resolveKey(plugin.id, serverId));
+                const key = resolveKey(plugin.id, serverId);
+                const entry = mcpServers.get(key);
                 if (!entry?.client) throw new Error("MCP server is not connected.");
-                await entry.client.notify("notifications/roots/list_changed", { roots });
+                mcpRoots.set(key, roots);
+                await entry.client.notify("notifications/roots/list_changed");
               },
-              onSamplingRequest: (handler) => { mcpHostHandlers.sampling.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.sampling.delete(handler as (payload: unknown) => unknown); },
-              onElicitationRequest: (handler) => { mcpHostHandlers.elicitation.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.elicitation.delete(handler as (payload: unknown) => unknown); },
-              onAuthorizationRequired: (handler) => { mcpHostHandlers.authorization.add(handler as (payload: unknown) => unknown); return () => mcpHostHandlers.authorization.delete(handler as (payload: unknown) => unknown); },
+              onSamplingRequest: (handler) => {
+                const listener = handler as (payload: unknown) => unknown;
+                mcpHostHandlers.sampling.add(listener);
+                const dispose = () => { mcpHostHandlers.sampling.delete(listener); };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onElicitationRequest: (handler) => {
+                const listener = handler as (payload: unknown) => unknown;
+                mcpHostHandlers.elicitation.add(listener);
+                const dispose = () => { mcpHostHandlers.elicitation.delete(listener); };
+                active.disposables.push(dispose);
+                return dispose;
+              },
+              onAuthorizationRequired: (handler) => {
+                const listener = handler as (payload: unknown) => unknown;
+                mcpHostHandlers.authorization.add(listener);
+                const dispose = () => { mcpHostHandlers.authorization.delete(listener); };
+                active.disposables.push(dispose);
+                return dispose;
+              },
               exposeTool: (definition, handler) => exposeMcp("tool", definition, handler, plugin.id, active),
               exposeResource: (definition, handler) => exposeMcp("resource", definition, handler, plugin.id, active),
               exposeResourceTemplate: (definition, handler) => exposeMcp("resourceTemplate", definition, handler, plugin.id, active),
               exposePrompt: (definition, handler) => exposeMcp("prompt", definition, handler, plugin.id, active),
-              notifyResourceChanged: (uri) => emitEvent("mcp:resource-changed", { uri }),
-              getExposure: () => ({ tools: [...mcpExposures.values()].filter((entry) => entry.pluginId === plugin.id && entry.kind === "tool").map(({ definition }) => definition) }),
-              onExposureChanged: (handler) => subscribeRawEvent("mcp:exposure-changed", () => handler(), active),
+              notifyResourceChanged: (uri) => {
+                emitEvent("mcp:resource-changed", { uri });
+                emitMcpEvent("exposure-changed", { pluginId: plugin.id, uri });
+              },
+              getExposure: () => {
+                void ensureArcMcpServer();
+                const own = [...mcpExposures.values()].filter((entry) => entry.pluginId === plugin.id);
+                return {
+                  tools: own.filter((entry) => entry.kind === "tool").map(({ definition }) => definition),
+                  resources: own.filter((entry) => entry.kind === "resource").map(({ definition }) => definition),
+                  resourceTemplates: own.filter((entry) => entry.kind === "resourceTemplate").map(({ definition }) => definition),
+                  prompts: own.filter((entry) => entry.kind === "prompt").map(({ definition }) => definition),
+                  serverUrl: arcMcpServerUrl,
+                  authorization: arcMcpServerUrl ? `Bearer ${arcMcpToken}` : null,
+                };
+              },
+              onExposureChanged: (handler) => subscribeMcp("exposure-changed", (payload) => {
+                if (!payload || (payload as { pluginId?: string }).pluginId === plugin.id) handler();
+              }, active),
             },
             localServer: {
               start: (root, entry = "") => invoke<{ root: string; url: string }>("plugin_local_server_start", { pluginId: plugin.id, root, entry }),
@@ -2277,6 +2476,18 @@ export function usePluginRuntime(
     localStorage.setItem(disabledStorageKey, JSON.stringify([...disabled]));
   }, []);
 
+  const getGrammar = useCallback((languageId: string) => grammars.current.get(languageId), []);
+
+  const getConfiguration = useCallback((pluginId: string, key: string, fallback?: unknown): unknown => {
+    const value = getConfigurationValue(pluginId, key);
+    return value === undefined ? fallback : value;
+  }, []);
+
+  const updateConfiguration = useCallback((pluginId: string, key: string, value: unknown, scope?: "global" | "workspace") => {
+    localStorage.setItem(configurationStorageKey(pluginId, key, scope), JSON.stringify(value));
+    configurationListeners.current.get(pluginId)?.forEach((listener) => listener({ key, value }));
+  }, []);
+
   return {
     plugins,
     actions,
@@ -2285,6 +2496,21 @@ export function usePluginRuntime(
     statusItems,
     panels,
     languages,
+    configurations,
+    getConfiguration,
+    updateConfiguration,
+    grammarVersion,
+    getGrammar,
+    conditionMatches: pluginConditionMatches,
+    languageCommands: {
+      goToDefinition: pluginGoToDefinition,
+      findReferences: pluginFindReferences,
+      renameSymbol: pluginRenameSymbol,
+      documentSymbols: pluginDocumentSymbols,
+      workspaceSymbols: pluginWorkspaceSymbols,
+      codeActions: pluginCodeActions,
+      signatureHelp: pluginSignatureHelp,
+    },
     keybindings,
     icons: iconRegistry,
     editorExtensions: pluginEditorExtensions,
@@ -2361,12 +2587,43 @@ const contentProviders = new Map<string, { read: (uri: string) => string | Promi
 const customEditors = new Map<string, { mount: (container: HTMLElement, context: { path: string; read: () => Promise<string> }) => void | (() => void) }>();
 const decorationTypes = new Map<string, { className?: string; style?: string; gutter?: boolean }>();
 const pluginLanguageProviders: PluginLanguageProviderEntry[] = [];
+const pluginContextValues = new Map<string, Map<string, unknown>>();
+
+function setPluginContextValue(pluginId: string, key: string, value: unknown) {
+  const values = pluginContextValues.get(pluginId) ?? new Map<string, unknown>();
+  values.set(key, value);
+  pluginContextValues.set(pluginId, values);
+}
+
+function pluginConditionMatches(pluginId: string, condition?: string): boolean {
+  if (!condition) return true;
+  const values = pluginContextValues.get(pluginId);
+  const evaluate = (expression: string): boolean => {
+    const trimmed = expression.trim();
+    if (!trimmed) return true;
+    if (trimmed.includes("||")) return trimmed.split("||").some(evaluate);
+    if (trimmed.includes("&&")) return trimmed.split("&&").every(evaluate);
+    const negated = trimmed.startsWith("!");
+    const body = negated ? trimmed.slice(1).trim() : trimmed;
+    let result: boolean;
+    const comparison = /^([\w.\-]+)\s*(==|!=)\s*(.+)$/.exec(body);
+    if (comparison) {
+      const actual = values?.get(comparison[1]);
+      const expected = comparison[3].replace(/^['"]|['"]$/g, "");
+      result = comparison[2] === "==" ? String(actual ?? "") === expected : String(actual ?? "") !== expected;
+    } else {
+      result = Boolean(values?.get(body));
+    }
+    return negated ? !result : result;
+  };
+  try { return evaluate(condition); } catch { return false; }
+}
 let decorationCounter = 0;
 let willSaveCounter = 0;
 let taskCounter = 0;
 let debugCounter = 0;
 let linkCounter = 0;
-let activeDebugSession: { id: string; configuration: unknown; pluginId: string } | null = null;
+let activeDebugSession: { id: string; configuration: unknown; pluginId: string; stop?: () => Promise<void> } | null = null;
 const taskProviders = new Map<string, { pluginId: string; provider: { provideTasks: () => unknown[] | Promise<unknown[]>; resolveTask?: (task: unknown) => unknown } }>();
 const debugAdapters = new Map<string, unknown>();
 const authProviders = new Map<string, { getSessions?: (scopes: string[]) => unknown; createSession?: (scopes: string[]) => unknown; removeSession?: (sessionId: string) => unknown }>();
@@ -2431,6 +2688,384 @@ function pluginProviders(kind: PluginLanguageProviderKind, context: PluginLangua
     .map((entry) => entry.provider);
 }
 
+
+let pluginHostActions: PluginHostActions | null = null;
+let pluginNotifier: ((message: string) => void) | null = null;
+function pluginNotify(message: string) { pluginNotifier?.(message); }
+let pluginCommandRunner: ((id: string) => Promise<void>) | null = null;
+
+type PluginLocationLike = {
+  path?: string;
+  uri?: string;
+  from?: number;
+  to?: number;
+  line?: number;
+  column?: number;
+  name?: string;
+  label?: string;
+  range?: { from?: number; to?: number; start?: { line?: number; character?: number }; end?: { line?: number; character?: number } };
+  selectionRange?: { from?: number; to?: number; start?: { line?: number; character?: number } };
+};
+
+function pluginPathFromLocation(location: PluginLocationLike): string | null {
+  if (typeof location.path === "string" && location.path) return location.path;
+  if (typeof location.uri === "string" && location.uri) return uriToPath(location.uri);
+  return null;
+}
+
+function normalizeLocation(value: PluginLocationLike): PluginLocationLike | null {
+  if (!value || typeof value !== "object") return null;
+  const path = pluginPathFromLocation(value);
+  if (!path) return null;
+  const range = value.range;
+  const from = value.from ?? range?.from;
+  const to = value.to ?? range?.to;
+  const line = value.line ?? range?.start?.line;
+  const column = value.column ?? range?.start?.character;
+  return { ...value, path, from, to, line: line === undefined ? undefined : line + 1, column: column === undefined ? undefined : column + 1 };
+}
+
+function normalizeLocationList(value: unknown): PluginLocationLike[] {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+  return values.map((entry) => normalizeLocation(entry as PluginLocationLike)).filter((entry): entry is PluginLocationLike => Boolean(entry));
+}
+
+async function waitForPluginEditor(path: string, attempts = 30): Promise<EditorView | null> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const editor = pluginHostActions?.getEditor(path);
+    if (editor) return editor;
+    await new Promise((resolve) => window.setTimeout(resolve, 25));
+  }
+  return null;
+}
+
+async function openPluginLocation(location: PluginLocationLike): Promise<boolean> {
+  if (!pluginHostActions) return false;
+  const path = pluginPathFromLocation(location);
+  if (!path) return false;
+  await pluginHostActions.openFile(path);
+  const editor = await waitForPluginEditor(path);
+  if (!editor) return false;
+  let offset = location.from;
+  if (offset === undefined && location.line !== undefined) {
+    const line = editor.state.doc.line(Math.max(1, Math.min(location.line, editor.state.doc.lines)));
+    offset = Math.min(line.to, line.from + Math.max(0, (location.column ?? 1) - 1));
+  }
+  if (offset !== undefined) {
+    const anchor = Math.max(0, Math.min(offset, editor.state.doc.length));
+    const head = location.to === undefined ? anchor : Math.max(anchor, Math.min(location.to, editor.state.doc.length));
+    editor.dispatch({ selection: { anchor, head }, effects: CodeMirrorView.scrollIntoView(anchor, { y: "center" }) });
+    editor.focus();
+  }
+  return true;
+}
+
+function pluginProviderContext(): PluginLanguageContext | null {
+  return activeLanguageContext();
+}
+
+function locationLabel(location: PluginLocationLike): string {
+  const name = location.name ?? location.label ?? pluginPathFromLocation(location) ?? "Location";
+  if (location.line !== undefined) return `${name} — line ${location.line}${location.column ? `:${location.column}` : ""}`;
+  if (location.from !== undefined) return `${name} — offset ${location.from}`;
+  return name;
+}
+
+async function pluginLanguageLocations(kind: "definition" | "reference"): Promise<PluginLocationLike[]> {
+  const context = pluginProviderContext();
+  if (!context) return [];
+  const locations: PluginLocationLike[] = [];
+  for (const provider of pluginProviders(kind, context) as PluginLocationProvider[]) {
+    try {
+      const result = await provider.provideLocations({ path: context.path, language: context.language, text: context.text, offset: context.offset, word: context.word });
+      locations.push(...normalizeLocationList(result));
+    } catch (error) {
+      pluginNotify(`Plugin ${kind} provider failed: ${String(error)}`);
+    }
+  }
+  return locations;
+}
+
+export async function pluginGoToDefinition(): Promise<void> {
+  const locations = await pluginLanguageLocations("definition");
+  if (!locations.length) return;
+  await openPluginLocation(locations[0]);
+}
+
+export async function pluginFindReferences(): Promise<void> {
+  const locations = await pluginLanguageLocations("reference");
+  if (!locations.length) return;
+  const picked = await showQuickPickModal(
+    locations.map((location) => ({ label: locationLabel(location), value: location })),
+    { placeHolder: `${locations.length} reference${locations.length === 1 ? "" : "s"}` },
+  );
+  if (picked) await openPluginLocation(picked as PluginLocationLike);
+}
+
+function normalizeWorkspaceEdit(value: unknown): { path: string; edits: { from: number; to?: number; text: string }[] }[] {
+  if (!value || typeof value !== "object") return [];
+  const edit = value as { changes?: Record<string, unknown[]>; documentChanges?: { uri?: string; path?: string; textDocument?: { uri?: string }; edits?: unknown[] }[] };
+  const entries: { path: string; edits: { from: number; to?: number; text: string }[] }[] = [];
+  const parseEdits = (items: unknown[]) => items.map((item) => {
+    const entry = item as { range?: { from?: number; to?: number }; from?: number; to?: number; text?: string; newText?: string; insert?: string };
+    return { from: entry.range?.from ?? entry.from ?? 0, to: entry.range?.to ?? entry.to, text: entry.text ?? entry.newText ?? entry.insert ?? "" };
+  }).filter((entry) => Number.isFinite(entry.from));
+  if (edit.changes) for (const [path, edits] of Object.entries(edit.changes)) entries.push({ path, edits: parseEdits(edits) });
+  if (edit.documentChanges) for (const change of edit.documentChanges) {
+    const path = change.path ?? change.textDocument?.uri ?? change.uri;
+    if (path) entries.push({ path: uriToPath(path), edits: parseEdits(change.edits ?? []) });
+  }
+  return entries;
+}
+
+async function applyPluginWorkspaceEdit(value: unknown): Promise<boolean> {
+  const entries = normalizeWorkspaceEdit(value);
+  if (!entries.length || !pluginHostActions) return false;
+  for (const entry of entries) {
+    let editor = pluginHostActions.getEditor(entry.path);
+    if (!editor) {
+      await pluginHostActions.openFile(entry.path);
+      editor = await waitForPluginEditor(entry.path);
+    }
+    if (!editor) continue;
+    const changes = [...entry.edits].sort((left, right) => right.from - left.from).map((edit) => ({ from: edit.from, to: edit.to ?? edit.from, insert: edit.text }));
+    editor.dispatch({ changes });
+  }
+  return true;
+}
+
+export async function pluginRenameSymbol(): Promise<void> {
+  const context = pluginProviderContext();
+  if (!context) return;
+  const providers = pluginProviders("rename", context) as PluginLocationProvider[];
+  if (!providers.length) return;
+  const nextName = await showInputBoxModal({ prompt: "New name", value: context.word, placeHolder: "Enter the new symbol name" });
+  if (!nextName || nextName === context.word) return;
+  for (const provider of providers) {
+    try {
+      const result = provider.provideRename
+        ? await provider.provideRename({ path: context.path, language: context.language, text: context.text, offset: context.offset, word: context.word, newName: nextName })
+        : await provider.provideLocations({ path: context.path, language: context.language, text: context.text, offset: context.offset, word: context.word, newName: nextName });
+      if (await applyPluginWorkspaceEdit(result)) return;
+      const locations = normalizeLocationList(result);
+      if (locations.length && pluginHostActions) {
+        for (const location of locations) {
+          const path = pluginPathFromLocation(location);
+          if (!path) continue;
+          let editor = pluginHostActions.getEditor(path);
+          if (!editor) {
+            await pluginHostActions.openFile(path);
+            editor = await waitForPluginEditor(path);
+          }
+          if (!editor) continue;
+          let from = location.from;
+          let to = location.to;
+          if (from === undefined && location.line !== undefined) {
+            const line = editor.state.doc.line(Math.max(1, Math.min(location.line, editor.state.doc.lines)));
+            from = Math.min(line.to, line.from + Math.max(0, (location.column ?? 1) - 1));
+            to = from + context.word.length;
+          }
+          if (from === undefined) continue;
+          editor.dispatch({ changes: { from, to: to ?? from, insert: nextName } });
+        }
+        return;
+      }
+    } catch (error) {
+      pluginNotify(`Plugin rename provider failed: ${String(error)}`);
+    }
+  }
+}
+
+export async function pluginDocumentSymbols(): Promise<void> {
+  const context = pluginProviderContext();
+  if (!context) return;
+  const symbols: PluginLocationLike[] = [];
+  for (const provider of pluginProviders("documentSymbol", context) as PluginRangeProvider[]) {
+    try {
+      const result = await provider.provideRanges({ path: context.path, language: context.language, text: context.text, offset: context.offset });
+      const values = Array.isArray(result) ? result : result == null ? [] : [result];
+      for (const value of values) {
+        const entry = value as PluginLocationLike & { children?: unknown[] };
+        const location = normalizeLocation({ ...entry, path: context.path });
+        if (location) symbols.push(location);
+        if (Array.isArray(entry.children)) for (const child of entry.children) {
+          const childLocation = normalizeLocation({ ...(child as PluginLocationLike), path: context.path });
+          if (childLocation) symbols.push(childLocation);
+        }
+      }
+    } catch (error) {
+      pluginNotify(`Plugin symbol provider failed: ${String(error)}`);
+    }
+  }
+  if (!symbols.length) return;
+  const picked = await showQuickPickModal(symbols.map((symbol) => ({ label: locationLabel(symbol), value: symbol })), { placeHolder: "Go to symbol" });
+  if (picked) await openPluginLocation(picked as PluginLocationLike);
+}
+
+export async function pluginWorkspaceSymbols(): Promise<void> {
+  const context = pluginProviderContext();
+  if (!context) return;
+  const locations: PluginLocationLike[] = [];
+  for (const provider of pluginProviders("workspaceSymbol", context) as PluginLocationProvider[]) {
+    try {
+      const result = await provider.provideLocations({ path: context.path, language: context.language, text: context.text, offset: context.offset, word: context.word });
+      locations.push(...normalizeLocationList(result));
+    } catch (error) {
+      pluginNotify(`Plugin workspace symbol provider failed: ${String(error)}`);
+    }
+  }
+  if (!locations.length) return;
+  const picked = await showQuickPickModal(locations.map((location) => ({ label: locationLabel(location), value: location })), { placeHolder: "Go to workspace symbol" });
+  if (picked) await openPluginLocation(picked as PluginLocationLike);
+}
+
+export async function pluginCodeActions(): Promise<void> {
+  const context = pluginProviderContext();
+  if (!context) return;
+  const actions: { label: string; action: unknown }[] = [];
+  for (const provider of pluginProviders("codeAction", context) as PluginRangeProvider[]) {
+    try {
+      const result = await provider.provideRanges({ path: context.path, language: context.language, text: context.text, offset: context.offset });
+      for (const value of Array.isArray(result) ? result : result == null ? [] : [result]) {
+        const action = value as { title?: string; label?: string };
+        actions.push({ label: action.title ?? action.label ?? String(value), action: value });
+      }
+    } catch (error) {
+      pluginNotify(`Plugin code action provider failed: ${String(error)}`);
+    }
+  }
+  if (!actions.length) return;
+  const picked = await showQuickPickModal(actions.map((action) => ({ label: action.label, value: action.action })), { placeHolder: "Code actions" });
+  if (!picked) return;
+  const action = picked as { edit?: unknown; command?: { id?: string; arguments?: unknown[] }; run?: () => unknown };
+  if (action.edit !== undefined) await applyPluginWorkspaceEdit(action.edit);
+  else if (action.command?.id && pluginCommandRunner) await pluginCommandRunner(action.command.id);
+  else if (typeof action.run === "function") await action.run();
+}
+
+export async function pluginSignatureHelp(): Promise<void> {
+  const context = pluginProviderContext();
+  if (!context) return;
+  const labels: string[] = [];
+  for (const provider of pluginProviders("signatureHelp", context) as PluginRangeProvider[]) {
+    try {
+      const result = await provider.provideRanges({ path: context.path, language: context.language, text: context.text, offset: context.offset });
+      for (const value of Array.isArray(result) ? result : result == null ? [] : [result]) {
+        const item = value as { label?: string; signature?: string; documentation?: string };
+        labels.push(item.label ?? item.signature ?? item.documentation ?? String(value));
+      }
+    } catch (error) {
+      pluginNotify(`Plugin signature provider failed: ${String(error)}`);
+    }
+  }
+  if (labels.length) await showQuickPickModal(labels.map((label) => ({ label })), { placeHolder: "Signatures" });
+}
+
+export function pluginExpandSelection(view: EditorView): boolean {
+  const context = pluginProviderContext();
+  if (!context) return false;
+  const providers = pluginProviders("selectionRange", context) as PluginRangeProvider[];
+  if (!providers.length) return false;
+  const selection = view.state.selection.main;
+  let result: unknown;
+  try {
+    result = providers[0].provideRanges({ path: context.path, language: context.language, text: context.text, offset: selection.head });
+  } catch {
+    return false;
+  }
+  const apply = (value: unknown) => {
+    const ranges = (Array.isArray(value) ? value : value == null ? [] : [value])
+      .map((entry) => entry as { from?: number; to?: number; range?: { from?: number; to?: number } })
+      .map((entry) => ({ from: entry.from ?? entry.range?.from ?? 0, to: entry.to ?? entry.range?.to ?? 0 }))
+      .filter((range) => range.from <= selection.from && range.to >= selection.to && (range.from < selection.from || range.to > selection.to))
+      .sort((left, right) => (left.to - left.from) - (right.to - right.from));
+    if (!ranges.length) return false;
+    view.dispatch({ selection: { anchor: ranges[0].from, head: ranges[0].to } });
+    return true;
+  };
+  if (result && typeof (result as Promise<unknown>).then === "function") {
+    void (result as Promise<unknown>).then((value) => apply(value), () => undefined);
+    return true;
+  }
+  return apply(result);
+}
+
+class PluginInlineWidget extends WidgetType {
+  constructor(private readonly text: string, private readonly className: string, private readonly onClick?: () => void) { super(); }
+  eq(other: PluginInlineWidget) { return other.text === this.text && other.className === this.className; }
+  toDOM() {
+    const element = document.createElement(this.onClick ? "button" : "span");
+    element.className = this.className;
+    element.textContent = this.text;
+    if (this.onClick) {
+      (element as HTMLButtonElement).type = "button";
+      element.addEventListener("click", (event) => { event.preventDefault(); this.onClick?.(); });
+    }
+    return element;
+  }
+  ignoreEvent() { return false; }
+}
+
+function pluginLensWidgets(value: unknown, type: "codeLens" | "inlayHints", docLength: number): DecorationSet {
+  const wrapper = value as { tokens?: unknown[]; data?: unknown[]; items?: unknown[] } | null;
+  const values = Array.isArray(value) ? value : Array.isArray(wrapper?.tokens) ? wrapper.tokens : Array.isArray(wrapper?.data) ? wrapper.data : Array.isArray(wrapper?.items) ? wrapper.items : value == null ? [] : [value];
+  const decorations: Range<Decoration>[] = [];
+  for (const entry of values) {
+    const item = entry as { from?: number; position?: number | { line?: number; character?: number }; offset?: number; to?: number; range?: { from?: number }; label?: string; title?: string; text?: string; command?: { id?: string; title?: string; run?: () => unknown } };
+    const from = item.from ?? item.range?.from ?? item.offset ?? (typeof item.position === "number" ? item.position : undefined);
+    if (from === undefined) continue;
+    const label = item.label ?? item.title ?? item.text ?? item.command?.title;
+    if (!label) continue;
+    const onClick = type === "codeLens" ? () => { if (item.command?.run) void item.command.run(); else if (item.command?.id) void pluginCommandRunner?.(item.command.id); } : undefined;
+    decorations.push(Decoration.widget({ widget: new PluginInlineWidget(String(label), type === "codeLens" ? "arc-plugin-code-lens" : "arc-plugin-inlay-hint", onClick), side: type === "codeLens" ? -1 : 1 }).range(Math.max(0, Math.min(from, docLength))));
+  }
+  return Decoration.set(decorations, true);
+}
+
+function pluginSemanticDecorations(value: unknown, docLength: number): DecorationSet {
+  const wrapper = value as { tokens?: unknown[]; data?: unknown[]; items?: unknown[] } | null;
+  const values = Array.isArray(value) ? value : Array.isArray(wrapper?.tokens) ? wrapper.tokens : Array.isArray(wrapper?.data) ? wrapper.data : Array.isArray(wrapper?.items) ? wrapper.items : value == null ? [] : [value];
+  const decorations: Range<Decoration>[] = [];
+  for (const entry of values) {
+    const item = entry as { from?: number; to?: number; length?: number; type?: string; tag?: string };
+    const from = Math.max(0, item.from ?? 0);
+    const to = Math.min(docLength, item.to ?? (from + (item.length ?? 0)));
+    if (to <= from) continue;
+    const kind = (item.type ?? item.tag ?? "token").replace(/[^a-zA-Z0-9_-]+/g, "-");
+    decorations.push(Decoration.mark({ class: `arc-semantic-token arc-semantic-${kind}` }).range(from, to));
+  }
+  return Decoration.set(decorations, true);
+}
+
+function pluginViewPlugin(kind: "codeLens" | "inlayHints" | "semanticTokens") {
+  return ViewPlugin.fromClass(class {
+    decorations: DecorationSet = Decoration.none;
+    private generation = 0;
+    constructor(view: EditorView) { this.refresh(view); }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged || update.selectionSet) this.refresh(update.view);
+    }
+    destroy() { this.generation += 1; }
+    private refresh(view: EditorView) {
+      const context = activeLanguageContext();
+      if (!context) { this.decorations = Decoration.none; return; }
+      const providers = pluginProviders(kind, context) as PluginRangeProvider[];
+      if (!providers.length) { this.decorations = Decoration.none; return; }
+      const generation = ++this.generation;
+      const offset = view.state.selection.main.head;
+      void Promise.all(providers.map(async (provider) => {
+        try { return await provider.provideRanges({ path: context.path, language: context.language, text: context.text, offset }); }
+        catch (error) { pluginNotify(`Plugin ${kind} provider failed: ${String(error)}`); return null; }
+      })).then((values) => {
+        if (generation !== this.generation) return;
+        const merged = values.flatMap((value) => Array.isArray(value) ? value : value == null ? [] : [value]);
+        this.decorations = kind === "semanticTokens" ? pluginSemanticDecorations(merged, view.state.doc.length) : pluginLensWidgets(merged, kind, view.state.doc.length);
+        view.dispatch({});
+      });
+    }
+  }, { decorations: (plugin) => plugin.decorations });
+}
+
 const pluginCompletionSource = async (context: CompletionContext): Promise<CompletionResult | null> => {
   const languageContext = activeLanguageContext();
   if (!languageContext) return null;
@@ -2456,12 +3091,35 @@ const pluginCompletionSource = async (context: CompletionContext): Promise<Compl
   return { from: word.from, options };
 };
 
+function renderPluginHover(dom: HTMLElement, value: unknown): boolean {
+  if (typeof value === "string") {
+    if (!value.trim()) return false;
+    dom.textContent = value;
+    return true;
+  }
+  if (!value || typeof value !== "object") return false;
+  const entry = value as { text?: unknown; contents?: unknown; html?: unknown };
+  const parts = Array.isArray(entry.contents) ? entry.contents : entry.contents === undefined ? [] : [entry.contents];
+  const text = [entry.text, entry.html, ...parts.map((part) => typeof part === "string" ? part : (part as { value?: unknown })?.value)]
+    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+    .join("\n\n");
+  if (!text) return false;
+  dom.textContent = text;
+  return true;
+}
+
 const pluginHoverExtension = hoverTooltip((view, position) => {
   const languageContext = activeLanguageContext();
   if (!languageContext) return null;
   const providers = pluginProviders("hover", languageContext) as PluginHoverProvider[];
   if (!providers.length) return null;
-  const offset = position - languageContext.lineFrom;
+  const end = view.state.doc.lineAt(position).to;
+  const makeTooltip = (value: unknown) => {
+    const dom = document.createElement("div");
+    dom.className = "arc-plugin-hover";
+    if (!renderPluginHover(dom, value)) return null;
+    return { pos: position, end, create: () => ({ dom }) };
+  };
   for (const provider of providers) {
     try {
       const value = provider.provideHover({
@@ -2471,24 +3129,15 @@ const pluginHoverExtension = hoverTooltip((view, position) => {
         offset: position,
         line: languageContext.line,
       });
-      void offset;
-      if (!value || typeof value === "object") {
-        if (typeof (value as Promise<unknown>)?.then === "function") return null;
-        if (value && typeof value === "object") return null;
+      if (value && typeof (value as Promise<unknown>).then === "function") {
+        const dom = document.createElement("div");
+        dom.className = "arc-plugin-hover";
+        dom.textContent = "Loading…";
+        void (value as Promise<unknown>).then((resolved) => { renderPluginHover(dom, resolved); }, () => undefined);
+        return { pos: position, end, create: () => ({ dom }) };
       }
-      if (typeof value === "string" && value.trim()) {
-        const end = view.state.doc.lineAt(position).to;
-        return {
-          pos: position,
-          end,
-          create: () => {
-            const dom = document.createElement("div");
-            dom.className = "arc-plugin-hover";
-            dom.textContent = value;
-            return { dom };
-          },
-        };
-      }
+      const tooltip = makeTooltip(value);
+      if (tooltip) return tooltip;
     } catch { /* Ignore failing hover providers. */ }
   }
   return null;
@@ -2514,10 +3163,23 @@ const pluginFoldingExtension = foldService.of((state, lineStart, lineEnd) => {
   return null;
 });
 
+const pluginLanguageKeymap = keymap.of([
+  { key: "F12", run: () => { void pluginGoToDefinition(); return true; } },
+  { key: "Shift-F12", run: () => { void pluginFindReferences(); return true; } },
+  { key: "F2", run: () => { void pluginRenameSymbol(); return true; } },
+  { key: "Mod-.", run: () => { void pluginCodeActions(); return true; } },
+  { key: "Shift-Alt-ArrowRight", run: (view) => pluginExpandSelection(view) },
+  { key: "Ctrl-Shift-Space", run: () => { void pluginSignatureHelp(); return true; } },
+]);
+
 const pluginLanguageExtensions: Extension[] = [
   autocompletion({ override: [pluginCompletionSource] }),
   pluginHoverExtension,
   pluginFoldingExtension,
+  pluginLanguageKeymap,
+  pluginViewPlugin("codeLens"),
+  pluginViewPlugin("inlayHints"),
+  pluginViewPlugin("semanticTokens"),
 ];
 
 const pluginEditorExtensions: Extension = [
@@ -2788,6 +3450,17 @@ function subscribeContextEvent(event: string, handler: (context: PluginEditorCon
   return subscribeRawEvent(event, handler as (payload: unknown) => void, active);
 }
 
+let lastPluginActivity = Date.now();
+let pluginActivityTracking = false;
+function pluginIdleTime(): number {
+  if (!pluginActivityTracking && typeof window !== "undefined") {
+    pluginActivityTracking = true;
+    const mark = () => { lastPluginActivity = Date.now(); };
+    for (const eventName of ["pointerdown", "keydown", "mousemove", "wheel", "touchstart", "focus"]) window.addEventListener(eventName, mark, { passive: true });
+  }
+  return Math.max(0, Date.now() - lastPluginActivity);
+}
+
 function currentVisibility() {
   return { visible: document.visibilityState === "visible", minimized: document.visibilityState === "hidden", hidden: document.visibilityState === "hidden" };
 }
@@ -2968,6 +3641,109 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function startPluginLanguageServer(
+  invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
+  pluginId: string,
+  options: { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; language?: string; initializationOptions?: unknown },
+): Promise<PluginLanguageServerHandle> {
+  const process = await spawnPluginProcess(invokeCommand, pluginId, options.command, options.args ?? [], { cwd: options.cwd, env: options.env });
+  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: number }>();
+  const notificationListeners = new Set<(method: string, params: unknown) => void>();
+  const requestListeners = new Set<(method: string, params: unknown) => unknown>();
+  let nextId = 1;
+  let buffer = "";
+  const send = async (message: unknown) => {
+    const body = JSON.stringify(message);
+    await process.write(`Content-Length: ${new TextEncoder().encode(body).length}\r\n\r\n${body}`);
+  };
+  const respond = (id: number | string, result: unknown, error?: { code: number; message: string }) => {
+    void send(error ? { jsonrpc: "2.0", id, error } : { jsonrpc: "2.0", id, result }).catch(() => undefined);
+  };
+  const handleMessage = (message: Record<string, unknown>) => {
+    if (typeof message.id === "number" && ("result" in message || "error" in message)) {
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);
+      window.clearTimeout(request.timer);
+      if (message.error) request.reject(new Error(String((message.error as { message?: string }).message ?? "Language server request failed.")));
+      else request.resolve(message.result);
+      return;
+    }
+    const method = String(message.method ?? "");
+    if (!method) return;
+    if (message.id !== undefined) {
+      void (async () => {
+        try {
+          let result: unknown = null;
+          for (const listener of requestListeners) result = await listener(method, message.params) ?? result;
+          respond(message.id as number | string, result);
+        } catch (error) {
+          respond(message.id as number | string, null, { code: -32603, message: String(error) });
+        }
+      })();
+      return;
+    }
+    notificationListeners.forEach((listener) => listener(method, message.params));
+  };
+  const consume = (chunk: string) => {
+    buffer += chunk;
+    for (;;) {
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      const header = buffer.slice(0, headerEnd);
+      const lengthMatch = /Content-Length:\s*(\d+)/i.exec(header);
+      if (!lengthMatch) { buffer = buffer.slice(headerEnd + 4); continue; }
+      const length = Number(lengthMatch[1]);
+      const start = headerEnd + 4;
+      if (buffer.length < start + length) return;
+      const body = buffer.slice(start, start + length);
+      buffer = buffer.slice(start + length);
+      try { handleMessage(JSON.parse(body) as Record<string, unknown>); } catch { /* Ignore malformed LSP payloads. */ }
+    }
+  };
+  process.onStdout(consume);
+  const server: PluginLanguageServerHandle = {
+    ...process,
+    request: (method, params, timeoutMs = 20_000) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = window.setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`Language server request timed out: ${method}`));
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timer });
+      void send({ jsonrpc: "2.0", id, method, params: params ?? {} }).catch((error) => {
+        window.clearTimeout(timer);
+        pending.delete(id);
+        reject(error);
+      });
+    }),
+    notify: (method, params) => send({ jsonrpc: "2.0", method, params: params ?? {} }),
+    onNotification: (handler) => {
+      notificationListeners.add(handler);
+      return () => notificationListeners.delete(handler);
+    },
+    onRequest: (handler) => {
+      requestListeners.add(handler);
+      return () => requestListeners.delete(handler);
+    },
+    shutdown: async () => {
+      try { await server.request("shutdown", null, 3000); } catch { /* Server may already be gone. */ }
+      await server.notify("exit").catch(() => undefined);
+      await process.stop();
+    },
+  };
+  const initialized = await server.request("initialize", {
+    processId: null,
+    rootUri: options.cwd ? pathToUri(options.cwd) : null,
+    workspaceFolders: options.cwd ? [{ uri: pathToUri(options.cwd), name: options.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? "workspace" }] : null,
+    capabilities: { textDocument: { synchronization: { dynamicRegistration: true } }, workspace: { workspaceFolders: true } },
+    initializationOptions: options.initializationOptions ?? null,
+  }) as { capabilities?: unknown };
+  void initialized;
+  await server.notify("initialized", {});
+  return server;
 }
 
 async function spawnPluginProcess(
@@ -3170,6 +3946,24 @@ const mcpHostHandlers = {
   authorization: new Set<(request: unknown) => unknown>(),
 };
 const mcpExposures = new Map<string, { pluginId: string; kind: string; definition: unknown; handler: unknown }>();
+const mcpRoots = new Map<string, { uri: string; name?: string }[]>();
+
+async function handleMcpHostRequest(key: string, method: string, params: unknown): Promise<unknown> {
+  if (method === "roots/list") return { roots: mcpRoots.get(key) ?? [] };
+  const handlers = method === "sampling/createMessage"
+    ? mcpHostHandlers.sampling
+    : method === "elicitation/create"
+      ? mcpHostHandlers.elicitation
+      : method === "notifications/authorization_required"
+        ? mcpHostHandlers.authorization
+        : null;
+  if (!handlers) return null;
+  for (const handler of handlers) {
+    const result = await handler(params);
+    if (result !== undefined) return result;
+  }
+  return null;
+}
 
 function emitMcpEvent(event: string, payload: unknown) {
   window.dispatchEvent(new CustomEvent(`arc:mcp:${event}`, { detail: payload }));
@@ -3264,13 +4058,12 @@ async function createMcpStdioClient(definition: PluginMcpServerDefinition, key: 
     }
     else if (method === "notifications/prompts/list_changed") emitMcpEvent("prompts", { id: key });
     else if (method === "notifications/message") emitMcpEvent("log", { serverId: key, ...(message.params as Record<string, unknown>) });
-    else if (method === "roots/list") {
-      const roots = (message.params as { roots?: unknown })?.roots ?? [];
-      void client.notify("notifications/roots/list_changed", { roots }).catch(() => undefined);
-    } else if (method === "sampling/createMessage" || method === "elicitation/create" || method === "notifications/authorization_required") {
-      const handler = method === "sampling/createMessage" ? mcpHostHandlers.sampling.values().next().value : method === "elicitation/create" ? mcpHostHandlers.elicitation.values().next().value : mcpHostHandlers.authorization.values().next().value;
-      if (typeof message.id === "number") {
-        void Promise.resolve(handler ? handler(message.params) : null).then((result) => send({ jsonrpc: "2.0", id: message.id, result }), (error) => send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: String(error) } }));
+    else if (method === "roots/list" || method === "sampling/createMessage" || method === "elicitation/create" || method === "notifications/authorization_required") {
+      if (message.id !== undefined) {
+        void handleMcpHostRequest(key, method, message.params).then(
+          (result) => send({ jsonrpc: "2.0", id: message.id, result }),
+          (error) => send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: String(error) } }),
+        );
       }
     }
   };
@@ -3328,6 +4121,13 @@ async function createMcpHttpClient(definition: PluginMcpServerDefinition, key: s
     }
     else if (method === "notifications/prompts/list_changed") emitMcpEvent("prompts", { id: key });
     else if (method === "notifications/message") emitMcpEvent("log", { serverId: key, ...(message.params as Record<string, unknown>) });
+    else if (method === "roots/list" || method === "sampling/createMessage" || method === "elicitation/create" || method === "notifications/authorization_required") {
+      if (message.id !== undefined) {
+        void handleMcpHostRequest(key, method, message.params).then((result) => {
+          void post({ jsonrpc: "2.0", id: message.id, result });
+        });
+      }
+    }
   };
   const post = async (message: unknown): Promise<Response> => fetch(definition.url!, {
     method: "POST",
@@ -3377,10 +4177,134 @@ async function createMcpHttpClient(definition: PluginMcpServerDefinition, key: s
   return client;
 }
 
+let arcMcpServerUrl = "";
+let arcMcpServerStarting: Promise<void> | null = null;
+let arcMcpServerHandle: { url: string; close: () => Promise<void> } | null = null;
+const arcMcpToken = (() => {
+  try { return crypto.randomUUID(); } catch { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+})();
+
+function mcpExposureDefinition(entry: { pluginId: string; kind: string; definition: unknown }) {
+  return (entry.definition ?? {}) as Record<string, unknown>;
+}
+
+function mcpExposureName(entry: { pluginId: string; kind: string; definition: unknown }): string {
+  const definition = mcpExposureDefinition(entry);
+  const raw = String(definition.name ?? definition.title ?? entry.kind);
+  return raw.includes(":") ? raw : `${entry.pluginId}:${raw}`;
+}
+
+function mcpTemplateMatches(template: string, uri: string): Record<string, string> | null {
+  const escaped = template.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\{[^}]+\\\}/g, "([^/]+)");
+  const match = new RegExp(`^${escaped}$`).exec(uri);
+  if (!match) return null;
+  const names = [...template.matchAll(/\{([^}]+)\}/g)].map((item) => item[1]);
+  return Object.fromEntries(names.map((name, index) => [name, decodeURIComponent(match[index + 1] ?? "")]));
+}
+
+function mcpContentResult(value: unknown): { content: { type: string; text: string }[]; isError: boolean; structuredContent?: unknown } {
+  if (value && typeof value === "object" && Array.isArray((value as { content?: unknown }).content)) return value as never;
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+  return { content: [{ type: "text", text }], isError: Boolean((value as { isError?: boolean })?.isError), structuredContent: value };
+}
+
+async function handleArcMcpRequest(request: { method: string; url: string; headers: Record<string, string>; body: Uint8Array }): Promise<{ status?: number; headers?: Record<string, string>; body?: string | Uint8Array }> {
+  const authorization = request.headers.authorization ?? request.headers.Authorization ?? "";
+  if (authorization !== `Bearer ${arcMcpToken}`) return { status: 401, headers: { "content-type": "text/plain" }, body: "Unauthorized" };
+  if (request.method !== "POST") return { status: 405, headers: { "content-type": "text/plain", allow: "POST" }, body: "Method not allowed" };
+  let message: { id?: number | string; method?: string; params?: Record<string, unknown> };
+  try { message = JSON.parse(new TextDecoder().decode(request.body)); }
+  catch { return { status: 400, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }) }; }
+  const respond = (result: unknown) => ({ status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }) });
+  const fail = (code: number, text: string) => ({ status: 200, headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code, message: text } }) });
+  const entries = [...mcpExposures.values()];
+  const method = message.method ?? "";
+  if (!method) return fail(-32600, "Invalid request");
+  if (method.startsWith("notifications/")) return { status: 202, headers: {}, body: "" };
+  try {
+    if (method === "initialize") return respond({
+      protocolVersion: "2025-06-18",
+      capabilities: {
+        tools: entries.some((entry) => entry.kind === "tool") ? { listChanged: false } : undefined,
+        resources: entries.some((entry) => entry.kind === "resource" || entry.kind === "resourceTemplate") ? { subscribe: false, listChanged: false } : undefined,
+        prompts: entries.some((entry) => entry.kind === "prompt") ? { listChanged: false } : undefined,
+      },
+      serverInfo: { name: "Arc", version: "0.1.2" },
+    });
+    if (method === "ping") return respond({});
+    if (method === "tools/list") return respond({ tools: entries.filter((entry) => entry.kind === "tool").map((entry) => {
+      const definition = mcpExposureDefinition(entry);
+      return { name: mcpExposureName(entry), title: definition.title, description: definition.description, inputSchema: definition.inputSchema ?? { type: "object" }, outputSchema: definition.outputSchema, annotations: definition.annotations };
+    }) });
+    if (method === "tools/call") {
+      const name = String(message.params?.name ?? "");
+      const entry = entries.find((candidate) => candidate.kind === "tool" && mcpExposureName(candidate) === name);
+      if (!entry) return fail(-32602, `Unknown tool: ${name}`);
+      const handler = entry.handler as (args: unknown) => unknown;
+      return respond(mcpContentResult(await handler(message.params?.arguments ?? {})));
+    }
+    if (method === "resources/list") return respond({ resources: entries.filter((entry) => entry.kind === "resource").map((entry) => {
+      const definition = mcpExposureDefinition(entry);
+      return { uri: definition.uri, name: definition.name ?? definition.uri, description: definition.description, mimeType: definition.mimeType };
+    }) });
+    if (method === "resources/templates/list") return respond({ resourceTemplates: entries.filter((entry) => entry.kind === "resourceTemplate").map((entry) => {
+      const definition = mcpExposureDefinition(entry);
+      return { uriTemplate: definition.uriTemplate ?? definition.uri, name: definition.name ?? definition.uriTemplate, description: definition.description, mimeType: definition.mimeType };
+    }) });
+    if (method === "resources/read") {
+      const uri = String(message.params?.uri ?? "");
+      const resource = entries.find((entry) => entry.kind === "resource" && mcpExposureDefinition(entry).uri === uri);
+      const template = entries.find((entry) => entry.kind === "resourceTemplate" && mcpTemplateMatches(String(mcpExposureDefinition(entry).uriTemplate ?? mcpExposureDefinition(entry).uri ?? ""), uri));
+      if (!resource && !template) return fail(-32602, `Unknown resource: ${uri}`);
+      const entry = resource ?? template!;
+      const handler = entry.handler as (uri: string, variables?: Record<string, string>) => unknown;
+      const value = await handler(uri, template ? mcpTemplateMatches(String(mcpExposureDefinition(template).uriTemplate ?? mcpExposureDefinition(template).uri ?? ""), uri) ?? undefined : undefined);
+      const definition = mcpExposureDefinition(entry);
+      const content = typeof value === "string" ? { uri, mimeType: definition.mimeType, text: value } : value && typeof value === "object" && "bytes" in (value as Record<string, unknown>) ? { uri, mimeType: definition.mimeType, blob: (value as { bytes: unknown }).bytes } : { uri, mimeType: definition.mimeType, text: JSON.stringify(value ?? null, null, 2) };
+      return respond({ contents: [content] });
+    }
+    if (method === "prompts/list") return respond({ prompts: entries.filter((entry) => entry.kind === "prompt").map((entry) => {
+      const definition = mcpExposureDefinition(entry);
+      return { name: mcpExposureName(entry), description: definition.description, arguments: definition.arguments };
+    }) });
+    if (method === "prompts/get") {
+      const name = String(message.params?.name ?? "");
+      const entry = entries.find((candidate) => candidate.kind === "prompt" && mcpExposureName(candidate) === name);
+      if (!entry) return fail(-32602, `Unknown prompt: ${name}`);
+      const value = await (entry.handler as (args: unknown) => unknown)(message.params?.arguments ?? {});
+      const definition = mcpExposureDefinition(entry);
+      return respond(value && typeof value === "object" && Array.isArray((value as { messages?: unknown }).messages)
+        ? value
+        : { description: definition.description, messages: [{ role: "user", content: { type: "text", text: typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2) } }] });
+    }
+    return fail(-32601, `Method not found: ${method}`);
+  } catch (error) {
+    return fail(-32603, String(error));
+  }
+}
+
+async function ensureArcMcpServer(): Promise<void> {
+  if (arcMcpServerHandle) return;
+  if (arcMcpServerStarting) return arcMcpServerStarting;
+  arcMcpServerStarting = (async () => {
+    try {
+      arcMcpServerHandle = await listenPluginHttp(invoke, "arc-mcp", handleArcMcpRequest, { host: "127.0.0.1", port: 0 });
+      arcMcpServerUrl = `${arcMcpServerHandle.url.replace(/\/$/, "")}/mcp`;
+      emitMcpEvent("server", { id: "arc", state: "connected", url: arcMcpServerUrl });
+    } catch (error) {
+      pluginNotify(`Could not start Arc MCP server: ${String(error)}`);
+    } finally {
+      arcMcpServerStarting = null;
+    }
+  })();
+  return arcMcpServerStarting;
+}
+
 function exposeMcp(kind: string, definition: unknown, handler: unknown, pluginId: string, active: ActivePlugin): () => void {
   const id = `${pluginId}:${kind}:${Math.random().toString(36).slice(2)}`;
   mcpExposures.set(id, { pluginId, kind, definition, handler });
   emitMcpEvent("exposure-changed", { pluginId });
+  void ensureArcMcpServer();
   const dispose = () => {
     mcpExposures.delete(id);
     emitMcpEvent("exposure-changed", { pluginId });

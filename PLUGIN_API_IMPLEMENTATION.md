@@ -1,6 +1,6 @@
 # Plugin API Expansion — Implementation Notes
 
-Status: implementation substantially complete, **not committed**, and the very last cleanup edit has not been rebuilt yet.
+Status: implementation substantially complete. Continuation work completed generated plugin configuration controls and OS-backed secrets.
 
 Source proposal: `PLUGIN_API_PROPOSALS.md`.
 
@@ -21,8 +21,10 @@ Primary implementation files:
 - `cargo check` passed.
 - `cargo clippy` passed with two warnings:
   - one pre-existing `sort_by` suggestion (not touched);
-  - `DataChange` unused import in tests (pre-existing warning).
-- Final edit added cleanup when plugin activation throws. That edit is applied, but `npm run build` was aborted before it finished. Re-run `npm run build` before committing.
+  - one `type_complexity` suggestion on the HTTP request parser.
+- Final edit added cleanup when plugin activation throws. Later `npm run build` runs passed.
+- Continuation: `npm run build`, `cargo check`, `cargo test` (4 passed), and `cargo clippy` pass. Clippy reports two pre-existing warnings (`type_complexity`, `unnecessary_sort_by`).
+- Follow-up implementation added working provider dispatch, LSP client handles, DAP adapter startup, real idle timing, tree expansion/actions, MCP exposure HTTP endpoint, and true streaming write handles.
 
 ## Lifecycle and capabilities
 
@@ -136,9 +138,11 @@ Integrated today:
 
 Limitations:
 
-- Definition, reference, rename, code action, code lens, inlay hints, signature help, document/workspace symbols, semantic tokens, selection range, and grammar registrations are stored/registered but not yet consumed by the editor UI.
-- `startServer` starts an owned process and sends an LSP `initialize` request, but does not implement the full LSP client lifecycle.
-- Diagnostic collections store data and emit `diagnostics:changed`, but are not yet rendered in an editor or problems view.
+- Definition (`F12`), reference (`Shift+F12`), rename (`F2`), code actions (`Mod-.`), signature help (`Ctrl+Shift+Space`), document/workspace symbols (command palette), code lens, inlay hints, semantic tokens, selection range (`Shift+Alt+Right`), folding, hover, completion, formatting, and grammars are consumed by the editor.
+- `startServer` now performs the LSP initialize/initialized handshake and returns `request`, `notify`, `onNotification`, `onRequest`, and `shutdown` handle methods.
+- Diagnostic collections store data and emit `diagnostics:changed`, but are not yet rendered as editor squiggles or a problems view.
+- Language server documents are not synchronized automatically; plugins send `textDocument/*` notifications through the returned handle.
+- Provider result handling accepts documented CodeMirror-friendly shapes; complex LSP-shaped objects are normalized where practical.
 
 ## Workspace, files, and paths
 
@@ -175,7 +179,7 @@ Limitations:
 
 - `files.trash` moves items into the app cache trash folder, not the OS trash.
 - File providers are not used by `stat`, streams, or file-open flows.
-- `openWriteStream` buffers all chunks until `close()` rather than true streaming backpressure.
+- `openWriteStream` writes chunks immediately through a real file handle; `close()` finalizes the handle and refreshes the workspace.
 
 ## Processes, PTYs, sockets, and HTTP
 
@@ -301,14 +305,17 @@ Added:
 Behavior:
 
 - Configuration supports schema defaults, global values, and workspace-scoped values in `localStorage`.
+- Registered schemas appear in **Settings → Plugins** with generated controls for string, number, integer, boolean, object, array, and enum properties.
+- `scope: "workspace"` persists per workspace; other values are global. Settings UI edits notify only the owning plugin through `api.configuration.onChanged`.
 - Workspace storage is keyed by plugin and workspace path.
 - Services are plugin-registered values and support waiting/listeners.
-- Secrets are plugin-scoped and encoded in `localStorage`.
+- Secrets are plugin-scoped and stored in the OS credential store through the `keyring` crate (Secret Service, Keychain, Credential Manager).
+- Legacy base64 secrets in `localStorage` migrate to the credential store on first read. Secrets refuse to save when no credential store is available.
 
 Limitations:
 
-- Secrets are **not** stored in the OS credential store. They are base64-encoded localStorage values.
-- Configuration UI is not generated in `SettingsPanel.tsx`; values are programmatically readable/writable.
+- Generated configuration controls cover scalar and JSON object/array values; there is no per-property custom editor registration.
+- Secret reads keep returning a legacy `localStorage` value if the OS credential store is unavailable during migration.
 
 ## Commands, keybindings, plugins, themes, window
 
@@ -352,7 +359,7 @@ Behavior:
 
 Limitations:
 
-- Debug support is session bookkeeping only; there is no DAP transport/bridge yet.
+- Debug adapters may provide `start`/`stop` callbacks or stdio `command`/`args`; the built-in path performs DAP `initialize` and `launch`/`attach` framing but does not yet broker breakpoints, stack traces, or variables.
 - Test controllers do not appear in a test explorer UI.
 - Auth providers do not have Arc-owned credential/session UI.
 - Deep links are not delivered by an OS deep-link integration yet; handlers are registry-only.
@@ -388,9 +395,10 @@ Behavior:
 
 Limitations:
 
-- There is **no Arc-owned MCP server** exposing plugin tools/resources/prompts to external MCP clients yet.
-- Exposure APIs are registries/events only.
-- Remote authorization UI is not implemented; `onAuthorizationRequired` is a handler registry.
+- Arc starts a loopback streamable-HTTP MCP endpoint when the first exposure is registered. `getExposure()` returns the URL and bearer authorization value.
+- The endpoint supports initialize, ping, tools, resources, resource templates, and prompts. External list-change push notifications are not implemented; clients re-read resources because the HTTP bridge is request/response only.
+- Exposure registration is lifecycle-managed and namespace-prefixed by owning plugin.
+- Remote authorization UI is not implemented; `onAuthorizationRequired` handles server notifications through plugin code.
 
 ## Documentation
 
@@ -398,11 +406,10 @@ Limitations:
 
 ## Suggested next steps
 
-1. Re-run `npm run build` after the final activation-cleanup edit.
-2. Decide whether to make secrets OS-backed (e.g. keyring/stronghold integration).
-3. Wire custom editors and content providers into `EditorPane`/file opening.
-4. Implement the remaining language-provider integrations or clearly mark registry-only providers.
-5. Add an Arc-owned MCP server if plugin exposure must work end-to-end.
-6. Consider real DAP and test explorer UIs for `api.debug` and `api.tests`.
-7. Replace polling git change notifications with watcher-driven updates.
-8. Bump versions in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` when releasing.
+1. Wire custom editors and content providers into `EditorPane`/file opening.
+2. Render diagnostics as editor squiggles and a problems view.
+3. Expand DAP brokering to breakpoints, stack traces, variables, and a debug UI.
+4. Consider a test explorer UI for `api.tests`.
+5. Replace polling git change notifications with watcher-driven updates.
+6. Add stream/push transport to the MCP exposure server if external resource notifications are required.
+7. Bump versions in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` when releasing.

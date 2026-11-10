@@ -827,6 +827,8 @@ function EditorPane({
   pluginLanguages,
   pluginLanguageOverrides,
   pluginEditorExtensions,
+  pluginGrammarFor,
+  pluginGrammarVersion,
   onSelectionChange,
   settings,
   theme,
@@ -854,6 +856,8 @@ function EditorPane({
   pluginLanguages: PluginLanguageContribution[];
   pluginLanguageOverrides: Record<string, string>;
   pluginEditorExtensions: Extension;
+  pluginGrammarFor: (languageId: string) => Extension | Promise<Extension> | undefined;
+  pluginGrammarVersion: number;
   onSelectionChange?: (path: string) => void;
   settings: AppSettings;
   theme: ThemeDefinition;
@@ -961,10 +965,15 @@ function EditorPane({
             (value) => value.toLowerCase() === file.name.toLowerCase(),
           ),
       );
-    void (contribution
-      ? Promise.resolve(contribution.load())
-      : loadCodeLanguage(override ?? extension)
-    )
+    void (async () => {
+      const language = contribution
+        ? await Promise.resolve(contribution.load())
+        : await loadCodeLanguage(override ?? extension);
+      const grammarIds = [contribution?.id, contribution?.id.split(':').at(-1), override, extension].filter((value): value is string => Boolean(value));
+      const grammar = grammarIds.map((id) => pluginGrammarFor(id)).find(Boolean);
+      const resolvedGrammar = grammar ? await Promise.resolve(grammar) : undefined;
+      return resolvedGrammar ? [language, resolvedGrammar] : language;
+    })()
       .then((language) => {
         if (!cancelled && view.current === editor)
           editor.dispatch({
@@ -975,7 +984,7 @@ function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [compartments.language, file?.path, file?.name, pluginLanguageOverrides, pluginLanguages]);
+  }, [compartments.language, file?.path, file?.name, pluginLanguageOverrides, pluginLanguages, pluginGrammarFor, pluginGrammarVersion]);
 
   useEffect(() => {
     const editor = view.current;
@@ -3481,7 +3490,8 @@ function App() {
     }
     const pluginBinding = pluginRuntime.keybindings.find(
       (binding) =>
-        !binding.condition && matchesPluginShortcut(event, binding.shortcut),
+        pluginRuntime.conditionMatches(binding.pluginId, binding.condition) &&
+        matchesPluginShortcut(event, binding.shortcut),
     );
     if (pluginBinding) {
       const command = pluginRuntime.commands.find(
@@ -4272,6 +4282,41 @@ function App() {
       title: 'Toggle File Viewer',
       run: () => setViewerOpen((visible) => !visible),
     },
+    {
+      id: 'plugin-go-to-definition',
+      title: 'Go to Definition',
+      run: () => pluginRuntime.languageCommands.goToDefinition(),
+    },
+    {
+      id: 'plugin-find-references',
+      title: 'Find References',
+      run: () => pluginRuntime.languageCommands.findReferences(),
+    },
+    {
+      id: 'plugin-rename-symbol',
+      title: 'Rename Symbol',
+      run: () => pluginRuntime.languageCommands.renameSymbol(),
+    },
+    {
+      id: 'plugin-document-symbols',
+      title: 'Go to Document Symbol',
+      run: () => pluginRuntime.languageCommands.documentSymbols(),
+    },
+    {
+      id: 'plugin-workspace-symbols',
+      title: 'Go to Workspace Symbol',
+      run: () => pluginRuntime.languageCommands.workspaceSymbols(),
+    },
+    {
+      id: 'plugin-code-actions',
+      title: 'Show Code Actions',
+      run: () => pluginRuntime.languageCommands.codeActions(),
+    },
+    {
+      id: 'plugin-signature-help',
+      title: 'Show Signature Help',
+      run: () => pluginRuntime.languageCommands.signatureHelp(),
+    },
   ];
   const commandItems: (PluginCommandDefinition & {
     pluginId: string;
@@ -4355,12 +4400,18 @@ function App() {
         pluginLanguages={pluginRuntime.languages}
         pluginLanguageOverrides={pluginLanguageOverrides}
         pluginEditorExtensions={pluginRuntime.editorExtensions}
-        onSelectionChange={(path) =>
+        pluginGrammarFor={pluginRuntime.getGrammar}
+        pluginGrammarVersion={pluginRuntime.grammarVersion}
+        onSelectionChange={(path) => {
           pluginRuntime.emitEvent(
             'editor:selection-changed',
             getPluginEditorContext(path),
-          )
-        }
+          );
+          pluginRuntime.emitEvent(
+            'editor:context-changed',
+            getPluginEditorContext(path),
+          );
+        }}
         pluginPanel={
           <Suspense fallback={<div className="editor-empty" />}>
             <PluginPanel
@@ -4994,6 +5045,9 @@ function App() {
               setThemeMakerOpen(true);
             }}
             onDeleteTheme={(id) => void deleteTheme(id)}
+            pluginConfigurations={pluginRuntime.configurations}
+            getPluginConfigValue={pluginRuntime.getConfiguration}
+            onUpdatePluginConfig={pluginRuntime.updateConfiguration}
           />
         </Suspense>
       )}

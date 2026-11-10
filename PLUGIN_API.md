@@ -50,7 +50,6 @@ Install the folder from **Plugins → Install from folder**. `activate(api)` run
 | `api.events` | Subscribe to app events or publish plugin-scoped events |
 | `api.storage` | Persistent key/value storage scoped to this plugin |
 | `api.localServer` | Start and stop plugin-owned local HTTP server |
-| `api.process` | Check executable names on Linux |
 | `api.codemirror` | Shared CodeMirror/Lezer modules for language plugins |
 | `api.languages`, `api.diagnostics` | Register languages, providers, grammars, and diagnostic collections |
 | `api.paths`, `api.workspaceFolders`, `api.workspaceTrust` | Path helpers and workspace metadata |
@@ -338,6 +337,9 @@ api.lifecycle.onShutdown(() => {
 const timer = api.timers.setInterval(() => api.ui.notify("tick"), 10_000);
 api.timers.clearInterval(timer); // Optional; unload cancels it automatically.
 
+const timeout = api.timers.setTimeout(() => api.ui.notify("once"), 500);
+api.timers.clearTimeout(timeout);
+
 const worker = api.workers.create(await api.assets.url("worker.js"));
 ```
 
@@ -348,13 +350,22 @@ const context = api.editor.getContext();
 // { path, uri, name, language, version, cursor, selection, selections,
 //   dirty, focused, visibleRanges }
 
+const last = api.editor.getLastActive();
+const language = api.editor.getLanguage();       // includes per-file overrides
+const cursor = api.editor.getCursor();
+const selections = api.editor.getSelections();
+const visible = api.editor.getVisibleRanges();
+
 api.editor.onActiveChanged((context) => console.log("active", context?.path));
+api.editor.onContextChanged((context) => console.log("context", context?.language));
 api.editor.onSelectionChanged((context) => console.log(context?.cursor));
 api.editor.onDocumentOpened(({ path, name }) => console.log(path, name));
 api.editor.onDocumentClosed(({ path }) => console.log(path));
 api.editor.onDocumentChanged(({ path, content }) => console.log(path));
 api.editor.onDocumentSaved(({ path }) => console.log(path));
 ```
+
+`getLastActive()` returns the last open source editor even when a plugin panel has focus. The optional `path` argument on the getters selects a specific open document.
 
 Editor navigation and edits:
 
@@ -402,15 +413,89 @@ api.languages.registerCompletionProvider({ language: "csharp" }, {
     { label: "Console", type: "class" },
   ],
 });
+api.languages.registerHoverProvider({ language: "csharp" }, {
+  provideHover: async ({ text, offset }) => ({ text: "C# symbol documentation" }),
+});
+api.languages.registerDefinitionProvider({ language: "csharp" }, {
+  provideLocations: async ({ path, offset }) => [{ path, from: offset, to: offset + 3 }],
+});
+api.languages.registerReferenceProvider({ language: "csharp" }, {
+  provideLocations: async ({ path, word }) => [{ path, from: 0, to: word.length }],
+});
+api.languages.registerRenameProvider({ language: "csharp" }, {
+  provideRename: async ({ path, offset, newName }) => ({
+    changes: { [path]: [{ from: offset, to: offset + 3, text: newName }] },
+  }),
+});
 api.languages.registerFormattingProvider({ language: "csharp" }, {
   provideFormatting: async ({ text }) => text.trim(),
 });
+api.languages.registerCodeActionProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ title: "Add using", edit: { changes: {} } }],
+});
+api.languages.registerCodeLensProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ from: 0, label: "Run tests", command: { id: "run-tests" } }],
+});
+api.languages.registerInlayHintsProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ from: 0, label: ": string" }],
+});
+api.languages.registerSignatureHelpProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ label: "WriteLine(string value)" }],
+});
+api.languages.registerDocumentSymbolProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ name: "Main", from: 0, to: 10 }],
+});
+api.languages.registerWorkspaceSymbolProvider({
+  provideLocations: async () => [{ path: "src/Program.cs", from: 0, to: 4, name: "Program" }],
+});
+api.languages.registerSemanticTokensProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ from: 0, to: 6, type: "keyword" }],
+});
+api.languages.registerFoldingProvider({ language: "csharp" }, {
+  provideFoldingRange: ({ line }) => ({ from: line, to: line + 4 }),
+});
+api.languages.registerSelectionRangeProvider({ language: "csharp" }, {
+  provideRanges: async () => [{ from: 0, to: 20 }],
+});
+api.languages.registerGrammar("csharp", {
+  load: async () => grammarExtension,
+});
+
+const server = await api.languages.startServer({
+  command: "csharp-ls",
+  args: ["--stdio"],
+  cwd: api.workspace,
+});
+await server.request("textDocument/definition", { /* LSP params */ });
+server.onNotification((method, params) => console.log(method, params));
+server.onRequest((method, params) => null); // answer server-initiated requests
+await server.shutdown();
 
 const collection = api.diagnostics.createCollection("csharp");
 collection.set("file:///src/Program.cs", [
   { severity: "error", message: "Missing semicolon", from: 10, to: 20 },
 ]);
+collection.delete("file:///src/Program.cs");
+collection.clear();
+collection.dispose();
 ```
+
+Provider behavior:
+
+| Provider | Editor behavior |
+| --- | --- |
+| completion, hover, folding, formatting | Applied automatically in every editor. |
+| definition | `F12` and the **Go to Definition** command. |
+| reference | `Shift+F12` and the **Find References** command. |
+| rename | `F2` and the **Rename Symbol** command. |
+| codeAction | `Ctrl/Cmd+.` and the **Show Code Actions** command. |
+| signatureHelp | `Ctrl+Shift+Space` and the **Show Signature Help** command. |
+| documentSymbol / workspaceSymbol | Command palette entries. |
+| codeLens / inlayHints / semanticTokens | Rendered in the editor. |
+| selectionRange | `Shift+Alt+Right` expands the selection. |
+| grammar | Combined with the registered language extension. |
+
+Language providers may return results synchronously or as promises. A failing provider is isolated and does not disable other providers. `api.languages.startServer` returns an LSP-shaped handle with `request`, `notify`, `onNotification`, `onRequest`, and `shutdown` in addition to process methods.
 
 All language provider registrations return disposables. `api.codemirror` exposes Arc's own `language`, `view`, `state`, `autocomplete`, and `highlight` modules so plugins do not bundle duplicate CodeMirror or Lezer instances.
 
@@ -432,9 +517,22 @@ const stream = await api.files.openReadStream("large.bin");
 const chunk = await stream.read(64 * 1024);
 await stream.close();
 
-const folder = await api.paths.resolve(api.workspace, "src");
-const uri = api.paths.toUri(folder);
-const relative = api.paths.relative(api.workspace, folder);
+const output = await api.files.openWriteStream("large-output.bin");
+await output.write(chunk); // writes immediately; no full-file buffering
+await output.close();
+
+const exists = await api.files.exists("src/main.js");
+api.files.registerProvider("plugin-data", {
+  read: async (path) => new TextEncoder().encode(`content for ${path}`),
+  write: async (path, bytes) => console.log(path, bytes.length),
+  list: async () => [{ name: "virtual.txt", kind: "file" }],
+});
+
+const folder = api.paths.join(api.workspace, "src");
+const resolved = await api.paths.resolve(api.workspace, "src");
+const uri = api.paths.toUri(resolved);
+const relative = api.paths.relative(api.workspace, resolved);
+const originalPath = api.paths.fromUri(uri);
 ```
 
 `api.workspaceFolders.get()` lists workspace folders. `api.workspaceTrust.isTrusted()` reports whether the active workspace is trusted. Both namespaces provide `onChanged` subscriptions.
@@ -453,9 +551,21 @@ const gitPath = await api.process.which("git");
 const pty = await api.pty.spawn("bash", [], { cwd: api.workspace });
 pty.onStdout((chunk) => console.log(chunk));
 
+const proc2 = await api.process.spawn("cat");
+proc2.onStderr((chunk) => console.error(chunk));
+proc2.onError((error) => console.error(error));
+proc2.onExit(({ code, signal }) => console.log(code, signal));
+await proc2.closeStdin();
+
 const socket = await api.ipc.connectUnix("/tmp/my.sock");
 socket.onData((bytes) => console.log(bytes));
+socket.onError((error) => console.error(error));
+socket.onClose(() => console.log("closed"));
 await socket.write(new TextEncoder().encode("ping\n"));
+await socket.close();
+
+const pipe = await api.ipc.connectPipe("my-pipe"); // Windows only
+await pipe.close();
 
 const tcp = await api.net.connectTcp("127.0.0.1", 9000);
 const server = await api.net.listenHttp(async (request) => ({
@@ -481,6 +591,7 @@ await api.net.download("https://example.com/file.zip", "downloads/file.zip", {
   onProgress: (received, total) => console.log(received, total),
 });
 
+console.log(api.net.isOnline());
 api.net.onOnlineChanged((online) => console.log("online", online));
 ```
 
@@ -492,6 +603,9 @@ const logo = api.icons.get("logo");
 
 const url = await api.assets.url("logo.svg");
 const text = await api.assets.readText("templates/page.html");
+const bytes = await api.assets.readBytes("logo.png");
+const nativePath = await api.assets.resolvePath("logo.svg");
+api.icons.unregister("logo");
 
 api.ui.updateAction("build", { label: "Build again", enabled: false });
 api.ui.updateStatusItem("mode", { text: "Ready" });
@@ -504,7 +618,22 @@ api.ui.registerMenuItem("explorer/context", {
 api.ui.registerSidebarView({ id: "outline", title: "Outline", mount(container) {} });
 api.ui.registerBottomView({ id: "problems", title: "Problems", mount(container) {} });
 api.ui.registerCustomTab({ id: "preview", title: "Preview", mount(container) {} });
+api.ui.registerTreeView({
+  id: "todo-tree",
+  title: "TODO",
+  getChildren: async (element) => element ? [] : [{ label: "src", children: true, element: "src" }],
+  onSelect: (element) => console.log(element),
+});
 api.ui.setViewBadge("outline", 3);
+api.ui.focusView("outline");
+api.ui.closeView("outline");
+api.ui.setContext("myPlugin.mode", "debug");
+const output = api.ui.createOutputChannel("My Plugin");
+output.append("Starting");
+output.appendLine("Started");
+output.show();
+output.clear();
+output.dispose();
 
 const picked = await api.ui.showQuickPick([
   { label: "Development", value: "dev" },
@@ -522,9 +651,6 @@ api.ui.showNotification("Deploy complete", {
   actions: [{ label: "Open log", run: () => console.log("log") }],
 });
 
-const output = api.ui.createOutputChannel("My Plugin");
-output.appendLine("Started");
-output.show();
 ```
 
 ### Configuration, storage, secrets, and services
@@ -544,22 +670,33 @@ api.configuration.onChanged(({ key, value }) => console.log(key, value));
 
 api.storage.workspace.set("lastFile", "src/main.js");
 const lastWorkspaceFile = api.storage.workspace.get("lastFile", null);
+api.storage.workspace.remove("lastFile");
+api.storage.workspace.clear();
 
 await api.secrets.set("token", "secret-value");
 const token = await api.secrets.get("token");
 await api.secrets.delete("token");
 
 api.services.register("my-plugin:api", { hello: () => "hi" });
+const existingService = api.services.get("my-plugin:api");
 const service = await api.services.whenAvailable("my-plugin:api");
 ```
+
+Registered configuration schemas appear in **Settings → Plugins** with generated controls for `string`, `number`, `integer`, `boolean`, `object`, `array`, and `enum` properties. `scope: "workspace"` stores a value per workspace; otherwise values are global. Updates made from the settings UI notify the owning plugin through `api.configuration.onChanged`.
+
+Secrets are stored in the operating-system credential store (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows). Values written by older Arc versions are migrated on first read. `api.secrets.*` rejects when no OS credential store is available rather than silently storing plaintext.
 
 ### Commands, keybindings, plugins, themes, and window
 
 ```js
+const commands = api.commands.list();
 api.commands.onExecuted(({ id, pluginId, success }) => console.log(id, success));
-api.keybindings.register("build", "Ctrl+Alt+B");
+const stopBinding = api.keybindings.register("build", "Ctrl+Alt+B");
+api.keybindings.unregister("build", "Ctrl+Alt+B");
 
 const installed = api.plugins.list();
+const plugin = api.plugins.get("other-plugin");
+const stopWatchingPlugins = api.plugins.onChanged(() => console.log("plugins changed"));
 await api.plugins.whenAvailable("other-plugin");
 
 const colors = api.themes.getColors();
@@ -568,6 +705,8 @@ api.themes.onChanged((theme) => console.log(theme.name));
 const focused = await api.window.isFocused();
 api.window.onFocusChanged((isFocused) => console.log(isFocused));
 console.log(api.window.getVisibility());
+api.window.onVisibilityChanged((visibility) => console.log(visibility));
+console.log(api.window.getIdleTime()); // milliseconds since last Arc input activity
 ```
 
 ### Git, tasks, tests, debugging, auth, and links
@@ -584,11 +723,21 @@ api.tasks.registerProvider("npm", {
 });
 const run = await api.tasks.run({ executable: "npm", args: ["test"] });
 run.onExit(({ code }) => console.log(code));
+api.tasks.onStarted(({ id, task }) => console.log("started", id, task));
+api.tasks.onFinished(({ id, code }) => console.log("finished", id, code));
 
 const tests = api.tests.createController("unit", "Unit Tests");
 tests.setItems([{ label: "parses input", status: "passed" }]);
 
-const session = await api.debug.start({ type: "my-debugger", program: "app.js" });
+api.debug.registerAdapter("my-debugger", async () => ({
+  // Either provide start/stop callbacks, or command/args for a DAP process.
+  command: "my-dap-adapter",
+  args: ["--stdio"],
+}));
+const session = await api.debug.start({ type: "my-debugger", request: "launch", program: "app.js" });
+console.log(api.debug.getActiveSession());
+api.debug.onSessionChanged((active) => console.log(active));
+await api.debug.stop(session.id);
 await session.stop();
 
 api.auth.registerProvider("github", {
@@ -617,7 +766,48 @@ const resources = await api.mcp.listResources("local");
 api.mcp.onToolsChanged("local", () => console.log("tools changed"));
 api.mcp.onLog(({ serverId, level, message }) => console.log(serverId, level, message));
 
-api.mcp.exposeTool({ name: "hello" }, async () => ({ content: "hello" }));
+// Server lifecycle and metadata
+console.log(api.mcp.listServers());
+console.log(api.mcp.getServer("local"));
+console.log(api.mcp.getCapabilities("local"));
+api.mcp.onServerChanged(({ id, state }) => console.log(id, state));
+await api.mcp.setLogLevel("local", "info");
+console.log(await api.mcp.ping("local"));
+await api.mcp.disconnect("local");
+await api.mcp.restart("local");
+api.mcp.unregisterServer("local");
+
+// Resources, templates, and prompts
+const templates = await api.mcp.listResourceTemplates("local");
+const resource = await api.mcp.readResource("local", "file:///README.md");
+const stopResource = api.mcp.subscribeResource("local", "file:///README.md", () => console.log("updated"));
+api.mcp.onResourcesChanged("local", () => console.log("resources changed"));
+const prompts = await api.mcp.listPrompts("local");
+const prompt = await api.mcp.getPrompt("local", "review", { language: "ts" });
+api.mcp.onPromptsChanged("local", () => console.log("prompts changed"));
+const completions = await api.mcp.complete("local", { type: "ref/prompt", name: "review" }, { name: "language", value: "t" });
+await api.mcp.setRoots("local", [{ uri: api.paths.toUri(api.workspace), name: "workspace" }]);
+
+// Host-side requests initiated by the server
+api.mcp.onSamplingRequest(async (request) => ({ role: "assistant", content: { type: "text", text: "..." } }));
+api.mcp.onElicitationRequest(async (request) => ({ action: "accept", content: {} }));
+api.mcp.onAuthorizationRequired(async (request) => ({ approved: false }));
+
+// Expose plugin contributions through Arc's MCP server
+const disposeTool = api.mcp.exposeTool({
+  name: "read_project_file",
+  description: "Read a workspace file",
+  inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+}, async ({ path }) => api.files.read(path));
+api.mcp.exposeResource({ uri: "plugin://todo", name: "TODO", mimeType: "text/plain" }, async () => "todo contents");
+api.mcp.exposeResourceTemplate({ uriTemplate: "plugin://todo/{id}", name: "TODO item" }, async (uri, variables) => variables?.id ?? "");
+api.mcp.exposePrompt({ name: "review_changes", description: "Review staged changes" }, async () => "Review the staged changes.");
+api.mcp.notifyResourceChanged("plugin://todo");
+console.log(api.mcp.getExposure());
+api.mcp.onExposureChanged(() => console.log("exposure changed"));
+disposeTool();
 ```
 
 Remote MCP servers use Streamable HTTP when `type: "http"` and a `url` are supplied. Local servers use stdio with the configured executable, arguments, working directory, and environment. Connections, notifications, cancellation, timeouts, tools, resources, prompts, completion, roots, sampling/elicitation handlers, and exposure registration are routed through Arc's plugin lifecycle.
+
+Arc starts a loopback MCP streamable-HTTP endpoint when the first exposure is registered. `api.mcp.getExposure()` returns the exposed definitions plus `serverUrl` and the required `authorization` header value. The endpoint supports `initialize`, `ping`, tools, resources, resource templates, prompts, and the corresponding list/read/call/get methods. It deliberately does not expose every editor command, file, or secret. Resource-update notifications are delivered locally through `notifyResourceChanged`; external HTTP clients must re-read resources because the HTTP bridge is request/response only.

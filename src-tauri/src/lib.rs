@@ -1230,6 +1230,44 @@ fn plugin_http_server_stop(
     Ok(())
 }
 
+const PLUGIN_SECRET_SERVICE: &str = "dev.arc.ide.plugins";
+
+fn plugin_secret_entry(plugin_id: &str, key: &str) -> Result<keyring::Entry, String> {
+    if plugin_id.trim().is_empty() || key.trim().is_empty() {
+        return Err("Plugin secret ID and key must not be empty.".to_string());
+    }
+    if plugin_id.len() > 128 || key.len() > 256 {
+        return Err("Plugin secret ID or key is too long.".to_string());
+    }
+    let username = format!("{plugin_id}:{key}");
+    keyring::Entry::new(PLUGIN_SECRET_SERVICE, &username)
+        .map_err(|error| format!("OS credential store is unavailable: {error}"))
+}
+
+#[tauri::command]
+fn plugin_secret_set(plugin_id: String, key: String, value: String) -> Result<(), String> {
+    plugin_secret_entry(&plugin_id, &key)?
+        .set_password(&value)
+        .map_err(|error| format!("Could not store plugin secret: {error}"))
+}
+
+#[tauri::command]
+fn plugin_secret_get(plugin_id: String, key: String) -> Result<Option<String>, String> {
+    match plugin_secret_entry(&plugin_id, &key)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Could not read plugin secret: {error}")),
+    }
+}
+
+#[tauri::command]
+fn plugin_secret_delete(plugin_id: String, key: String) -> Result<(), String> {
+    match plugin_secret_entry(&plugin_id, &key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not delete plugin secret: {error}")),
+    }
+}
+
 #[tauri::command]
 fn plugin_trash_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let source = PathBuf::from(&path);
@@ -2879,6 +2917,9 @@ pub fn run() {
             plugin_http_server_start,
             plugin_http_respond,
             plugin_http_server_stop,
+            plugin_secret_set,
+            plugin_secret_get,
+            plugin_secret_delete,
             plugin_trash_path,
             github_diff,
             set_native_background_blur,

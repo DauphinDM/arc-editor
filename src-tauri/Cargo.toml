@@ -21,6 +21,7 @@ tauri-plugin-clipboard-manager = "2"
 portable-pty = "0.9"
 notify-debouncer-full = "0.5"
 ignore = "0.4"
+keyring = "4"
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
